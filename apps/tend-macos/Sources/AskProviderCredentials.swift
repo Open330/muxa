@@ -8,7 +8,6 @@ import Security
 enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
     case claude
     case codex
-    case gemini
     case anthropic
     case openai
     /// Apple's Foundation Models — the on-device model and Private Cloud
@@ -20,7 +19,7 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
     var kind: TendAskProvider.Kind {
         switch self {
         // `apple` is a CLI to tendd: a binary it spawns, and no key.
-        case .claude, .codex, .gemini, .apple: .cli
+        case .claude, .codex, .apple: .cli
         case .anthropic, .openai: .api
         }
     }
@@ -30,7 +29,6 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .claude: "Claude Code"
         case .codex: "Codex CLI"
-        case .gemini: "Gemini CLI"
         case .anthropic: "Anthropic API"
         case .openai: "OpenAI API"
         case .apple: "Apple Intelligence"
@@ -40,7 +38,7 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
     /// Executable an instance runs unless it overrides `executable`.
     var defaultExecutable: String? {
         switch self {
-        case .claude, .codex, .gemini: rawValue
+        case .claude, .codex: rawValue
         case .apple: Self.appleHelperName
         case .anthropic, .openai: nil
         }
@@ -55,7 +53,6 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .claude, .anthropic: "ANTHROPIC_API_KEY"
         case .codex: "CODEX_API_KEY"
-        case .gemini: "GEMINI_API_KEY"
         case .openai: "OPENAI_API_KEY"
         // No key at all: the model belongs to the signed-in Mac.
         case .apple: ""
@@ -67,7 +64,7 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         case .anthropic: "claude-sonnet-5"
         case .openai: "gpt-5"
         case .apple: AskAppleModel.onDevice.rawValue
-        case .claude, .codex, .gemini: nil
+        case .claude, .codex: nil
         }
     }
 
@@ -81,7 +78,6 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .claude: "brain.head.profile"
         case .codex: "chevron.left.forwardslash.chevron.right"
-        case .gemini: "diamond"
         case .anthropic: "brain"
         case .openai: "cpu"
         case .apple: "apple.logo"
@@ -93,7 +89,6 @@ enum AskProviderEngine: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .claude: "npm install -g @anthropic-ai/claude-code"
         case .codex: "npm install -g @openai/codex"
-        case .gemini: "npm install -g @google/gemini-cli"
         // The helper ships inside Tend.app; there is nothing to install.
         case .anthropic, .openai, .apple: nil
         }

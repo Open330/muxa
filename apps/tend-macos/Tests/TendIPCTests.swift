@@ -3972,7 +3972,7 @@ func composeBundledCLIArgumentsMirrorTheDaemonRequest() throws {
     #expect(AppModel.composeCredentialEnvironmentKey(for: "anthropic") == "ANTHROPIC_API_KEY")
     #expect(AppModel.composeCredentialEnvironmentKey(for: "codex") == "CODEX_API_KEY")
     #expect(AppModel.composeCredentialEnvironmentKey(for: "openai") == "OPENAI_API_KEY")
-    #expect(AppModel.composeCredentialEnvironmentKey(for: "gemini") == "GEMINI_API_KEY")
+    #expect(AppModel.composeCredentialEnvironmentKey(for: "gemini") == nil)
     #expect(AppModel.composeCredentialEnvironmentKey(for: "unknown") == nil)
 }
 
@@ -4678,9 +4678,11 @@ func askProviderDraftValidatesIdsTheWayTheDaemonDoes() {
     #expect(draft.validationMessage(taken: none)?.isEmpty == false)
 
     // The engine supplies every default the sheet only hints at.
-    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "anthropic", "openai", "apple"])
-    #expect(AskProviderEngine.gemini.defaultExecutable == "gemini")
-    #expect(AskProviderEngine.gemini.defaultCredentialEnv == "GEMINI_API_KEY")
+    #expect(AskProviderEngine.allCases.map(\.rawValue) == ["claude", "codex", "anthropic", "openai", "apple"])
+    // The Gemini CLI engine was removed from tendd; a stored id no longer decodes.
+    #expect(AskProviderEngine(rawValue: "gemini") == nil)
+    #expect(AskProviderEngine.codex.defaultExecutable == "codex")
+    #expect(AskProviderEngine.codex.defaultCredentialEnv == "CODEX_API_KEY")
     #expect(AskProviderEngine.anthropic.defaultExecutable == nil)
     #expect(AskProviderEngine.anthropic.defaultModel == "claude-sonnet-5")
     #expect(AskProviderEngine.openai.defaultModel == "gpt-5")

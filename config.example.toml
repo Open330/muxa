@@ -127,7 +127,7 @@
 # your account.
 # [ask]
 # enabled = true
-# agent = "claude"          # claude | codex | gemini | anthropic | openai | apple
+# agent = "claude"          # claude | codex | anthropic | openai | apple
 #                           # (apple: the Mac's own models, macOS 26+, no key);
 #                           # ←/→ switches at runtime
 # cwd = "~"                 # where the headless process runs; defaults to $HOME

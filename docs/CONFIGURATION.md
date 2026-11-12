@@ -338,8 +338,8 @@ example `["/nfs/home/june"]` when `/home/june/workspace` points there.
 `timeout_secs` defaults to 30 minutes so skills have time to prepare a
 persistent worker. Reaching it terminates the headless agent process; it is a
 wall-clock safety limit, not an inactivity detector. `plan` is a read-only
-mode (claude `--permission-mode plan`, codex `--sandbox read-only`, gemini
-`--approval-mode plan`); `tend work compose` always drafts under it.
+mode (claude `--permission-mode plan`, codex `--sandbox read-only`);
+`tend work compose` always drafts under it.
 
 ### Providers
 
@@ -354,9 +354,9 @@ for the schema, limits, privacy boundary, and free versus paid tests.
 
 An **engine** is the code that drives a provider: the argv a CLI takes, the
 JSON an API answers with, the environment variable its key lives in. There
-are six and they are fixed — `claude`, `codex`, and `gemini` drive the
-agent CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
---output-format json`) and resume their own sessions between questions;
+are five and they are fixed — `claude` and `codex` drive the agent CLIs in
+print mode (`claude -p`, `codex exec --json`) and resume their own sessions
+between questions;
 `anthropic` and `openai` call the Messages and Chat Completions APIs
 directly over HTTPS; `apple` runs the Mac's own Foundation Models. API
 engines have no session to resume, so tendd replays the conversation's
@@ -416,9 +416,16 @@ is why an `[ask.providers.anthropic] model = "…"` written before any of
 this still means what it always did. Removing such a table clears the
 settings; the built-in itself stays.
 
+The `gemini` engine (Gemini CLI, `gemini -p`) has been removed. A config
+that still names it loads: `[ask] agent = "gemini"` starts on `claude`
+instead, and an `[ask.providers.<id>]` table on the engine lists as no
+provider. tendd logs a warning naming each such entry; delete it, or remove
+the table with `tend ask provider remove <id>`. Earlier Gemini answers stay
+in Ask history.
+
 An API key comes from, in order: the one-turn key a client sends, the
 engine's own variable in tendd's environment (`ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`; `CODEX_API_KEY` and `GEMINI_API_KEY` for the CLIs), then
+`OPENAI_API_KEY`; `CODEX_API_KEY` for the Codex CLI), then
 the variable that provider's `api_key_env` names. The key itself is never
 written to config.toml. Two providers on one engine share the engine's
 variable, so give each its own `api_key_env` (or send a one-turn key) when

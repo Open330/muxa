@@ -13,9 +13,6 @@ enum TendAgentLogoAsset: String, CaseIterable, Sendable {
     case claude
     /// OpenAI's blossom, which Codex wears too.
     case openai
-    /// Google's Gemini sparkle, for the Gemini Ask engine. Gemini CLI is no
-    /// longer an agent kind, so no agent wears it.
-    case gemini
     case antigravity
     case opencode
     /// The Anthropic symbol, for the Anthropic API engine.
@@ -40,7 +37,6 @@ enum TendAgentLogoAsset: String, CaseIterable, Sendable {
         switch self {
         case .claude: 0.98
         case .openai: 1.37
-        case .gemini: 1.04
         case .antigravity: 1.35
         case .opencode: 1
         case .anthropic: 1
@@ -87,7 +83,6 @@ extension AskProviderEngine {
         switch self {
         case .claude: .claude
         case .codex, .openai: .openai
-        case .gemini: .gemini
         case .anthropic: .anthropic
         case .apple: nil
         }

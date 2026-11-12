@@ -171,7 +171,7 @@ let hasMacOS27SDK = false
 /// given. So the instructions say outright that such an answer is out of date.
 let workspaceInstructions = """
     You are the assistant in Global Ask, a feature of tend. tend is an app that \
-    tracks the AI coding agents (Claude Code, Codex, Gemini CLI and others) the \
+    tracks the AI coding agents (Claude Code, Codex, Antigravity, opencode and others) the \
     user runs in terminal panes on this Mac. You have tools that read those \
     agent sessions: list_agent_sessions and read_agent_session. Earlier turns \
     of this conversation may say you cannot access other applications or \

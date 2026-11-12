@@ -2155,8 +2155,8 @@ async fn ask_providers_lists_every_provider_and_follows_the_selection() {
     let ids: Vec<&str> = providers.iter().map(|info| info.id.as_str()).collect();
     assert_eq!(ids, crate::ask::supported_agents());
     assert!(providers[0].selected);
-    assert_eq!(providers[3].model.as_deref(), Some("claude-sonnet-5"));
-    assert_eq!(providers[4].model.as_deref(), Some("gpt-5"));
+    assert_eq!(providers[2].model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(providers[3].model.as_deref(), Some("gpt-5"));
 
     assert_eq!(client.ask_agent(Some("openai")).await.unwrap(), "openai");
     let providers = client.ask_providers().await.unwrap();
@@ -2321,7 +2321,6 @@ async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
         "anthropic-work",
         "claude",
         "codex",
-        "gemini",
         "anthropic",
         "openai",
     ];
@@ -2373,7 +2372,7 @@ async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
         .filter(|info| info.builtin)
         .all(|info| !info.configured));
     let error = client
-        .ask_provider_remove("gemini")
+        .ask_provider_remove("openai")
         .await
         .unwrap_err()
         .to_string();
