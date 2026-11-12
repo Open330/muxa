@@ -14,6 +14,7 @@ pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
     EvidenceReference, TaskAttempt, TaskContract, TaskReport, TASK_CONTRACT_CAPABILITY,
 };
+mod execute_overlap;
 mod human_decisions;
 mod mailbox_snapshot;
 mod open_counts;
@@ -219,6 +220,7 @@ fn dispatch_matches(
         && existing.expects_reply == input.expects_reply
         && existing.notify == input.notify
         && existing.human_action == input.human_action
+        && existing.allow_path_overlap == input.allow_path_overlap
         && existing.decision
             == input
                 .decision
@@ -309,11 +311,16 @@ fn same_participant_pair(
 /// reusing the pane can never inherit the work.
 ///
 /// Returns whether anything changed, so callers can persist only real edits.
+/// Whether `caller` would adopt `request` from its pane's pending
+/// placeholder ([`pin_pending_recipient`]).
+fn adopts_pending(request: &CollaborationRequest, caller: &Participant) -> bool {
+    is_pending_session(&request.to.agent_session_id)
+        && !is_pending_session(&caller.agent_session_id)
+        && !caller.console
+}
+
 fn pin_pending_recipient(request: &mut CollaborationRequest, caller: &Participant) -> bool {
-    if !is_pending_session(&request.to.agent_session_id)
-        || is_pending_session(&caller.agent_session_id)
-        || caller.console
-    {
+    if !adopts_pending(request, caller) {
         return false;
     }
     // Keep the alias/roles the launcher stamped when the registering session
@@ -919,6 +926,14 @@ pub struct CollaborationRequest {
     /// readable question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::decision::Decision>,
+    /// The sender declared this execute task may share paths with other
+    /// open execute tasks in the same checkout.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_path_overlap: bool,
+    /// The absolute paths this open execute request reserves, resolved when
+    /// it was accepted or last moved (`execute_overlap.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execute_scope: Option<Vec<String>>,
     /// The sender's slot, and where its reply wake followed it
     /// (`sender_follow.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1127,7 +1142,15 @@ pub struct NewRequest {
     /// `human_action`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::decision::Decision>,
+    /// An execute task whose `paths` overlap an open execute task in the
+    /// same checkout is refused unless this is set
+    /// ([`EXECUTE_OVERLAP_CAPABILITY`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_path_overlap: bool,
 }
+
+/// Daemons that refuse overlapping execute `paths` in one checkout.
+pub const EXECUTE_OVERLAP_CAPABILITY: &str = "collaboration_execute_overlap_v1";
 
 impl Default for NewRequest {
     fn default() -> Self {
@@ -1156,6 +1179,7 @@ impl Default for NewRequest {
             supersedes_request_id: None,
             user_authorized: false,
             decision: None,
+            allow_path_overlap: false,
         }
     }
 }
@@ -1554,6 +1578,12 @@ pub enum CollaborationError {
     InvalidDispatch(String),
     #[error("invalid decision fields: {0}")]
     InvalidDecision(String),
+    #[error(
+        "execute paths overlap open execute request {request_id} held by another agent at {path}; narrow paths, wait for it, use a separate worktree, or set allow_path_overlap"
+    )]
+    PathOverlap { request_id: String, path: String },
+    #[error("execute request refused: {0}")]
+    ExecuteUnreserved(String),
     #[error("dispatch {0} already exists with a different recipient or payload")]
     DispatchConflict(String),
     #[error("agent collaboration is disabled; enable [collaboration].enabled")]
@@ -3193,6 +3223,8 @@ impl CollaborationStore {
                 Err(CollaborationError::DispatchConflict(id))
             };
         }
+        let execute_scope =
+            execute_overlap::reserve(self.requests.read().await.values(), &to, &input)?;
         if let Some(old_id) = &input.supersedes_request_id {
             let requests = self.requests.read().await;
             let old = requests
@@ -3275,6 +3307,8 @@ impl CollaborationStore {
             user_authorized: input.user_authorized,
             turn_offer: None,
             decision,
+            allow_path_overlap: input.allow_path_overlap,
+            execute_scope,
             wake_retry: None,
             dispatch_id: input.dispatch_id,
             source_node_id: input.source_node_id,
@@ -3526,6 +3560,7 @@ impl CollaborationStore {
         let now = OffsetDateTime::now_utc();
         let mut changed = false;
         let mut inbox = Vec::new();
+        let open = self.requests.read().await;
         {
             let requests = &mut staged;
             for request in requests.values_mut() {
@@ -3542,7 +3577,15 @@ impl CollaborationStore {
                 {
                     // The session pulling this inbox is the one the pane's
                     // pending request was waiting for: adopt it, so every
-                    // later match is session-pinned.
+                    // later match is session-pinned. An execute request
+                    // whose files that session cannot reserve stays queued.
+                    if adopts_pending(request, caller) {
+                        match execute_overlap::adopt(open.values(), request, caller) {
+                            Ok(Some(scope)) => request.execute_scope = Some(scope),
+                            Ok(None) => {}
+                            Err(_) => continue,
+                        }
+                    }
                     changed |= pin_pending_recipient(request, caller);
                     if request.status == RequestStatus::Queued {
                         request.status = if request.expects_reply {
@@ -3566,6 +3609,7 @@ impl CollaborationStore {
                 }
             }
         }
+        drop(open);
         inbox.sort_by_key(|request| request.created_at);
         if changed {
             self.commit_request_rows(&inbox).await?;
@@ -3603,6 +3647,12 @@ impl CollaborationStore {
             {
                 None
             } else {
+                if adopts_pending(request, caller) {
+                    let open = self.requests.read().await;
+                    if let Some(scope) = execute_overlap::adopt(open.values(), request, caller)? {
+                        request.execute_scope = Some(scope);
+                    }
+                }
                 pin_pending_recipient(request, caller);
                 request.status = RequestStatus::Claimed;
                 request.claimed_at = Some(OffsetDateTime::now_utc());
@@ -4323,6 +4373,19 @@ impl CollaborationStore {
                 || to.console
             {
                 return Ok(None);
+            }
+            // The move takes the reservation with it: refuse it (the request
+            // stays with its holder) when the new recipient's files are held
+            // by another agent.
+            let scope = {
+                let current = self.requests.read().await;
+                match execute_overlap::rebind(current.values(), request, &to) {
+                    Ok(scope) => scope,
+                    Err(_) => return Ok(None),
+                }
+            };
+            if scope.is_some() {
+                request.execute_scope = scope;
             }
             let old = std::mem::replace(&mut request.to, to);
             request.rebound_from.push(old.agent_session_id);
@@ -5885,6 +5948,218 @@ mod tests {
         assert_eq!(
             store.create(sender, human, input).await.unwrap().id,
             request.id
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one store, every accepted and refused shape
+    async fn overlapping_execute_paths_in_one_checkout_are_refused() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let lead = participant("%1", "lead");
+        let worker_a = participant("%2", "a");
+        let worker_b = participant("%3", "b");
+        let mut elsewhere = participant("%4", "c");
+        elsewhere.cwd = Some("/other-worktree".into());
+        let task = |paths: &[&str]| NewRequest {
+            kind: RequestKind::Task,
+            work_mode: WorkMode::Execute,
+            body: "edit".into(),
+            paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+            ..NewRequest::default()
+        };
+        let first = store
+            .create(lead.clone(), worker_a.clone(), task(&["src/auth"]))
+            .await
+            .unwrap();
+        // Another agent, same checkout, inside the held directory.
+        let refused = store
+            .create(
+                lead.clone(),
+                worker_b.clone(),
+                task(&["./src/auth/login.rs"]),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(CollaborationError::PathOverlap { request_id, .. }) if *request_id == first.id),
+            "{refused:?}"
+        );
+        // No paths claims the whole checkout.
+        assert!(store
+            .create(lead.clone(), worker_b.clone(), task(&[]))
+            .await
+            .is_err());
+        // Disjoint paths, another checkout, the same agent's own queue, a
+        // read-only request, or an explicit opt-in all go through.
+        store
+            .create(lead.clone(), worker_b.clone(), task(&["docs"]))
+            .await
+            .unwrap();
+        store
+            .create(lead.clone(), elsewhere, task(&["src/auth"]))
+            .await
+            .unwrap();
+        store
+            .create(lead.clone(), worker_a.clone(), task(&["src/auth"]))
+            .await
+            .unwrap();
+        store
+            .create(
+                lead.clone(),
+                worker_b.clone(),
+                NewRequest {
+                    work_mode: WorkMode::ReadOnly,
+                    ..task(&["src/auth"])
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                lead.clone(),
+                worker_b.clone(),
+                NewRequest {
+                    allow_path_overlap: true,
+                    ..task(&["src/auth"])
+                },
+            )
+            .await
+            .unwrap();
+        // Sibling directories reaching the same files are one reservation.
+        let mut left = participant("%5", "left");
+        left.cwd = Some("/mono/a".into());
+        let mut right = participant("%6", "right");
+        right.cwd = Some("/mono/b".into());
+        store
+            .create(lead.clone(), left, task(&["../shared"]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .create(lead.clone(), right, task(&["/mono/shared/x.rs"]))
+                .await,
+            Err(CollaborationError::PathOverlap { .. })
+        ));
+        // Without a known directory, or without a reply to end it, there is
+        // nothing to reserve: refused unless the sender opts out.
+        let mut unknown = participant("%7", "unknown");
+        unknown.cwd = None;
+        assert!(matches!(
+            store
+                .create(lead.clone(), unknown.clone(), task(&["src"]))
+                .await,
+            Err(CollaborationError::ExecuteUnreserved(_))
+        ));
+        assert!(matches!(
+            store
+                .create(
+                    lead.clone(),
+                    participant("%8", "quiet"),
+                    NewRequest {
+                        expects_reply: false,
+                        ..task(&["notes"])
+                    },
+                )
+                .await,
+            Err(CollaborationError::ExecuteUnreserved(_))
+        ));
+        store
+            .create(
+                lead.clone(),
+                unknown,
+                NewRequest {
+                    allow_path_overlap: true,
+                    ..task(&["src"])
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_adopting_a_pending_execute_request_must_be_able_to_reserve_it() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let lead = participant("%1", "lead");
+        let task = NewRequest {
+            kind: RequestKind::Task,
+            work_mode: WorkMode::Execute,
+            body: "edit".into(),
+            paths: vec!["src".into()],
+            ..NewRequest::default()
+        };
+        store
+            .create(lead.clone(), participant("%2", "holder"), task.clone())
+            .await
+            .unwrap();
+        let mut pending = participant("%3", "pending-pane:default:%3");
+        pending.cwd = Some("/isolated".into());
+        let queued = store.create(lead.clone(), pending, task).await.unwrap();
+        // The session that registers in that pane works in the holder's
+        // checkout: it does not get the request, which stays queued.
+        let adopter = participant("%3", "real-session");
+        assert!(store.claim_for(&adopter).await.unwrap().is_empty());
+        let still = store
+            .list_for(&lead, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == queued.id)
+            .unwrap();
+        assert_eq!(still.status, RequestStatus::Queued);
+        // Working where the reservation was made, it adopts it.
+        let mut adopter = participant("%3", "real-session");
+        adopter.cwd = Some("/isolated".into());
+        let claimed = store.claim_for(&adopter).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].to.agent_session_id, "real-session");
+        assert_eq!(
+            claimed[0].execute_scope.as_deref(),
+            Some(&["/isolated/src".to_owned()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_an_execute_request_rechecks_its_reservation() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let lead = participant("%1", "lead");
+        let holder = participant("%2", "holder");
+        let mut isolated = participant("%3", "isolated");
+        isolated.cwd = Some("/isolated".into());
+        let successor = participant("%4", "successor");
+        let task = NewRequest {
+            kind: RequestKind::Task,
+            work_mode: WorkMode::Execute,
+            body: "edit".into(),
+            paths: vec!["src".into()],
+            ..NewRequest::default()
+        };
+        store
+            .create(lead.clone(), holder, task.clone())
+            .await
+            .unwrap();
+        let moving = store
+            .create(lead.clone(), isolated.clone(), task)
+            .await
+            .unwrap();
+        assert_eq!(
+            moving.execute_scope.as_deref(),
+            Some(&["/isolated/src".to_owned()][..])
+        );
+        // Its successor works in the checkout the holder is editing.
+        let rebound = store
+            .rebind_recipient(&moving.id, &isolated, successor)
+            .await
+            .unwrap();
+        assert!(rebound.is_none(), "the move is refused, the request stays");
+        let mut elsewhere = participant("%5", "elsewhere");
+        elsewhere.cwd = Some("/isolated-2".into());
+        let rebound = store
+            .rebind_recipient(&moving.id, &isolated, elsewhere)
+            .await
+            .unwrap()
+            .expect("a free checkout takes it");
+        assert_eq!(
+            rebound.execute_scope.as_deref(),
+            Some(&["/isolated-2/src".to_owned()][..])
         );
     }
 

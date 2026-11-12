@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Execute tasks no longer edit the same files at once by accident. An
+  `execute` request now reserves the paths it names (no paths means the
+  whole checkout), and tendd refuses a new one, or a move of one to a slot
+  successor, that overlaps a reservation held by another agent; the error
+  names the open request. An execute request must expect a reply and its
+  recipient must have a known working directory. Set `allow_path_overlap`
+  (MCP) or `--allow-path-overlap` (`tend msg send`) when sharing is intended
+  (`collaboration_execute_overlap_v1`).
 - Session-activity sampling lists tmux sessions and clients in one `tmux`
   call instead of two, every 5 seconds.
 

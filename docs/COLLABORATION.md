@@ -664,6 +664,25 @@ The receiver should claim its inbox promptly, honor kind/work mode/paths, and
 always produce a terminal `tend_reply`. Avoid concurrent edits to the same
 files; use separate worktrees when scopes cannot be isolated.
 
+tendd enforces the non-overlap (`collaboration_execute_overlap_v1`): an
+`execute` request reserves the files it names, and a new one (or a move of
+one to a slot successor) is refused when it overlaps a reservation held by
+another agent. Paths resolve against the recipient's working directory
+(`.`/`..` normalized and symlinks in the existing part of each path
+resolved, so `../shared` from two sibling directories, or a symlinked
+directory and its target, are one path); a glob counts from its literal prefix
+(`src/**/*.rs` holds `src`); no paths means the whole checkout, the nearest
+directory with a `.git` entry (a linked worktree inside the repository is
+its own checkout). No git is run. When a session adopts a request queued
+for its pane before it registered, the reservation is rechecked in that
+session's directory; one that would overlap stays queued. Requests queued for the same agent are
+not compared, since it takes them in turn. The reservation lasts while the
+request is open, so an execute request must expect a reply, and a recipient
+with no known working directory cannot be reserved; both are refused. Narrow
+the paths, wait for the open request to finish, give the work its own
+worktree, or set `allow_path_overlap` (`tend msg send --execute
+--allow-path-overlap`) when sharing the files is intended.
+
 ## Indexed history, migration, and retention
 
 The mailbox is persisted to an owner-only SQLite database before delivery.

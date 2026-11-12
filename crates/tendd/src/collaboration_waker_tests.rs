@@ -367,6 +367,7 @@ async fn collaboration_waker_reacts_to_mailbox_revision() {
             sender,
             recipient,
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -705,6 +706,7 @@ async fn full_wake_claims_and_injects_the_structured_request_body() {
             sender.clone(),
             recipient.clone(),
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -771,6 +773,7 @@ async fn full_wake_claims_and_injects_the_structured_request_body() {
             sender,
             recipient.clone(),
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -843,6 +846,7 @@ async fn operator_full_wake_injects_console_requests() {
             console,
             recipient.clone(),
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -936,6 +940,7 @@ async fn operator_full_wake_keeps_agent_requests_in_the_mailbox() {
             sender,
             recipient.clone(),
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -1023,6 +1028,7 @@ async fn full_wake_submits_only_one_request_per_idle_generation() {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    allow_path_overlap: false,
                     decision: None,
                     user_authorized: false,
                     task_contract: None,
@@ -1176,6 +1182,7 @@ async fn direct_wake_recovers_without_reinjecting_the_request_body() {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    allow_path_overlap: false,
                     decision: None,
                     user_authorized: false,
                     task_contract: None,
@@ -1710,6 +1717,7 @@ async fn terminal_reply_wakes_idle_sender_without_injecting_body() {
             sender,
             recipient.clone(),
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -1845,6 +1853,7 @@ async fn a_console_sender_is_woken_for_nothing() {
             console.clone(),
             recipient.clone(),
             NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,

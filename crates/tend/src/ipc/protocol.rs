@@ -1039,6 +1039,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "collaboration_peer_recovery",
     collaboration::TASK_CONTRACT_CAPABILITY,
     collaboration::HUMAN_ACTIONS_CAPABILITY,
+    collaboration::EXECUTE_OVERLAP_CAPABILITY,
     collaboration::PURPOSE_PROMOTE_CAPABILITY,
     collaboration::PIPELINE_PURPOSE_CAPABILITY,
     collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,

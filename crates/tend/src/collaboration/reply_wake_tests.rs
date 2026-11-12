@@ -487,6 +487,8 @@ fn legacy_rows_derive_their_release_from_timestamps() {
 
 fn legacy_request(pair: &Pair) -> CollaborationRequest {
     CollaborationRequest {
+        execute_scope: None,
+        allow_path_overlap: false,
         decision: None,
         turn_offer: None,
         sender_follow: None,

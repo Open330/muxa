@@ -645,6 +645,10 @@ enum MsgCmd {
         /// the request.
         #[arg(long)]
         user_authorized: bool,
+        /// With --execute: allow paths that overlap another open execute
+        /// task in the same checkout (refused by default).
+        #[arg(long, requires = "execute")]
+        allow_path_overlap: bool,
         /// Print a compact acknowledgement without repeating request/reply bodies.
         #[arg(long)]
         json: bool,

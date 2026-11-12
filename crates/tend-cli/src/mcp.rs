@@ -1087,6 +1087,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
             tool["inputSchema"]["properties"]["task_contract"] =
                 tend::collaboration::task_contract_schema();
             tool["inputSchema"]["properties"]["supersedes_request_id"] = json!({"type":"string","description":"Close your read-only request for the same task_id and replace it; never transfers edit authority."});
+            tool["inputSchema"]["properties"]["allow_path_overlap"] = json!({"type":"boolean","description":"Allow paths that overlap another agent's open execute task; refused by default."});
         }
         if tool["name"] == "tend_request_attention" {
             if let (Some(properties), Value::Object(decision)) = (
@@ -4781,6 +4782,11 @@ fn new_request_from_args(
         return Err("task_contract requires a reply-bearing agent request".into());
     }
     Ok(NewRequest {
+        allow_path_overlap: match args.get("allow_path_overlap") {
+            None => false,
+            Some(Value::Bool(allow)) => *allow,
+            Some(_) => return Err("allow_path_overlap must be a boolean".into()),
+        },
         decision: crate::decision_record::request_decision(args)?,
         task_contract,
         supersedes_request_id,

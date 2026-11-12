@@ -278,6 +278,8 @@ pub(super) fn fake_watch_collaboration_request(
 ) -> CollaborationRequest {
     let now = OffsetDateTime::now_utc();
     CollaborationRequest {
+        execute_scope: None,
+        allow_path_overlap: false,
         decision: None,
         turn_offer: None,
         sender_follow: None,
@@ -933,6 +935,8 @@ pub(super) const COLLAB_FIXTURE_BODY: &str =
 
 pub(super) fn collab_request(to_pane: &str) -> CollaborationRequest {
     CollaborationRequest {
+        execute_scope: None,
+        allow_path_overlap: false,
         decision: None,
         turn_offer: None,
         sender_follow: None,

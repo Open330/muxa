@@ -1695,6 +1695,7 @@ async fn widening_a_listing_over_ipc_is_console_only() {
                     &from,
                     to,
                     &NewRequest {
+                        allow_path_overlap: false,
                         decision: None,
                         user_authorized: false,
                         task_contract: None,
@@ -1850,6 +1851,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             &sender,
             "role:review",
             &NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -1884,6 +1886,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             &sender,
             "@reviewer",
             &NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -2012,6 +2015,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             &sender,
             "role:rust",
             &NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
@@ -2172,6 +2176,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             },
             "pane:%1",
             &NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,

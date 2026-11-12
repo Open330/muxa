@@ -425,6 +425,7 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             notify,
             withdraw,
             user_authorized,
+            allow_path_overlap,
             json,
             full,
         } => {
@@ -455,6 +456,7 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &origin,
                     &target,
                     &NewRequest {
+                        allow_path_overlap,
                         decision: None,
                         task_contract: task_contract
                             .as_deref()
