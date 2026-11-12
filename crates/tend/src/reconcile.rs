@@ -381,10 +381,10 @@ impl<L: LivenessSource> Reconciler<L> {
             if let (Some(status), Some(current)) =
                 (status, self.store.by_session(&t.id.session_id).await)
             {
-                if current.state != AgentState::Stopped
-                    && status.at > current.last_activity_at
-                    && status.at <= now
-                {
+                // The Store's precedence rule keeps a historical rollout
+                // record from undoing a newer hook, and drops a re-read of
+                // the record already applied.
+                if current.state != AgentState::Stopped && status.at <= now {
                     let event = match status.event {
                         codex_rollout::StatusEvent::Working => AgentEvent::ToolStarted {
                             id: t.id.clone(),
@@ -419,30 +419,23 @@ impl<L: LivenessSource> Reconciler<L> {
                 }
             }
             if let Some(response) = recovery_response {
-                if self
-                    .store
-                    .by_session(&t.id.session_id)
-                    .await
-                    .is_some_and(|current| {
-                        current.state == AgentState::Error
-                            && current.last_activity_at == t.last_activity_at
-                    })
-                {
-                    self.store
-                        .apply_observed(
-                            &AgentEvent::TurnStopped {
-                                id: t.id.clone(),
-                                response: Some(response),
-                                recap: None,
-                                ai_title: None,
-                                idle_confirmed: false,
-                                // Repair state without making an old turn look recent.
-                                at: t.last_activity_at,
-                            },
-                            StateSource::ProviderRecord,
-                        )
-                        .await;
-                }
+                // Repair state without making an old turn look recent, and
+                // only if the row is still the capped row this reading was
+                // judged against: the Store checks that under its lock.
+                self.store
+                    .apply_observed_repair_if_unchanged(
+                        &AgentEvent::TurnStopped {
+                            id: t.id.clone(),
+                            response: Some(response),
+                            recap: None,
+                            ai_title: None,
+                            idle_confirmed: false,
+                            at: t.last_activity_at,
+                        },
+                        StateSource::ProviderRecord,
+                        t.last_activity_at,
+                    )
+                    .await;
             }
             // Lifecycle signals are useful even before the first token-count
             // record, or when large tool output pushed quota out of the tail.
@@ -485,15 +478,10 @@ impl<L: LivenessSource> Reconciler<L> {
             }
 
             if let Some(scope) = rl.reached {
-                let current = self.store.by_session(&t.id.session_id).await;
-                if rl.at.is_some_and(|at| {
-                    at > now
-                        || current
-                            .as_ref()
-                            .is_some_and(|agent| at <= agent.last_activity_at)
-                }) {
-                    // Old quota evidence must not undo a newer resumed/completed
-                    // turn or permission hook, nor make it appear newly active.
+                if rl.at.is_some_and(|at| at > now) {
+                    // Old quota evidence cannot undo a newer resumed/completed
+                    // turn or permission hook: the Store's precedence rule
+                    // refuses it. A record stamped in the future is skipped.
                     continue;
                 }
                 // Re-assert the cap only when the row isn't already showing
@@ -710,8 +698,19 @@ impl<L: LivenessSource> Reconciler<L> {
         let agentless_stopped = if complete_kinds.is_empty() {
             0
         } else {
+            // The multiplexer's own foreground command for each pane: the
+            // deterministic half of "this pane runs no agent".
+            let foreground: HashMap<String, String> = union_panes
+                .iter()
+                .map(|pane| (pane.pane_id.clone(), pane.current_command.clone()))
+                .collect();
             self.store
-                .stop_rows_without_agent_process(&workloads, &complete_kinds, AGENTLESS_PANE_IDLE)
+                .stop_rows_without_agent_process(
+                    &workloads,
+                    &foreground,
+                    &complete_kinds,
+                    AGENTLESS_PANE_IDLE,
+                )
                 .await
         };
         if agentless_stopped > 0 {

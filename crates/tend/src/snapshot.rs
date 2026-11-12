@@ -285,6 +285,9 @@ fn serialize_agents(agents: &[Agent]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
         // The same source re-confirming the same state is activity too.
         if let Some(provenance) = agent.state_source.as_mut() {
             provenance.at = OffsetDateTime::UNIX_EPOCH;
+            if let Some(deterministic_at) = provenance.deterministic_at.as_mut() {
+                *deterministic_at = OffsetDateTime::UNIX_EPOCH;
+            }
         }
     }
     Ok((exact, to_bytes(&blanked)?))
