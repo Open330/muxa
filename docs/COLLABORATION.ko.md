@@ -159,7 +159,7 @@ enabled = true
 wake = "idle_only"
 # 선택 사항: 기본값 "operator_full", 또는 "notice" / "full"
 wake_payload = "operator_full"
-# 선택 사항. 생략하면 이력을 영구 보존
+# 선택 사항. 완료된 thread를 이 일수가 지나면 정리
 retention_days = 90 # 기본값, 0이면 영구 보존
 ```
 

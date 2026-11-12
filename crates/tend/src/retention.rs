@@ -9,11 +9,22 @@ use std::time::SystemTime;
 
 /// Delete all but the newest `keep` entries of `directory`, newest by
 /// modification time. Hidden entries (`.name`) are left alone, symlinks are
-/// removed as links and never followed. `keep == 0` disables pruning.
+/// removed as links and never followed. `keep == 0` disables pruning, and
+/// so does a `directory` that is itself a symlink or not a directory: the
+/// sweep never reaches outside the data directory through a link.
 /// Returns the paths removed.
 pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathBuf>> {
     if keep == 0 {
         return Ok(Vec::new());
+    }
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            tracing::warn!(path = %directory.display(), "backup retention skipped: not a real directory");
+            return Ok(Vec::new());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     }
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -120,6 +131,24 @@ mod tests {
         let removed = prune_backups(dir.path(), 1).unwrap();
         assert_eq!(removed.len(), 1);
         assert!(outside.path().join("precious").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_backups_root_is_never_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for index in 0..4 {
+            std::fs::write(outside.path().join(format!("user-{index}")), b"x").unwrap();
+        }
+        let root = dir.path().join("backups");
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+        assert!(prune_backups(&root, 1).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 4);
+        // A plain file at the root is skipped too.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(prune_backups(&file, 1).unwrap().is_empty());
     }
 
     #[cfg(unix)]

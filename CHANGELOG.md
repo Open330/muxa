@@ -30,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newest 5 entries (`[storage].backups_keep`); completed mailbox threads are
   pruned after 90 days by default (`[collaboration].retention_days`, `0` keeps
   everything) at startup and hourly rather than only at startup; and launch
-  archives in `spawns/` that never completed expire after 90 days. Each cap
-  can be turned off with `0`.
+  archives in `spawns/` that never completed expire after 90 days. The audit,
+  backup and mailbox caps can each be turned off with `0`.
 
 ### Fixed
 

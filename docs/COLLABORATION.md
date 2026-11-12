@@ -276,7 +276,7 @@ enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
 # Optional: "operator_full" (default), "notice", or "full".
 wake_payload = "operator_full"
-# Optional; omitted retains history indefinitely.
+# Optional; completed threads are pruned after this many days.
 retention_days = 90 # default; 0 retains indefinitely
 ```
 

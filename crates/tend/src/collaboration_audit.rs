@@ -458,11 +458,13 @@ mod tests {
     async fn rotates_to_one_previous_generation_at_the_size_cap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("collaboration-audit.ndjson");
-        let line = encode_entry(&entry()).unwrap().len() as u64;
+        // One fixed entry: `at` is "now", and its encoded length varies.
+        let fixed = entry();
+        let line = encode_entry(&fixed).unwrap().len() as u64;
         // Room for two entries per generation.
         let log = CollaborationAuditLog::at_path_with_max_bytes(path.clone(), line * 2);
         for _ in 0..5 {
-            log.append(entry()).await;
+            log.append(fixed.clone()).await;
         }
         assert_eq!(load(&path).await.unwrap().len(), 1);
         assert_eq!(load(&rotated_path(&path)).await.unwrap().len(), 2);
@@ -473,10 +475,11 @@ mod tests {
     async fn rotation_counts_a_preexisting_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("collaboration-audit.ndjson");
-        let line = encode_entry(&entry()).unwrap().len();
+        let fixed = entry();
+        let line = encode_entry(&fixed).unwrap().len();
         tokio::fs::write(&path, vec![b'x'; line * 2]).await.unwrap();
         let log = CollaborationAuditLog::at_path_with_max_bytes(path.clone(), line as u64 * 2);
-        log.append(entry()).await;
+        log.append(fixed).await;
         assert_eq!(load(&path).await.unwrap().len(), 1);
         assert!(rotated_path(&path).exists());
     }
