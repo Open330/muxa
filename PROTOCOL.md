@@ -749,7 +749,8 @@ Tagged union. `type` field is the discriminant.
 | `notification_fired`  | `id`, `level`, `message`, `at`                                    | Agent needs attention                    |
 | `turn_stopped`        | `id`, `at`                                                        | Agent finished responding                |
 | `session_ended`       | `id`, `at`                                                        | Session terminated                       |
-| `heartbeat`           | `id`, `model?`, `context_used_pct?`, `cost_usd?`, `at`            | Periodic metadata refresh                |
+| `heartbeat`           | `id`, `model?`, `context_used_pct?`, `cost_usd?`, `rate_limit_5h_pct?`, `rate_limit_5h_resets_at?`, `rate_limit_7d_pct?`, `rate_limit_7d_resets_at?`, `at` | Periodic metadata refresh |
+| `rate_limited`        | `id`, `scope`, `source`, `resets_at?`, `message?`, `at` | Observed usage cap; sets the agent state to `error` |
 
 `id`:
 ```json
@@ -777,6 +778,27 @@ or a yes/no permission. Adapters that can't distinguish should use
 
 `at`: RFC 3339 UTC timestamp (`"2026-04-24T12:00:00Z"`).
 
+For `rate_limited`, `scope` and `source` are required snake-case enums:
+
+- `RateLimitScope`: `"five_hour" | "seven_day" | "unknown"`.
+- `RateLimitSource`: `"statusline" | "stop_failure" | "transcript" | "codex_rollout"`.
+
+Adapters and the daemon's rollout reconciler emit this event when a source
+reports a usage cap. `resets_at` is an optional RFC 3339 timestamp; a source
+such as a 429 may not know the reset time. `message` is optional user-facing
+text, copied to the agent's `last_notification` when present. For example:
+
+```json
+{"protocol":6,"kind":"ingest","event":{"type":"rate_limited","id":{"kind":"claude_code","session_id":"sess-abc","pane":"%12","cwd":"/home/user/proj"},"scope":"unknown","source":"stop_failure","message":"Rate limit reached","at":"2026-04-24T12:00:00Z"}}
+```
+
+The four `heartbeat` rate-limit fields are optional and omitted when absent.
+The `*_pct` values are numeric window utilization percentages (0–100), not
+remaining quota; the `*_resets_at` values are RFC 3339 timestamps. Heartbeats
+refresh window metadata. Claude statusline saturation can also mark a soft
+cap; Codex utilization alone does not establish that the agent is blocked.
+
+
 ---
 
 ## `Agent` schema (in responses)
@@ -797,6 +819,13 @@ Same fields as stored in the registry:
   "model": "string | null",
   "context_used_pct": 34.0,
   "cost_usd": 0.12,
+  "rate_limit_5h_pct": 100.0,
+  "rate_limit_5h_resets_at": "2026-04-24T14:00:00Z",
+  "rate_limit_7d_pct": 42.0,
+  "rate_limit_7d_resets_at": "2026-04-29T00:00:00Z",
+  "rate_limited_until": "2026-04-24T14:00:00Z",
+  "rate_limit_scope": "five_hour",
+  "rate_limit_source": "statusline",
   "started_at": "2026-04-24T12:00:00Z",
   "last_activity_at": "2026-04-24T12:03:21Z"
 }
@@ -808,6 +837,19 @@ is the short socket name (the socket file's basename, e.g. `default` or
 reconciler. `tmux_session` is backfilled by the reconciler's multi-socket
 pane scan each tick; it is absent until the first tick after the agent's
 pane is seen.
+
+The seven rate-limit fields above are additive, optional, and omitted when
+unset. The four window fields have the same types and meaning as on
+`heartbeat`. `rate_limited_until` is the observed cap's RFC 3339 reset time;
+it can be absent even while capped when the source has no reset estimate.
+`rate_limit_scope` and `rate_limit_source` use the enums defined under
+`AgentEvent`. A `rate_limited` event preserves an existing richer scope or
+reset estimate when the new event does not carry one. A statusline soft cap
+clears when a later heartbeat reports utilization below saturation; hard
+sources are not cleared by that heartbeat. A fresh `started` clears cap
+metadata; observed Codex prompt/tool or rollout activity can also clear a
+prior Codex cap. Consumers should use scope/source as well as the reset time
+rather than treating a missing `rate_limited_until` as proof of no cap.
 
 ## `HistoryEntry` schema (in `recent_prompts` responses)
 
