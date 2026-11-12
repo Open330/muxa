@@ -95,7 +95,46 @@ pub fn scan_pane_workloads(panes: &[PaneInfo]) -> HashMap<String, WorkloadSummar
     if !panes.iter().any(|pane| pane.pane_pid != 0) {
         return HashMap::new();
     }
-    let table = crate::process_snapshot::read_current_process_table();
+    scan_pane_workloads_with(panes, &ProcessSource::capture())
+}
+
+/// One process-table read shared by several scans of the same moment. The
+/// reconciler takes one per tick for both its workload and Codex scans,
+/// instead of one `ps` pass each. On Linux it is empty: `/proc` is read
+/// per pane, which is already cheap.
+#[derive(Debug, Default)]
+pub struct ProcessSource {
+    #[cfg(not(target_os = "linux"))]
+    table: crate::process_snapshot::ProcessTable,
+}
+
+impl ProcessSource {
+    /// Read the process table now (a no-op on Linux).
+    #[must_use]
+    pub fn capture() -> Self {
+        Self {
+            #[cfg(not(target_os = "linux"))]
+            table: crate::process_snapshot::read_current_process_table(),
+        }
+    }
+}
+
+/// [`scan_pane_workloads`] over an already captured [`ProcessSource`].
+#[cfg(target_os = "linux")]
+pub fn scan_pane_workloads_with(
+    panes: &[PaneInfo],
+    _source: &ProcessSource,
+) -> HashMap<String, WorkloadSummary> {
+    scan_pane_workloads(panes)
+}
+
+/// [`scan_pane_workloads`] over an already captured [`ProcessSource`].
+#[cfg(not(target_os = "linux"))]
+pub fn scan_pane_workloads_with(
+    panes: &[PaneInfo],
+    source: &ProcessSource,
+) -> HashMap<String, WorkloadSummary> {
+    let table = &source.table;
     let mut out = HashMap::new();
     for pane in &crate::tmux::canonical_panes(panes) {
         if pane.pane_pid == 0 {
@@ -135,8 +174,15 @@ pub struct CodexPaneScan {
 /// pane ancestry, and list the panes hosting an interactive Codex. Never
 /// guesses from cwd or chooses between multiple panes itself.
 pub fn scan_codex_panes(panes: &[PaneInfo]) -> CodexPaneScan {
+    scan_codex_panes_with(panes, &ProcessSource::capture())
+}
+
+/// [`scan_codex_panes`] over an already captured [`ProcessSource`].
+pub fn scan_codex_panes_with(panes: &[PaneInfo], source: &ProcessSource) -> CodexPaneScan {
     #[cfg(not(target_os = "linux"))]
-    let table = crate::process_snapshot::read_current_process_table();
+    let table = &source.table;
+    #[cfg(target_os = "linux")]
+    let _ = source;
     // A grouped session lists each pane once per `~view~` client session:
     // scan (and report) each pane once, under its base session.
     let unique = crate::tmux::canonical_panes(panes);

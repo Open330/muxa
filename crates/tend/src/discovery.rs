@@ -37,6 +37,8 @@ use crate::ipc::{Client, RuntimeError};
 use crate::process_snapshot::ProcessTable;
 use crate::state::SYNTHETIC_SESSION_PREFIX;
 use crate::tmux::PaneInfo;
+#[cfg(not(target_os = "linux"))]
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 /// One discovered agent pane.
@@ -115,32 +117,160 @@ pub fn discover_from_panes(panes: &[PaneInfo]) -> Vec<Discovered> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn discover_from_panes(panes: &[PaneInfo]) -> Vec<Discovered> {
-    let needs_tree = panes.iter().any(|p| {
+    discover_from_panes_cached(
+        panes,
+        &WRAPPER_CACHE,
+        std::time::Instant::now(),
+        &crate::pid_liveness::pid_alive,
+        &crate::process_snapshot::read_current_process_table,
+    )
+}
+
+/// Process-wide memo of wrapper-pane tree walks; see [`WrapperCache`].
+#[cfg(not(target_os = "linux"))]
+static WRAPPER_CACHE: std::sync::LazyLock<std::sync::Mutex<WrapperCache>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(not(target_os = "linux"))]
+fn discover_from_panes_cached(
+    panes: &[PaneInfo],
+    cache: &std::sync::Mutex<WrapperCache>,
+    now: std::time::Instant,
+    alive: &dyn Fn(u32) -> bool,
+    read_table: &dyn Fn() -> ProcessTable,
+) -> Vec<Discovered> {
+    let wrapper = |p: &PaneInfo| {
         classify_command(&p.current_command).is_none()
             && is_wrapper_command(&p.current_command)
             && p.pane_pid != 0
-    });
-    let table = needs_tree.then(crate::process_snapshot::read_current_process_table);
+    };
+    // Answer what the cache can, and walk the table only for the rest.
+    let mut known: HashMap<&str, Option<AgentKind>> = HashMap::new();
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for p in panes.iter().filter(|p| wrapper(p)) {
+            if let Some(hit) = cache.lookup(p.pane_pid, &p.current_command, now, alive) {
+                known.insert(p.pane_id.as_str(), hit);
+            }
+        }
+    }
+    let missing: Vec<&PaneInfo> = panes
+        .iter()
+        .filter(|p| wrapper(p) && !known.contains_key(p.pane_id.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        let table = read_table();
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.expire(now);
+        for p in missing {
+            let found = classify_descendants_in_table(p.pane_pid, &table);
+            cache.record(p.pane_pid, &p.current_command, found, now);
+            known.insert(p.pane_id.as_str(), found.map(|(kind, _)| kind));
+        }
+    }
 
     panes
         .iter()
         .filter_map(|p| {
             classify_command(&p.current_command)
-                .or_else(|| {
-                    if is_wrapper_command(&p.current_command) {
-                        table
-                            .as_ref()
-                            .and_then(|table| classify_descendants_in_table(p.pane_pid, table))
-                    } else {
-                        None
-                    }
-                })
+                .or_else(|| known.get(p.pane_id.as_str()).copied().flatten())
                 .map(|kind| Discovered {
                     pane: p.clone(),
                     kind,
                 })
         })
         .collect()
+}
+
+/// Wrapper panes (`aas`, `node`, …) are classified by walking the process
+/// tree below them, and on macOS that walk needs a whole-table `ps` pass.
+/// Nearly every pane of a heavy user runs behind such a wrapper, so the
+/// walk would otherwise run on every screen-detection tick.
+///
+/// Results are memoized per `(pane_pid, current_command)`:
+///
+/// * A found agent is reused while the agent process it found is still
+///   alive (a `kill(pid, 0)`, no spawn) and for at most
+///   [`WRAPPER_FOUND_MAX_AGE`]. Once that process exits — the wrapper went
+///   on to start something else — the pane is walked again.
+/// * "No agent" is reused for [`WRAPPER_MISS_TTL`], but only once the key
+///   has existed for [`WRAPPER_NEW_KEY_GRACE`]: a freshly started wrapper
+///   is usually still starting its agent, and the startup gate must be
+///   seen promptly.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default)]
+struct WrapperCache {
+    entries: HashMap<(u32, String), WrapperEntry>,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy)]
+struct WrapperEntry {
+    found: Option<(AgentKind, u32)>,
+    checked: std::time::Instant,
+    first_seen: std::time::Instant,
+}
+
+#[cfg(not(target_os = "linux"))]
+const WRAPPER_FOUND_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(not(target_os = "linux"))]
+const WRAPPER_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(not(target_os = "linux"))]
+const WRAPPER_NEW_KEY_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(not(target_os = "linux"))]
+impl WrapperCache {
+    /// `Some(result)` when the cached walk still stands; the inner `None`
+    /// is a cached "no agent", the outer one a miss.
+    #[allow(clippy::option_option)]
+    fn lookup(
+        &self,
+        pane_pid: u32,
+        command: &str,
+        now: std::time::Instant,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> Option<Option<AgentKind>> {
+        let entry = self.entries.get(&(pane_pid, command.to_owned()))?;
+        let since_check = now.saturating_duration_since(entry.checked);
+        match entry.found {
+            Some((kind, pid)) => {
+                (since_check < WRAPPER_FOUND_MAX_AGE && alive(pid)).then_some(Some(kind))
+            }
+            None => (now.saturating_duration_since(entry.first_seen) >= WRAPPER_NEW_KEY_GRACE
+                && since_check < WRAPPER_MISS_TTL)
+                .then_some(None),
+        }
+    }
+
+    fn record(
+        &mut self,
+        pane_pid: u32,
+        command: &str,
+        found: Option<(AgentKind, u32)>,
+        now: std::time::Instant,
+    ) {
+        let key = (pane_pid, command.to_owned());
+        let first_seen = self.entries.get(&key).map_or(now, |entry| entry.first_seen);
+        self.entries.insert(
+            key,
+            WrapperEntry {
+                found,
+                checked: now,
+                first_seen,
+            },
+        );
+    }
+
+    /// Forget keys nobody has re-walked for a while (closed panes).
+    fn expire(&mut self, now: std::time::Instant) {
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.checked) < WRAPPER_FOUND_MAX_AGE * 2
+        });
+    }
 }
 
 /// Walk descendants of `pane_pid` looking for an agent binary. Returns
@@ -158,12 +288,14 @@ pub fn classify_descendants(pane_pid: u32) -> Option<AgentKind> {
     #[cfg(not(target_os = "linux"))]
     {
         let table = crate::process_snapshot::read_current_process_table();
-        classify_descendants_in_table(pane_pid, &table)
+        classify_descendants_in_table(pane_pid, &table).map(|(kind, _)| kind)
     }
 }
 
+/// The agent kind found below `pane_pid` and the pid of the process that
+/// identified it.
 #[cfg(not(target_os = "linux"))]
-fn classify_descendants_in_table(pane_pid: u32, table: &ProcessTable) -> Option<AgentKind> {
+fn classify_descendants_in_table(pane_pid: u32, table: &ProcessTable) -> Option<(AgentKind, u32)> {
     classify_descendants_in_table_with_depth(pane_pid, MAX_TREE_DEPTH, table)
 }
 
@@ -172,18 +304,19 @@ fn classify_descendants_in_table_with_depth(
     root: u32,
     max_depth: u8,
     table: &ProcessTable,
-) -> Option<AgentKind> {
+) -> Option<(AgentKind, u32)> {
     if max_depth == 0 {
         return None;
     }
     for child in table.children(root) {
         if let Some(name) = table.comm(*child) {
             if let Some(k) = classify_command(name) {
-                return Some(k);
+                return Some((k, *child));
             }
         }
-        if let Some(k) = classify_descendants_in_table_with_depth(*child, max_depth - 1, table) {
-            return Some(k);
+        if let Some(found) = classify_descendants_in_table_with_depth(*child, max_depth - 1, table)
+        {
+            return Some(found);
         }
     }
     None
@@ -551,7 +684,163 @@ mod tests {
 
         assert_eq!(
             classify_descendants_in_table(1, &table),
-            Some(AgentKind::Codex)
+            Some((AgentKind::Codex, 200))
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn wrapper_table(with_agent: bool) -> ProcessTable {
+        use crate::process_snapshot::ProcessInfo;
+        let mut processes = vec![ProcessInfo {
+            pid: 100,
+            parent_pid: 1,
+            depth: 0,
+            comm: "aas".into(),
+            cmdline: "aas claude".into(),
+        }];
+        if with_agent {
+            processes.push(ProcessInfo {
+                pid: 200,
+                parent_pid: 100,
+                depth: 0,
+                comm: "claude".into(),
+                cmdline: "claude".into(),
+            });
+        }
+        ProcessTable::from_processes(processes)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn wrapper_pane() -> PaneInfo {
+        PaneInfo {
+            pane_pid: 100,
+            ..pane("%1", "aas")
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn wrapper_walk_is_reused_while_the_found_agent_lives() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let cache = std::sync::Mutex::new(WrapperCache::default());
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            wrapper_table(true)
+        };
+        let alive = Cell::new(true);
+        let is_alive = |pid: u32| pid == 200 && alive.get();
+        let start = Instant::now();
+        let panes = [wrapper_pane()];
+
+        for tick in 0..5 {
+            let found = discover_from_panes_cached(
+                &panes,
+                &cache,
+                start + Duration::from_secs(3 * tick),
+                &is_alive,
+                &read,
+            );
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].kind, AgentKind::ClaudeCode);
+        }
+        assert_eq!(reads.get(), 1, "one table read serves every later tick");
+
+        // The agent exited: the pane is walked again.
+        alive.set(false);
+        discover_from_panes_cached(
+            &panes,
+            &cache,
+            start + Duration::from_secs(20),
+            &is_alive,
+            &read,
+        );
+        assert_eq!(reads.get(), 2);
+
+        // Even a live agent is re-verified after the maximum age.
+        alive.set(true);
+        discover_from_panes_cached(
+            &panes,
+            &cache,
+            start + Duration::from_secs(21),
+            &is_alive,
+            &read,
+        );
+        assert_eq!(reads.get(), 2);
+        discover_from_panes_cached(
+            &panes,
+            &cache,
+            start + Duration::from_secs(400),
+            &is_alive,
+            &read,
+        );
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_new_wrapper_without_an_agent_is_rewalked_until_its_grace_ends() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let cache = std::sync::Mutex::new(WrapperCache::default());
+        let reads = Cell::new(0);
+        let has_agent = Cell::new(false);
+        let read = || {
+            reads.set(reads.get() + 1);
+            wrapper_table(has_agent.get())
+        };
+        let start = Instant::now();
+        let panes = [wrapper_pane()];
+        let at = |secs| start + Duration::from_secs(secs);
+
+        // Inside the grace window every call walks: the agent may be starting.
+        for secs in [0, 3, 6] {
+            assert!(
+                discover_from_panes_cached(&panes, &cache, at(secs), &|_| true, &read).is_empty()
+            );
+        }
+        assert_eq!(reads.get(), 3);
+        // The agent appears and is found on the very next call.
+        has_agent.set(true);
+        assert_eq!(
+            discover_from_panes_cached(&panes, &cache, at(9), &|_| true, &read).len(),
+            1
+        );
+
+        // A long-lived wrapper with no agent is re-walked only every miss TTL.
+        let cache = std::sync::Mutex::new(WrapperCache::default());
+        has_agent.set(false);
+        reads.set(0);
+        discover_from_panes_cached(&panes, &cache, at(0), &|_| true, &read);
+        discover_from_panes_cached(&panes, &cache, at(31), &|_| true, &read);
+        assert_eq!(reads.get(), 2);
+        for secs in [34, 40, 55] {
+            discover_from_panes_cached(&panes, &cache, at(secs), &|_| true, &read);
+        }
+        assert_eq!(reads.get(), 2, "misses are cached after the grace window");
+        discover_from_panes_cached(&panes, &cache, at(62), &|_| true, &read);
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_different_foreground_command_is_a_different_key() {
+        use std::time::Instant;
+        let cache = std::sync::Mutex::new(WrapperCache::default());
+        let now = Instant::now();
+        discover_from_panes_cached(&[wrapper_pane()], &cache, now, &|_| true, &|| {
+            wrapper_table(true)
+        });
+        let node = PaneInfo {
+            pane_pid: 100,
+            ..pane("%1", "node")
+        };
+        let found =
+            discover_from_panes_cached(&[node], &cache, now, &|_| true, &|| wrapper_table(false));
+        assert!(
+            found.is_empty(),
+            "the `aas` result is not reused for `node`"
         );
     }
 

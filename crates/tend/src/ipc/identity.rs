@@ -109,7 +109,9 @@ pub(super) struct CollaborationConnectionActor {
     pub(super) caller_pid: Option<u32>,
     pub(super) caller_uid: Option<u32>,
     pub(super) caller_gid: Option<u32>,
-    pub(super) executable: Option<String>,
+    /// The caller's executable, looked up the first time provenance is
+    /// recorded: most connections (hook ingest, status reads) never need it.
+    pub(super) executable: std::sync::OnceLock<Option<String>>,
     pub(super) observed_pane: Option<String>,
     pub(super) pane_evidence: Option<CollaborationPaneEvidence>,
     pub(super) pane_observed: bool,
@@ -160,7 +162,10 @@ impl CollaborationConnectionActor {
             caller_pid: self.caller_pid,
             caller_uid: self.caller_uid,
             caller_gid: self.caller_gid,
-            executable: self.executable.clone(),
+            executable: self
+                .executable
+                .get_or_init(|| self.caller_pid.and_then(process_executable))
+                .clone(),
             observed_pane: self.observed_pane.clone(),
             pane_evidence: self.pane_evidence,
             origin_match,
@@ -174,8 +179,10 @@ pub(super) fn observe_collaboration_actor(stream: &Stream) -> CollaborationConne
     let caller_pid = peer.pid;
     let caller_uid = peer.uid;
     let caller_gid = peer.gid;
-    let (executable, process_kind) =
-        caller_pid.map_or((None, CollaborationClientKind::Unknown), process_identity);
+    let (executable, process_kind) = caller_pid.map_or(
+        (std::sync::OnceLock::new(), CollaborationClientKind::Unknown),
+        process_identity,
+    );
     CollaborationConnectionActor {
         client_kind: process_kind,
         caller_pid,
@@ -344,15 +351,14 @@ pub(super) fn process_environment_pane(_pid: u32) -> Option<String> {
     None
 }
 
-pub(super) fn process_identity(pid: u32) -> (Option<String>, CollaborationClientKind) {
+/// The caller's executable (pre-filled on Linux, where `/proc` is cheap and
+/// also yields the client kind) and its client kind. Elsewhere the
+/// executable is left for [`process_executable`] to fill on first use.
+pub(super) fn process_identity(
+    pid: u32,
+) -> (std::sync::OnceLock<Option<String>>, CollaborationClientKind) {
     #[cfg(target_os = "linux")]
     {
-        let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            });
         let kind = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map_or(
             CollaborationClientKind::Unknown,
             |bytes| {
@@ -363,21 +369,31 @@ pub(super) fn process_identity(pid: u32) -> (Option<String>, CollaborationClient
                     .unwrap_or(CollaborationClientKind::Unknown)
             },
         );
-        (executable, kind)
+        (std::sync::OnceLock::from(process_executable(pid)), kind)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output()
-            .ok();
-        let executable = output.and_then(|output| {
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        });
-        (executable, CollaborationClientKind::Unknown)
+        let _ = pid;
+        (std::sync::OnceLock::new(), CollaborationClientKind::Unknown)
+    }
+}
+
+/// The executable of `pid`, without spawning a process: `/proc/<pid>/exe` on
+/// Linux, a single-process query elsewhere. This used to be a `ps -o comm=`
+/// spawn on every IPC connection on macOS.
+pub(super) fn process_executable(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::process_snapshot::process_executable(pid)
     }
 }
 

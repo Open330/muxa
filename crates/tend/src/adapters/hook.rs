@@ -39,7 +39,7 @@ pub fn launch_claim(kind: AgentKind) -> Option<String> {
     if std::env::var_os(crate::ask::ASK_ENV_MARKER).is_some()
         || std::env::var_os("TEND_SESSION_ID").is_some()
         || (kind == AgentKind::Codex
-            && crate::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id()))
+            && crate::adapters::proc_ancestry::self_under_shared_codex_app_server())
     {
         return None;
     }
@@ -84,7 +84,7 @@ where
     let pane = if headless
         || surface.is_some()
         || (A::KIND == AgentKind::Codex
-            && crate::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id()))
+            && crate::adapters::proc_ancestry::self_under_shared_codex_app_server())
     {
         // A shared Codex app-server fires hooks for every attached thread
         // with the env of whichever pane started it, so its pane names a

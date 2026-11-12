@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everything) at startup and hourly rather than only at startup; and launch
   archives in `spawns/` that never completed expire after 90 days. The audit,
   backup and mailbox caps can each be turned off with `0`.
+
+- tendd spawns far fewer processes on macOS. In a 35-pane benchmark of
+  hook-owned Codex panes behind a wrapper, tmux and `ps` spawns dropped from
+  about 1,360 to about 190 a minute. The wrapper-pane agent lookup is memoized
+  instead of taking a full `ps` table every 3 s; a Working hook-owned pane is
+  re-captured every 15 s instead of every tick; the reconciler takes one
+  process table per tick instead of two; each IPC connection no longer spawns
+  `ps -o comm=` for its caller (the executable is looked up in-process, and
+  only when collaboration provenance is recorded); and a Codex hook checks its
+  ancestry with per-process queries once, instead of two full `ps` passes.
+
 ### Fixed
 
 - A peer that claims a request and ends its turn without replying no longer

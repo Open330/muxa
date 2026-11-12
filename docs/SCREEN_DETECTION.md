@@ -251,11 +251,17 @@ before the next, so **a slow tick skips rather than overlaps**):
    single `spawn_blocking`, keeping panes selected by a direct command match,
    supported wrapper/process discovery, or a live Codex registry row needing
    recap observation. When **nothing matches, zero captures run** — idle cost
-   is ≈ one pane list.
+   is ≈ one pane list. On macOS a wrapper pane (`aas`, `node`, …) needs a
+   whole-table `ps` pass to find the agent below it; that walk is memoized per
+   `(pane_pid, foreground command)`. A found agent is reused while its process
+   is alive (at most 5 minutes); "no agent" is reused for 30 s, but only for a
+   wrapper older than 30 s, so a starting agent's startup gate is still seen on
+   the next tick.
 2. **Stop dropped rows** — any previously-tracked pane no longer a candidate is
    driven to `Stopped` (see Row liveness).
 3. **Per candidate** — skip if a live non-Codex hook owns it; for live Codex,
-   capture only the recap metadata; otherwise run endpoint-scoped
+   capture only the recap metadata, at most every 15 s while it is Working and
+   every 30 s otherwise unless its state or activity changed; otherwise run endpoint-scoped
    `capture_pane_on` inside `spawn_blocking` (bounded by tmux's 1s command
    timeout), `prepare_capture`, `classify`, and **on a state change** ingest the
    synthetic events through `synthetic::apply_if_unowned` (which re-checks
