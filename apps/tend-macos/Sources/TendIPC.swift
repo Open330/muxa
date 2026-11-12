@@ -1522,6 +1522,22 @@ actor TendIPCClient {
         return (response.reviewItems ?? [], response.reviewHasMore ?? false)
     }
 
+    /// One page of every review item, decided ones included, newest first
+    /// (`review_items_v1`): what Home reads to know which results tendd
+    /// recorded as reviewed.
+    func reviewPage(offset: Int, limit: Int) async throws -> (items: [TendReviewItem], hasMore: Bool) {
+        guard capabilities.contains("review_items_v1") else { return ([], false) }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "review_list",
+            "open_only": false,
+            "oldest_first": false,
+            "limit": limit,
+            "offset": offset,
+        ], timeout: 10)
+        return (response.reviewItems ?? [], response.reviewHasMore ?? false)
+    }
+
     /// Everything pending on the person on this Mac's daemon, in its order
     /// (`decision_queue_v1`), read as the operator console so human
     /// requests are included. nil from a daemon without the queue: the

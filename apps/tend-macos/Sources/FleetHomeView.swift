@@ -50,7 +50,8 @@ struct FleetHomeView: View {
         if decisionFeed.reviewedKeys != nil {
             let feed = decisionFeed
             let client = model.client
-            Task { await feed.recordLooksGood(work, client: client) }
+            let works = allWorks
+            Task { await feed.recordLooksGood(work, client: client, works: works) }
             return
         }
         reviewed.markReviewed(work)
@@ -109,7 +110,7 @@ struct FleetHomeView: View {
             // Decisions made elsewhere (the CLI, an agent, another window)
             // leave the queue while Home stays open.
             while !Task.isCancelled {
-                await decisionFeed.load(model.client)
+                await decisionFeed.load(model.client, works: allWorks)
                 try? await Task.sleep(for: FleetDecisionFeed.refreshEvery)
             }
         }

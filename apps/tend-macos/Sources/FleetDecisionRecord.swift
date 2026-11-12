@@ -28,12 +28,28 @@ enum FleetDecisionRecord {
     }
 
     /// The keys of results accepted from Home, which Home hides.
-    static func reviewedKeys(in history: TendDecisionHistory) -> Set<String> {
-        Set(history.items.compactMap { item -> String? in
-            guard case .review(let review) = item, review.disposition?.kind == "accepted",
+    static func reviewedKeys(in reviews: [TendReviewItem]) -> Set<String> {
+        Set(reviews.compactMap { review -> String? in
+            guard review.disposition?.kind == "accepted",
                   let key = review.idempotencyKey, kind(ofKey: key) == .looksGood else { return nil }
             return key
         })
+    }
+
+    static let reviewPageSize = 500
+    /// At most this many pages per read (5,000 records).
+    static let maxReviewPages = 10
+
+    /// How far back review records matter: a minute before the earliest
+    /// finish among the board's finished results. nil (read to the bound)
+    /// when one has no time.
+    static func cutoff(for works: [FleetWork]) -> Date? {
+        var earliest: Date?
+        for work in works where work.lane == .finished {
+            guard let at = work.lastChange ?? work.since else { return nil }
+            earliest = min(earliest ?? at, at)
+        }
+        return (earliest ?? Date()).addingTimeInterval(-60)
     }
 
     static func summary(_ work: FleetWork) -> String {

@@ -19,6 +19,9 @@ private final class RecordingDaemon: @unchecked Sendable {
     var capabilities = ["session_bytes_v1", "session_attachment_identity_v1", "work_control_v1",
                         "review_items_v1", "review_record_v1", "decision_queue_v1"]
     var refuseRecords = false
+    /// Older records already in the store, oldest first.
+    var preloaded: [(key: String, at: String)] = []
+    private(set) var pagesRead = 0
 
     var records: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return recorded }
 
@@ -35,6 +38,24 @@ private final class RecordingDaemon: @unchecked Sendable {
             if refuseRecords { return try JSONSerialization.data(withJSONObject: ["ok": false, "error": "review store unavailable"]) }
             recorded.append(object)
             return try JSONSerialization.data(withJSONObject: ["ok": true])
+        case "review_list":
+            // Newest first: what was recorded here, then the preloaded ones.
+            let made: [[String: Any]] = recorded.enumerated().reversed().map { index, request in
+                let review = request["review"] as? [String: Any] ?? [:]
+                return Self.item("rv_\(index)", key: review["idempotency_key"] as? String ?? "", at: "2026-11-12T23:00:00Z",
+                                 disposition: request["disposition"] as? String ?? "accepted")
+            }
+            let older = preloaded.enumerated().reversed().map { index, old in
+                Self.item("old_\(index)", key: old.key, at: old.at, disposition: "accepted")
+            }
+            let all = made + older
+            let offset = object["offset"] as? Int ?? 0
+            let limit = object["limit"] as? Int ?? 50
+            let page = Array(all.dropFirst(offset).prefix(limit))
+            pagesRead += 1
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true, "review_items": page, "review_has_more": offset + page.count < all.count,
+            ])
         case "decision_queue":
             return try JSONSerialization.data(withJSONObject: ["ok": true, "decision_queue": ["items": []]])
         case "decision_history":
@@ -51,6 +72,14 @@ private final class RecordingDaemon: @unchecked Sendable {
         default:
             return try JSONSerialization.data(withJSONObject: ["ok": true])
         }
+    }
+
+    static func item(_ id: String, key: String, at: String, disposition: String) -> [String: Any] {
+        [
+            "id": id, "target": ["kind": "session", "session_id": "s"], "generation": 1, "summary": "x",
+            "idempotency_key": key, "requested_at": at, "requested_by": ["kind": "user"],
+            "disposition": ["kind": disposition, "by": ["kind": "user"], "at": at],
+        ]
     }
 
     func client() -> TendIPCClient {
@@ -84,7 +113,8 @@ private final class RecordingDaemon: @unchecked Sendable {
         #expect(answer.answer == "Merge now" && answer.request.requestID == "req_1")
         #expect(answer.request.decision?.options == ["Merge now", "Hold"])
         // Only Looks Good from Home hides a result; an answer never does.
-        #expect(FleetDecisionRecord.reviewedKeys(in: history) == ["home:abc"])
+        let reviews: [TendReviewItem] = history.items.compactMap { if case .review(let review) = $0 { review } else { nil } }
+        #expect(FleetDecisionRecord.reviewedKeys(in: reviews) == ["home:abc"])
         #expect(FleetDecisionRecord.kind(ofKey: "home-answer:def") == .answered)
         #expect(FleetDecisionRecord.kind(ofKey: "home-sendback:x") == .sentBack)
         #expect(FleetDecisionRecord.kind(ofKey: "cli:x") == nil)
@@ -139,16 +169,16 @@ private final class RecordingDaemon: @unchecked Sendable {
         let client = daemon.client()
         try await client.hello()
         let feed = FleetDecisionFeed()
-        await feed.load(client)
-        #expect(feed.reviewedKeys == [])
         let work = try finished("a", at: "2026-11-08T01:00:00Z")
-        await feed.recordLooksGood(work, client: client)
+        await feed.load(client, works: [work])
+        #expect(feed.reviewedKeys == [])
+        await feed.recordLooksGood(work, client: client, works: [work])
         #expect(feed.reviewedKeys == [FleetBoard.reviewKey(work)])
         #expect(daemon.records.first?["disposition"] as? String == "accepted")
 
         daemon.refuseRecords = true
         let other = try finished("b", at: "2026-11-08T01:00:00Z")
-        await feed.recordLooksGood(other, client: client)
+        await feed.recordLooksGood(other, client: client, works: [work, other])
         #expect(feed.reviewedKeys?.contains(FleetBoard.reviewKey(other)) == false)
         #expect(feed.problem?.contains("review store unavailable") == true)
     }
@@ -170,6 +200,34 @@ private final class RecordingDaemon: @unchecked Sendable {
         #expect(feed.reviewedKeys == [FleetBoard.reviewKey(shown)])
     }
 
+    /// A result reviewed long ago, behind many newer records, stays hidden:
+    /// the read pages back to the board's oldest finished result.
+    @MainActor
+    @Test func anOldReviewBehindManyNewerOnesStillHides() async throws {
+        let daemon = RecordingDaemon()
+        let work = try finished("a", at: "2026-11-08T01:00:00Z")
+        daemon.preloaded = [(FleetBoard.reviewKey(work), "2026-11-08T02:00:00Z")]
+            + (0..<1_200).map { ("home:other\($0)", "2026-11-10T00:00:00Z") }
+        let client = daemon.client()
+        try await client.hello()
+        let feed = FleetDecisionFeed()
+        await feed.load(client, works: [work])
+        #expect(feed.reviewedKeys?.contains(FleetBoard.reviewKey(work)) == true)
+        #expect(daemon.pagesRead == 3)
+    }
+
+    @MainActor
+    @Test func aMigrationTheDaemonDidNotRecordIsNotDone() async throws {
+        let daemon = RecordingDaemon()
+        let client = daemon.client()
+        try await client.hello()
+        let work = try finished("a", at: "2026-11-08T01:00:00Z")
+        var marks = FleetReviewMarks()
+        marks.markReviewed(work)
+        daemon.refuseRecords = true
+        #expect(await FleetDecisionFeed().migrate(marks, works: [work], client: client) == false)
+    }
+
     @MainActor
     @Test func anOlderDaemonKeepsTheLocalMarks() async throws {
         let daemon = RecordingDaemon()
@@ -177,7 +235,7 @@ private final class RecordingDaemon: @unchecked Sendable {
         let client = daemon.client()
         try await client.hello()
         let feed = FleetDecisionFeed()
-        await feed.load(client)
+        await feed.load(client, works: [try finished("a", at: "2026-11-08T01:00:00Z")])
         #expect(feed.reviewedKeys == nil)
         #expect(try await client.recordDecision(
             target: .session(provider: "c", sessionID: "s"), key: "k", summary: "s", disposition: .accepted, note: nil
