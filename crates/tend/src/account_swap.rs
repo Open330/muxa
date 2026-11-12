@@ -3856,8 +3856,10 @@ fn signal_pids(signal: &str, pids: &[u32]) {
         .status();
 }
 
+/// Signal 0 / `/proc`, not a `ps` spawn: the stop loop polls this every
+/// 100 ms, and an `EPERM` answer is a live process, not an exit.
 fn is_alive(pid: u32) -> bool {
-    process_command(pid).is_some()
+    crate::pid_liveness::pid_alive(pid)
 }
 
 /// The command line of `pid`, or `None` once it has exited.

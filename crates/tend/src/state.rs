@@ -405,30 +405,7 @@ fn default_state_entered_at() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
-/// Whether an OS process is still alive, used for pid-tracked task rows.
-/// Dependency-free: a fast `/proc/<pid>` check on Linux (the primary
-/// target), falling back to `kill -0` elsewhere (macOS/BSD have no
-/// `/proc`). A live entry — including a zombie, which vanishes once reaped
-/// — counts as alive.
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    #[cfg(windows)]
-    {
-        crate::process_snapshot::pid_exists(pid)
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-}
+use crate::pid_liveness::pid_alive;
 
 impl Agent {
     /// Prefer a captured response over sparse compaction/resume metadata.
@@ -2182,19 +2159,48 @@ impl Store {
     /// `None` means the surface no longer exists; `Some(false)` means its
     /// process exited but output is still available. A failed lookup is a no-op.
     /// Lookups run under the registry lock, so a new hook cannot race cleanup.
+    /// Pid liveness is read before the lock is taken; a row whose pid changed
+    /// in between is left for the next pass.
     pub async fn reconcile_native_surfaces<F>(&self, lookup: F) -> usize
     where
         F: Fn(&str) -> Result<Option<bool>, crate::session::SessionError> + Send,
     {
+        let native = |agent: &Agent| {
+            agent
+                .surface
+                .as_ref()
+                .is_some_and(|surface| surface.kind == crate::event::SurfaceKind::Pty)
+                && agent.pane.is_none()
+        };
+        let pids: Vec<(String, u32)> = self
+            .agents
+            .read()
+            .await
+            .iter()
+            .filter(|(_, agent)| native(agent))
+            .filter_map(|(key, agent)| agent.pid.map(|pid| (key.clone(), pid)))
+            .collect();
+        let live: HashMap<String, (u32, bool)> = pids
+            .into_iter()
+            .map(|(key, pid)| (key, (pid, pid_alive(pid))))
+            .collect();
         let mut agents = self.agents.write().await;
         let mut changed = 0;
-        for agent in agents.values_mut() {
+        for (key, agent) in agents.iter_mut() {
+            if !native(agent) {
+                continue;
+            }
+            let pid_live = match agent.pid {
+                None => false,
+                Some(pid) => match live.get(key) {
+                    Some(&(checked, alive)) if checked == pid => alive,
+                    // Registered or re-pidded since the check: next pass.
+                    _ => continue,
+                },
+            };
             let Some(surface) = agent.surface.as_ref() else {
                 continue;
             };
-            if surface.kind != crate::event::SurfaceKind::Pty || agent.pane.is_some() {
-                continue;
-            }
             let running = match lookup(&surface.id) {
                 Ok(Some(true)) | Err(_) => continue,
                 Ok(other) => other,
@@ -2205,7 +2211,7 @@ impl Store {
             }
             // A surviving pid after daemon restart still owns its task row.
             // Detach the stale surface, but leave pid liveness to its own sweep.
-            if missing && agent.pid.is_some_and(pid_alive) {
+            if missing && pid_live {
                 changed += 1;
                 continue;
             }
@@ -2456,14 +2462,30 @@ impl Store {
     /// changes state, never deletes — the regular GC reaps `Stopped` rows
     /// after their inactivity TTL. Returns the number of rows flipped.
     pub async fn reap_dead_pids(&self) -> usize {
+        // Liveness is checked with no registry lock held. A row is flipped
+        // only if it still tracks the pid that was found dead.
+        let tracked: Vec<(String, u32)> = self
+            .agents
+            .read()
+            .await
+            .iter()
+            .filter(|(_, agent)| agent.state != AgentState::Stopped)
+            .filter_map(|(key, agent)| agent.pid.map(|pid| (key.clone(), pid)))
+            .collect();
+        let dead: Vec<(String, u32)> = tracked
+            .into_iter()
+            .filter(|(_, pid)| !pid_alive(*pid))
+            .collect();
+        if dead.is_empty() {
+            return 0;
+        }
         let mut agents = self.agents.write().await;
         let mut flipped = 0_usize;
-        for agent in agents.values_mut() {
-            let Some(pid) = agent.pid else { continue };
-            if agent.state == AgentState::Stopped {
+        for (key, pid) in dead {
+            let Some(agent) = agents.get_mut(&key) else {
                 continue;
-            }
-            if pid_alive(pid) {
+            };
+            if agent.pid != Some(pid) || agent.state == AgentState::Stopped {
                 continue;
             }
             let prev = agent.state;
@@ -3912,6 +3934,22 @@ mod tests {
         );
         // Idempotent: a second pass flips nothing new.
         assert_eq!(store.reap_dead_pids().await, 0);
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn reap_dead_pids_keeps_another_users_live_process() {
+        let store = Store::shared();
+        // pid 1 is root's: signal 0 answers EPERM, which is a live process.
+        store
+            .register_task("root".into(), Some(1), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.reap_dead_pids().await, 0);
+        assert_eq!(
+            store.by_session("root").await.unwrap().state,
+            AgentState::Working
+        );
     }
 
     #[tokio::test]
