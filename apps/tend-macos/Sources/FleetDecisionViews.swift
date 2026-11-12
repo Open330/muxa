@@ -19,6 +19,9 @@ final class FleetDecisionFeed: ObservableObject {
     @Published private(set) var busy: Set<String> = []
     /// The last error recording a decision, by id.
     @Published var failures: [String: String] = [:]
+    /// The one decision whose answer is open, and the text typed so far.
+    @Published private var composingID: String?
+    @Published private var drafts: [String: String] = [:]
     private var loading = false
 
     static let refreshEvery: Duration = .seconds(5)
@@ -51,6 +54,27 @@ final class FleetDecisionFeed: ObservableObject {
         guard let local = model.fleetHosts.first(where: \.local)?.identity else { return [] }
         let merged = FleetDecisions.merge(queue: queue, reviews: reviews, messages: model.operatorMessages, localHost: local)
         return FleetDecisions.attachAskers(merged, agents: model.hostedAgents)
+    }
+
+    /// The open answer for `id`: one composer at a time across Home and the
+    /// Review sheet, so a keyboard Send can only reach the one on screen.
+    func draft(for id: String) -> Binding<String?> {
+        Binding(
+            get: { [weak self] in
+                guard let self, self.composingID == id else { return nil }
+                return self.drafts[id] ?? ""
+            },
+            set: { [weak self] value in
+                guard let self else { return }
+                if let value {
+                    self.composingID = id
+                    self.drafts[id] = value
+                } else if self.composingID == id {
+                    self.composingID = nil
+                    self.drafts[id] = nil
+                }
+            }
+        )
     }
 
     /// Replies to a human request as the person; tendd records the answer.
@@ -268,7 +292,17 @@ struct FleetDecisionCard: View {
     var openAsker: (() -> Void)?
     /// Opens with the answer field showing, for previews and tests.
     var initialAnswer: String?
-    @State private var composing: String?
+    /// The open answer, shared by every card so only one composer (and one
+    /// ⌘↩ Send) exists at a time; a card without one keeps its own.
+    var draft: Binding<String?>?
+    @State private var localDraft: String?
+
+    private var composing: String? {
+        get { draft?.wrappedValue ?? localDraft }
+        nonmutating set {
+            if let draft { draft.wrappedValue = newValue } else { localDraft = newValue }
+        }
+    }
     @Environment(\.colorScheme) private var colorScheme
 
     private var answerText: String { composing ?? initialAnswer ?? "" }

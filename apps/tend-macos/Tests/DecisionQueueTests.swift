@@ -106,6 +106,13 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
         // The waiting agent is already a Work card; the local request is the
         // queue's copy; the remote one follows; the answered one is gone.
         #expect(decisions.map(\.id) == ["human:mac:req_1", "review:rv_1", "human:mini:req_r"])
+        #expect(decisions[0].detail == "Merge #12 now?", "the queue's copy wins")
+
+        // A partial queue (its human-request source unavailable) is not
+        // proof of absence: this Mac's mailbox copy still shows.
+        let partial = TendPendingQueue(items: [], unavailable: ["human requests: locked"])
+        let local2 = try message(host: local, id: "req_2", created: "2026-11-12T01:00:00Z")
+        #expect(FleetDecisions.merge(queue: partial, reviews: [], messages: [local2], localHost: local).map(\.id) == ["human:mac:req_2"])
         #expect(decisions[0].title == "Merge #12 or hold for the perf run?")
         #expect(decisions[0].detail == "Merge #12 now?")
         #expect(decisions[0].asker == "@impl")
@@ -220,6 +227,56 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
         }
         #expect(ChangesRevision(range: "--output=x") == nil)
         #expect(ChangesRevision(commit: "xyz") == nil)
+    }
+
+    /// A partial clone's missing blobs stay missing: Changes never fetches
+    /// from the promisor remote, whatever git version honours which switch.
+    @Test(.enabled(if: GitRunner.shared != nil))
+    func aPartialCloneIsNeverFetchedFrom() async throws {
+        let git = try #require(GitRunner.shared)
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("tend-promisor-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let source = base.appendingPathComponent("src").path
+        let clone = base.appendingPathComponent("clone").path
+        try FileManager.default.createDirectory(atPath: source, withIntermediateDirectories: true)
+        // Plain git, outside the app's settings, to build the fixture.
+        func plain(_ args: [String], in dir: String) async -> GitOutput {
+            let output = await BoundedProcess.run(
+                executable: git.executable,
+                arguments: ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                            "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"] + args,
+                limit: 1 << 20, timeout: 20
+            )
+            #expect(output.status == 0, "git \(args.joined(separator: " ")): \(output.stderr)")
+            return output
+        }
+        _ = await plain(["init", "-q", "-b", "main"], in: source)
+        try "one\n".write(toFile: "\(source)/a.txt", atomically: true, encoding: .utf8)
+        _ = await plain(["add", "."], in: source)
+        _ = await plain(["commit", "-q", "-m", "first"], in: source)
+        try "one\ntwo\n".write(toFile: "\(source)/a.txt", atomically: true, encoding: .utf8)
+        _ = await plain(["commit", "-q", "-am", "second"], in: source)
+        _ = await plain(["config", "uploadpack.allowfilter", "true"], in: source)
+        _ = await plain(["clone", "-q", "--no-checkout", "--filter=blob:none", "file://\(source)", clone], in: base.path)
+        let head = await plain(["rev-parse", "HEAD"], in: clone).stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        func missing() async -> Int {
+            let output = await plain(["rev-list", "--objects", "--missing=print", "HEAD"], in: clone)
+            return output.stdoutText.split(separator: "\n").filter { $0.hasPrefix("?") }.count
+        }
+        let before = await missing()
+        #expect(before > 0, "the fixture must start with promised blobs")
+
+        let loader = ChangesLoader(git: git)
+        let revision = try #require(ChangesRevision(commit: head))
+        let resolved = try await loader.resolve(revision, root: clone).get()
+        let files = try await loader.branchFiles(root: clone, base: resolved).get()
+        if let file = files.first {
+            if case .success(let loaded) = await loader.diff(root: clone, file: file, base: resolved) {
+                #expect(loaded.file.hunks.isEmpty, "a promised blob must not be fetched to show its diff")
+            }
+        }
+        #expect(await missing() == before, "Changes fetched from the promisor remote")
     }
 
     @MainActor

@@ -254,7 +254,8 @@ struct FleetHomeView: View {
             openRevision: openRevision,
             answer: { text in await feed.answer(decision, text: text, model: model) },
             decide: { disposition, note in await feed.decide(decision, disposition, note: note, model: model) },
-            openAsker: asker.map { hosted in { open(hosted) } }
+            openAsker: asker.map { hosted in { open(hosted) } },
+            draft: feed.draft(for: decision.id)
         )
     }
 
@@ -399,6 +400,7 @@ struct FleetHomeView: View {
                             works: works.filter { $0.lane == lane },
                             decisions: lane == .needsYou ? decisions : [],
                             decisionCard: { decisionCard($0) { revisionTarget = $0 } },
+                            decisionProblem: lane == .needsYou ? decisionFeed.problem : nil,
                             selectedID: selectedID,
                             select: { id in selectedID = selectedID == id ? nil : id },
                             open: peek,
@@ -450,6 +452,8 @@ private struct FleetLaneColumn: View {
     /// The daemon's decisions, in Your turn only, above the Work cards.
     var decisions: [FleetDecision] = []
     var decisionCard: ((FleetDecision) -> FleetDecisionCard)?
+    /// Why the decisions may be incomplete (a source tendd could not read).
+    var decisionProblem: String?
     let selectedID: String?
     let select: (String) -> Void
     let open: (TendHostedAgent) -> Void
@@ -529,6 +533,14 @@ private struct FleetLaneColumn: View {
             .padding(.bottom, 8)
             ScrollView {
                 LazyVStack(spacing: 8) {
+                    if let decisionProblem {
+                        Label(decisionProblem, systemImage: "exclamationmark.circle")
+                            .font(TendType.meta)
+                            .foregroundStyle(.orange)
+                            .lineLimit(3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 4)
+                    }
                     if let decisionCard {
                         ForEach(decisions) { decision in
                             decisionCard(decision)

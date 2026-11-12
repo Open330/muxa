@@ -356,7 +356,9 @@ struct FleetDecision: Identifiable, Hashable, Sendable {
 enum FleetDecisions {
     /// The queue Home shows. With the daemon's queue: its human requests and
     /// review items in its order (waiting agents are already Work cards),
-    /// then other hosts' human requests from the console mailbox. Without
+    /// then the console mailbox's human requests it does not hold: other
+    /// hosts', and this Mac's when the queue read was partial (a source
+    /// unavailable, truncated, an entry this app could not decode). Without
     /// it: this Mac's open review items, then every host's human requests.
     /// One request is listed once.
     static func merge(
@@ -383,8 +385,6 @@ enum FleetDecisions {
         }
         let pending = messages
             .filter { $0.isHumanRequest && $0.request.needsHumanResponse }
-            // The queue already holds this Mac's human requests, in order.
-            .filter { queue == nil || $0.host.alias != localHost.alias }
             .sorted { $0.request.createdAt < $1.request.createdAt }
         pending.forEach { add(FleetDecision(humanRequest: $0)) }
         return result

@@ -135,7 +135,9 @@ Review sheet; see [MACOS](MACOS.md#workspace-information-architecture). It
 opens commit and range evidence in a read-only Changes view on the person's
 click, with the same read-only git settings as the rest of Changes
 (`--no-ext-diff`, `--no-textconv`, `core.fsmonitor=false`, no optional locks,
-no lazy fetch from a promisor remote).
+no lazy fetch from a promisor remote, and every transport refused through
+`protocol.allow=never` and an empty `GIT_ALLOW_PROTOCOL`, so an older git that
+ignores `GIT_NO_LAZY_FETCH` cannot fetch either).
 
 ## Status line
 
