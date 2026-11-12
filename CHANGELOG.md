@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The daemon removes terminal launch archives after 30 days, retaining live
+  agents’ launch records and unfinished launch tickets.
+
 ## [0.10.8] - 2026-11-12
 
 ### Fixed

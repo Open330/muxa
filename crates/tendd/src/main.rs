@@ -352,7 +352,7 @@ async fn run() -> Result<()> {
         &activity_transition_shutdown_tx,
     )
     .await;
-    let gc_handle = spawn_gc_task(&store, &shutdown_tx);
+    let gc_handle = spawn_gc_task(&store, &collaboration, &shutdown_tx);
     let directory_max_age = if cfg.reconciler.enabled {
         cfg.reconciler.interval_secs.saturating_add(2)
     } else {
@@ -3624,9 +3624,11 @@ async fn send_collaboration_text(
 /// rather than relying on the runtime falling out from under it.
 fn spawn_gc_task(
     store: &tend::SharedStore,
+    collaboration: &Arc<CollaborationStore>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let store = store.clone();
+    let collaboration = collaboration.clone();
     let ttl = time::Duration::minutes(STOPPED_AGENT_TTL_MINUTES);
     let tick = std::time::Duration::from_secs(GC_SWEEP_INTERVAL_SECONDS);
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -3636,6 +3638,27 @@ fn spawn_gc_task(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Snapshot before evicting stopped rows. Open tickets protect
+                    // launches even before an agent has registered.
+                    let agents = store.snapshot().await;
+                    let mut protected: std::collections::BTreeSet<String> = collaboration.worker_spawn_records().await.into_iter()
+                        .filter(|spawn| spawn.closed_at.is_none()
+                            && spawn.phase != tend::collaboration::WorkerSpawnPhase::Failed)
+                        .map(|spawn| spawn.launch_id).collect();
+                    protected.extend(store.protected_launch_archives());
+                    if let Some(directory) = tend::launch_identity::archive_directory() {
+                        let result = tokio::task::spawn_blocking(move || {
+                            tend::launch_identity::prune_archives(
+                                &directory, &agents, &protected, std::time::SystemTime::now(),
+                            )
+                        }).await;
+                        match result {
+                            Ok(Ok(removed)) if removed > 0 => tracing::debug!(removed, "gc swept launch archives"),
+                            Ok(Err(error)) => tracing::warn!(%error, "launch archive sweep failed"),
+                            Err(error) => tracing::warn!(%error, "launch archive sweep task failed"),
+                            _ => {}
+                        }
+                    }
                     let removed = store.gc(ttl).await;
                     if removed > 0 {
                         tracing::debug!(removed, "gc swept stopped agents");
