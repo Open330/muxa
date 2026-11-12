@@ -28,7 +28,7 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
 
 | opencode signal | tend event | State |
 | --- | --- | --- |
-| `session.created`, or the first prompt into a session tend has not seen created | `Started` | idle |
+| `session.created`, or a prompt into a session other than the pane's current one | `Started` | idle |
 | `chat.message` (non-synthetic text parts of the user message) | `PromptSubmitted` | working |
 | tool part `state.status` → `running` | `ToolStarted` (`bash` carries its command) | working |
 | tool part `state.status` → `completed` / `error` | `ToolCompleted` | — |
@@ -48,10 +48,10 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
   the plugin, so one pane is one conversation.
 - **Pane binding comes from prompts, not from event arrival.** opencode hands
   the plugin every session's events in its directory, so an event does not
-  say which session the TUI is showing. A session is bound to the pane when
-  it is created, or by the first prompt sent into it (a resumed session),
-  once. Events from other sessions update only their own rows. Switching
-  back to a session already bound in this pane does not move the row.
+  say which session the TUI is showing. The pane is bound to a session when
+  it is created, and rebound whenever a prompt goes into a different session
+  than the last one, so the pane keeps one live row. Events from other
+  sessions update only their own rows.
 - **Responses** are reset at each prompt and reported only for a turn that
   ended without `session.error`; a failed or aborted turn's partial output is
   not recorded as its answer, and a failed turn stays in error after idle.
@@ -71,7 +71,8 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
   they reach any pane-based agent without that hook: delivered into the pane
   when its row is idle.
 - **Account routing** is Claude/Codex only.
-- **Modes.** Discovery sees the process name only, so a pane running
-  `opencode serve` or `opencode run` is registered too and stays idle; only
-  the interactive TUI (what `tend agent start --agent opencode` launches)
-  produces events.
+- **Modes.** Discovery sees the process name only, so it cannot tell the
+  interactive TUI from `opencode serve` or `opencode run`, and registers a
+  pane running either. The plugin runs in opencode's server in every mode,
+  but only the TUI (what `tend agent start --agent opencode` launches) gives
+  the pane an input target for typed delivery.

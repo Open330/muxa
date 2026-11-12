@@ -23,7 +23,7 @@ export const TendPlugin = async ({ $, client, directory }) => {
   const replies = new Map(); // sessionID -> { messageID, parts: Map<partID, text> }
   const tools = new Map(); // sessionID:messageID:callID -> last forwarded status
   const completed = new Map(); // assistant messageIDs already reported
-  const announced = new Map(); // top-level sessionIDs tend has been told about
+  let owner = null; // the session the pane's user last prompted (or created)
   const incomplete = new Set(); // sessionIDs whose current turn failed or was aborted
 
   const remember = (map, key, value, cap = 512) => {
@@ -58,11 +58,11 @@ export const TendPlugin = async ({ $, client, directory }) => {
     const sessionID = properties && properties.sessionID;
     if (sessionID && children.has(sessionID)) return;
     // A prompt is the one event that says this pane's user is driving a
-    // session. The first prompt into a session tend has not seen created
-    // (resumed, or picked in the session list) binds the pane to it, once.
-    // Any other event only updates that session's own row.
-    if (type === "tend.prompt" && sessionID && !announced.has(sessionID)) {
-      remember(announced, sessionID, true);
+    // session. A prompt into a session other than the pane's current owner
+    // rebinds the pane to it (so A→B→A leaves one live row); any other event
+    // only updates that session's own row.
+    if (type === "tend.prompt" && sessionID && sessionID !== owner) {
+      owner = sessionID;
       queue.push({ type: "tend.session.active", properties: { sessionID }, tend: { directory } });
     }
     queue.push({ type, properties, tend: { directory, ...extra } });
@@ -108,11 +108,12 @@ export const TendPlugin = async ({ $, client, directory }) => {
             return;
           }
           if (event.type === "session.created") {
-            remember(announced, p.info.id, true);
+            owner = p.info.id;
             send(event.type, { sessionID, info: { id: p.info.id, directory: p.info.directory } });
           }
           return;
         case "session.deleted":
+          if (sessionID === owner) owner = null;
           send(event.type, { sessionID });
           return;
         case "session.idle":

@@ -89,16 +89,17 @@ const assistant = async (emit, sessionID, id, text) => {
   await emit("message.part.updated", { part: { id: `${id}-p`, sessionID, messageID: id, type: "text", text } });
 };
 
-test("only a prompt binds a session, once; other sessions' events never do", async () => {
+test("only a prompt that changes the owner rebinds; other sessions' events never do", async () => {
   const { sent, hooks, emit, settle } = await harness();
   await prompt(hooks, "A", "first");
   await emit("permission.asked", { id: "p", sessionID: "A", permission: "bash", patterns: [] });
   await prompt(hooks, "B", "second");
   await emit("permission.replied", { sessionID: "A", requestID: "p", reply: "once" });
   await prompt(hooks, "A", "again");
+  await prompt(hooks, "A", "and again");
   await settle();
   const binds = sent.filter((p) => p.type === "tend.session.active").map((p) => p.properties.sessionID);
-  assert.deepEqual(binds, ["A", "B"]);
+  assert.deepEqual(binds, ["A", "B", "A"]);
 });
 
 test("a reply from an earlier turn never reaches a later idle", async () => {

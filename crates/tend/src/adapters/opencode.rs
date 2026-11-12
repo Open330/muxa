@@ -30,10 +30,10 @@
 //!   (a failed or aborted turn's partial output is not its answer).
 //! - **A pane is bound by a prompt, not by event arrival.** opencode delivers
 //!   every session's events in the directory to the plugin, so an event says
-//!   nothing about which session the TUI shows. `session.created` and the
-//!   first prompt into a session tend has not seen created (a resumed one)
-//!   become `Started`, once per session; everything else only updates that
-//!   session's own row.
+//!   nothing about which session the TUI shows. `session.created`, and a
+//!   prompt into a session other than the one the pane last prompted, become
+//!   `Started` (which reconciles the pane to that one row); everything else
+//!   only updates that session's own row.
 //!
 //! `session.idle` is opencode's explicit `status = idle`, so it is sent with
 //! `idle_confirmed`: it clears a pending wait, keeps an error, and never
@@ -523,6 +523,30 @@ mod tests {
         ])
         .await;
         assert_eq!(state, crate::event::AgentState::Idle);
+    }
+
+    /// What the plugin emits for prompts A, B, then A again in one pane:
+    /// the pane must end with exactly one live row, A's.
+    #[tokio::test]
+    async fn switching_back_leaves_one_live_row_on_the_pane() {
+        let store = crate::state::Store::shared();
+        for session in ["A", "B", "A"] {
+            for payload in [
+                json!({ "type": "tend.session.active", "properties": { "sessionID": session } }),
+                json!({ "type": "tend.prompt", "properties": { "sessionID": session, "text": "go" } }),
+            ] {
+                store.apply(&ev(payload).unwrap()).await;
+            }
+        }
+        let live: Vec<String> = store
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|agent| agent.pane.as_deref() == Some("%7"))
+            .filter(|agent| agent.state != crate::event::AgentState::Stopped)
+            .map(|agent| agent.session_id)
+            .collect();
+        assert_eq!(live, ["A"]);
     }
 
     /// The previous adapter searched every nested object for keys such as
