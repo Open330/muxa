@@ -9,11 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-### Changed
-
-- Session-activity sampling lists tmux sessions and clients in one `tmux`
-  call instead of two, every 5 seconds.
-
 - `tend work dispatch-status` (and `tend_dispatch_status`) includes the
   result records filed on the dispatched Work: summary, decision asked for,
   evidence, and the person's disposition and note, refreshed on every read.
@@ -45,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`collaboration_execute_overlap_v1`).
 - Session-activity sampling lists tmux sessions and clients in one `tmux`
   call instead of two, every 5 seconds.
+
 ## [0.10.14] - 2026-11-12
 
 ### Added
