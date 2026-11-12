@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ids the daemon stamps from your pane (`thread_id`, `workspace_id`,
   `work_id`, `run_id`) are no longer advertised. 16 tools, 26,607 bytes,
   about half of the 52,864 this stream started from.
+- The installed Tend agent instructions match the new MCP surface and are
+  shorter: the collaboration skill drops from 13,982 to about 6,000 bytes,
+  the bootstrap from 3,798 to about 2,600, the workflow examples from 5,539 to
+  about 3,000. Sending work is documented as returning at once, with the
+  reply arriving as a wake. The collaboration guide's next steps name the
+  listed tools.
 
 ### Fixed
 
