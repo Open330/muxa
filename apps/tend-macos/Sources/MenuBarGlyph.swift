@@ -4,8 +4,9 @@ import SwiftUI
 /// What a menu-bar face shows: an SF Symbol name, a product's logo
 /// (`tend.claude`, `tend.codex`, `tend.gemini`, …), or a short text
 /// (`text:🚀`, `text:MB`) a person chose for a fleet host. Drawn the same
-/// way in the menu-bar image and in the SwiftUI lists. Logos are drawn from
-/// their one-colour variant, since a face is white on the identity colour.
+/// way in the menu-bar image and in the SwiftUI lists. A logo is drawn as
+/// its owner publishes it, on no background (`drawsOwnFace`); every other
+/// glyph is white on the face's identity colour.
 enum TendGlyph {
     static let claude = "tend.claude"
     static let codex = "tend.codex"
@@ -51,11 +52,27 @@ enum TendGlyph {
         String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2))
     }
 
+    /// True when the glyph is a logo that fits `slot`: it is then the whole
+    /// face, with no identity-colour disc behind it. A logo too small for
+    /// its brand's minimum (OpenCode in the menu bar) is not drawn; the face
+    /// keeps its disc and shows a terminal symbol instead.
+    static func drawsOwnFace(_ value: String, slot: CGFloat) -> Bool {
+        if case .logo(let logo) = kind(value) { return logo.fits(slot) }
+        return false
+    }
+
+    /// What a logo that does not fit its slot shows instead.
+    static let tooSmallSymbol = "terminal"
+
     /// Draws the glyph centred in `rect` in the current AppKit context.
-    static func draw(_ value: String, in rect: NSRect, color: NSColor) {
+    /// `color` inks symbols and text; a logo keeps its own colours and only
+    /// takes the alpha. `dark` picks a logo's variant for a dark ground.
+    static func draw(_ value: String, in rect: NSRect, color: NSColor, dark: Bool = false) {
         switch kind(value) {
         case .logo(let logo):
-            logo.drawMono(in: rect, color: color)
+            if !logo.draw(in: rect, dark: dark, alpha: color.alphaComponent) {
+                draw(tooSmallSymbol, in: rect, color: color, dark: dark)
+            }
         case .text(let text):
             var size = rect.height * 0.95
             var attributes: [NSAttributedString.Key: Any] = [:]
@@ -97,8 +114,13 @@ struct TendGlyphView: View {
     var body: some View {
         switch TendGlyph.kind(value) {
         case .logo(let logo):
-            TendAgentLogo(asset: logo, fallbackSymbol: "terminal", size: size, style: .mono)
-                .foregroundStyle(color)
+            if logo.fits(size) {
+                TendAgentLogo(asset: logo, fallbackSymbol: TendGlyph.tooSmallSymbol, size: size)
+            } else {
+                Image(systemName: TendGlyph.tooSmallSymbol)
+                    .font(.system(size: size, weight: .semibold))
+                    .foregroundStyle(color)
+            }
         case .text(let text):
             Text(verbatim: text)
                 .font(.system(size: size * 0.9, weight: .bold))
@@ -109,6 +131,31 @@ struct TendGlyphView: View {
             Image(systemName: name)
                 .font(.system(size: size, weight: .semibold))
                 .foregroundStyle(color)
+        }
+    }
+}
+
+/// A round menu-bar face: a logo on its own, anything else white on the
+/// identity gradient. Shared by the menu-bar lists, the chips, host badges
+/// and Settings, so every face follows the same rule.
+struct TendGlyphFace: View {
+    let value: String
+    let gradient: LinearGradient
+    var size: CGFloat
+    /// The symbol or text size on a disc.
+    var glyphSize: CGFloat
+
+    /// A logo fills most of the face's circle, as the symbol and disc did.
+    private var logoSize: CGFloat { (size * 0.78).rounded() }
+
+    var body: some View {
+        if TendGlyph.drawsOwnFace(value, slot: logoSize) {
+            TendGlyphView(value: value, size: logoSize)
+                .frame(width: size, height: size)
+        } else {
+            TendGlyphView(value: value, size: glyphSize)
+                .frame(width: size, height: size)
+                .background(gradient, in: Circle())
         }
     }
 }

@@ -71,10 +71,12 @@ struct TendMenuBarAvatar: View {
     var showsStatus = true
 
     var body: some View {
-        TendGlyphView(value: item.appearance.symbol, size: size * 0.45)
-            .frame(width: size, height: size)
-            .background(item.appearance.gradient, in: Circle())
-            .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
+        TendGlyphFace(value: item.appearance.symbol, gradient: item.appearance.gradient, size: size, glyphSize: size * 0.45)
+            .overlay {
+                if !TendGlyph.drawsOwnFace(item.appearance.symbol, slot: (size * 0.78).rounded()) {
+                    Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 if showsStatus {
                     Image(systemName: item.menuStatusSymbol)

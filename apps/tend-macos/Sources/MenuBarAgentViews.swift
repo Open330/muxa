@@ -60,8 +60,7 @@ struct TendMenuBarContent: View {
                                             if case .group(let scope) = chip.destination { selectScope(scope) }
                                         } label: {
                                             HStack {
-                                                TendGlyphView(value: chip.appearance.symbol, size: 12)
-                                                    .frame(width: 28, height: 28).background(chip.appearance.gradient, in: Circle())
+                                                TendGlyphFace(value: chip.appearance.symbol, gradient: chip.appearance.gradient, size: 28, glyphSize: 12)
                                                 VStack(alignment: .leading) {
                                                     Text(verbatim: chip.name).font(.subheadline.weight(.semibold))
                                                     Text(verbatim: chip.location).font(TendType.meta).foregroundStyle(.secondary)

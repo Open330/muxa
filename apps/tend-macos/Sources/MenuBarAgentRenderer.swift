@@ -58,18 +58,29 @@ enum TendMenuBarAgentRenderer {
                 let shape = NSBezierPath(roundedRect: face, xRadius: height / 2, yRadius: height / 2)
                 let alpha: CGFloat = liveIDs.contains(agent.id) ? 1 : 0.3
                 let appearance = agent.appearance
+                // A logo is the whole face, drawn as published with no disc
+                // behind it; its pill text then takes the menu bar's ink.
+                let logoRect = NSRect(x: face.minX + 2, y: face.midY - (height - 4) / 2, width: height - 4, height: height - 4)
+                let ownFace = TendGlyph.drawsOwnFace(appearance.symbol, slot: logoRect.height)
+                let label: NSColor = ownFace ? ink : .white
                 // Clear a narrow moat from the chip layer before painting the
                 // next face: overlapping avatars retain a readable silhouette.
                 NSGraphicsContext.current?.compositingOperation = .clear
                 NSBezierPath(roundedRect: face.insetBy(dx: -0.8, dy: -0.8), xRadius: height / 2 + 0.8, yRadius: height / 2 + 0.8).fill()
                 NSGraphicsContext.current?.compositingOperation = .sourceOver
-                NSGradient(starting: appearance.top.withAlphaComponent(alpha), ending: appearance.bottom.withAlphaComponent(alpha))?.draw(in: shape, angle: -45)
-                NSColor.white.withAlphaComponent(0.18 * alpha).setStroke()
-                shape.lineWidth = 0.5
-                shape.stroke()
+                if !ownFace {
+                    NSGradient(starting: appearance.top.withAlphaComponent(alpha), ending: appearance.bottom.withAlphaComponent(alpha))?.draw(in: shape, angle: -45)
+                    NSColor.white.withAlphaComponent(0.18 * alpha).setStroke()
+                    shape.lineWidth = 0.5
+                    shape.stroke()
+                }
                 NSGraphicsContext.saveGraphicsState()
                 shape.addClip()
-                drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha), scales: scales, cache: glyphCache)
+                if ownFace {
+                    TendGlyph.draw(appearance.symbol, in: logoRect, color: label.withAlphaComponent(alpha), dark: dark)
+                } else {
+                    drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha), dark: dark, scales: scales, cache: glyphCache)
+                }
                 if isPill {
                     let text = agent.pillLabel as NSString
                     let textSize = text.size(withAttributes: [.font: pillFont])
@@ -77,7 +88,7 @@ enum TendMenuBarAgentRenderer {
                     let room = face.maxX - trailing - textX
                     if room > 0 {
                         NSRect(x: textX, y: face.minY, width: room, height: height).clip()
-                        text.draw(at: NSPoint(x: textX, y: face.midY - textSize.height / 2), withAttributes: [.font: pillFont, .foregroundColor: NSColor.white.withAlphaComponent(alpha)])
+                        text.draw(at: NSPoint(x: textX, y: face.midY - textSize.height / 2), withAttributes: [.font: pillFont, .foregroundColor: label.withAlphaComponent(alpha)])
                     }
                 }
                 NSGraphicsContext.restoreGraphicsState()
@@ -125,7 +136,14 @@ enum TendMenuBarAgentRenderer {
         return image
     }
 
-    private static func drawSymbol(_ name: String, in rect: NSRect, color: NSColor, scales: [CGFloat], cache: TendMenuBarGlyphCache?) {
+    private static func drawSymbol(_ name: String, in rect: NSRect, color: NSColor, dark: Bool = false, scales: [CGFloat], cache: TendMenuBarGlyphCache?) {
+        // Only an SF Symbol may be tinted from a white bitmap. A logo keeps
+        // its own colours, so it is drawn directly, cached or not; a text
+        // face is drawn by TendGlyph when there is no cache.
+        if case .logo = TendGlyph.kind(name) {
+            TendGlyph.draw(name, in: rect, color: color, dark: dark)
+            return
+        }
         if let image = cache?.glyph(name, size: rect.size, scales: scales) {
             // Glyphs are white; badge glyphs can use dark ink.
             NSGraphicsContext.saveGraphicsState()
@@ -135,6 +153,10 @@ enum TendMenuBarAgentRenderer {
             rect.fill(using: .sourceAtop)
             NSGraphicsContext.current?.cgContext.endTransparencyLayer()
             NSGraphicsContext.restoreGraphicsState()
+            return
+        }
+        guard case .symbol = TendGlyph.kind(name) else {
+            TendGlyph.draw(name, in: rect, color: color, dark: dark)
             return
         }
         guard let source = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return }
@@ -193,7 +215,9 @@ final class TendMenuBarGlyphCache {
         guard key.width > 0, key.height > 0 else { return nil }
         if let image = images[key] { return image }
         let size = NSSize(width: CGFloat(key.width) / 4, height: CGFloat(key.height) / 4)
-        // A logo or a text face is not an SF Symbol; TendGlyph draws it.
+        // A logo keeps its own colours and is never cached as a white
+        // bitmap; a text face is rasterized white like a symbol.
+        if case .logo = TendGlyph.kind(name) { return nil }
         guard case .symbol = TendGlyph.kind(name) else {
             let image = TendMenuBarAgentRenderer.rasterized(size: size, scales: scales) {
                 TendGlyph.draw(name, in: NSRect(origin: .zero, size: size), color: .white)

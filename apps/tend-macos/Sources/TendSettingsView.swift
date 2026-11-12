@@ -595,9 +595,7 @@ private struct TendMenuBarSettingsView: View {
         let isCustomText = TendGlyph.kind(icon) != .symbol(icon)
         return GridRow {
             HStack(spacing: 8) {
-                TendGlyphView(value: icon, size: 11)
-                    .frame(width: 22, height: 22)
-                    .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                TendGlyphFace(value: icon, gradient: TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, size: 22, glyphSize: 11)
                     .accessibilityHidden(true)
                 Text(verbatim: host.alias)
                     .lineLimit(1)

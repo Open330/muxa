@@ -3,16 +3,6 @@
     {
       "filename": "openai.svg",
       "idiom": "universal"
-    },
-    {
-      "appearances": [
-        {
-          "appearance": "luminosity",
-          "value": "dark"
-        }
-      ],
-      "filename": "openai-dark.svg",
-      "idiom": "universal"
     }
   ],
   "info": {
@@ -20,6 +10,7 @@
     "version": 1
   },
   "properties": {
-    "preserves-vector-representation": true
+    "preserves-vector-representation": true,
+    "template-rendering-intent": "template"
   }
 }

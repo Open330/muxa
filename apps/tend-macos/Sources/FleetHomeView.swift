@@ -1141,9 +1141,7 @@ struct FleetHostBadges: View {
             ForEach(hosts, id: \.alias) { host in
                 let icon = TendHostIcons.icon(for: host.alias, local: host.local)
                 HStack(spacing: 3) {
-                    TendGlyphView(value: icon, size: 7)
-                        .frame(width: 14, height: 14)
-                        .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                    TendGlyphFace(value: icon, gradient: TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, size: 14, glyphSize: 7)
                     Text(verbatim: host.alias)
                         .lineLimit(1)
                 }

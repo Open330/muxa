@@ -477,6 +477,8 @@ cargo fmt --all -- --check
 
 MIT OR Apache-2.0.
 
+`apps/tend-macos/Resources/Assets.xcassets/AgentLogos`에 있는 서드파티 제품 로고는 각 소유자의 상표이며 이 라이선스에 포함되지 않습니다. [AgentLogos-NOTICE.md](apps/tend-macos/Resources/AgentLogos-NOTICE.md)를 참고하세요.
+
 ### Peek 전문 보기
 
 `prefix + q`로 peek를 연 뒤 **`|`**를 누르면 현재 패널의 텍스트를 전체 화면으로 읽을 수 있습니다. `j/k` 또는 방향키로 스크롤하고, `PgUp/PgDn`, `Home/End`로 이동합니다. `n/p`는 다음/이전 패널, `r`은 새로고침, `|` 또는 `Esc`는 오버레이로 복귀, `q`는 종료입니다.

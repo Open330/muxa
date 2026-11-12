@@ -549,7 +549,7 @@ struct TendAgentMark: Hashable, Sendable {
 
     var symbol: String { engine?.symbolName ?? ownSymbol ?? "terminal" }
     var tint: Color { agentProgramTint(program) }
-    /// The product's logo; `logo?.colorName` is its asset name.
+    /// The product's logo; `logo?.assetName` is its asset name.
     var logo: TendAgentLogoAsset? { TendAgentLogoAsset(kind: program) }
 
     /// Every agent kind this build can put a face on. A rule may name one

@@ -1256,7 +1256,7 @@ enum AutomationTokenStyle {
     /// The capsule behind a token. A known agent's logo already carries its
     /// brand colour, so its capsule stays neutral.
     func capsuleTint(for token: String) -> Color {
-        if self == .agent, TendAgentMark.known(for: token)?.logo != nil { return .secondary }
+        if self == .agent, TendAgentMark.known(for: token)?.logo?.fits(AutomationTokenLabel.logoSize) == true { return .secondary }
         return tint(for: token)
     }
 }
@@ -1265,13 +1265,14 @@ enum AutomationTokenStyle {
 /// gets no symbol — inventing one would say something untrue — and keeps
 /// its wire spelling.
 private struct AutomationTokenLabel: View {
+    static let logoSize: CGFloat = 12
     let token: String
     let style: AutomationTokenStyle
 
     var body: some View {
         HStack(spacing: 4) {
             if let mark {
-                TendAgentLogo(mark: mark, size: 12)
+                TendAgentLogo(mark: mark, size: Self.logoSize)
                     .foregroundStyle(mark.tint)
             }
             Text(verbatim: style.title(for: token))
