@@ -29,10 +29,10 @@ parameters, including ids the daemon already derives from the caller
 | `tend_guide` | Orientation: identity, peers, guardrails, launch preferences. `topic`: `collaboration` (default), `room`, `launch` | `collaboration_guide`, `room_context`, old `guide` |
 | `tend_status` | Observe agents: summary, one `pane` (with capture/history), or `query` to find where work is; `host` for a Fleet host | `agent_find`, `capture_pane`, `recent_prompts`, `fleet_status`, `fleet_capture` |
 | `tend_agent_search` | Historical transcript evidence; `event_ids` expands hits | `agent_read` |
-| `tend_wait` | Wait on one handle: a request id, a dispatch id, a swap job, or a `pane` state change | `wait_reply`, `fleet_wait_reply`, `wait_for_change`, `dispatch_status` |
+| `tend_wait` | Wait on one handle: a request id (`req_…`, `dispatch-<uuid>`) for its reply, a swap job (`swap-<uuid>`) until it ends, a dispatch UUID (its current status, returned at once), or a `pane` state change. The handle's kind comes from its id; `host` only says where it runs | `wait_reply`, `fleet_wait_reply`, `wait_for_change`, `dispatch_status` |
 | `tend_call_peer` | Every durable request to an agent: auto-selected peer, exact `target`, one-way `intent=notice`; `host` + `pane` for Fleet | `send_message`, `fleet_call_peer` |
 | `tend_request_attention` | A decision only a person can make | — |
-| `tend_inbox` | Read the mailbox: claim incoming work, `request_id` for one, `view=sent|all|report` for history and replies | `list_messages`, `peer_report` |
+| `tend_inbox` | Read the mailbox. Without `view` it claims incoming work (one `request_id`, or the queue). With `view=incoming|sent|all|report` it only reads (history, one instruction or its progress, the newest peer reply) and never accepts work or changes its authority | `list_messages`, `peer_report` |
 | `tend_update_request` | Act on an open request: progress `body`, or `action=cancel|withdraw_wake` | `fleet_update_request`, `cancel_message`, `withdraw_reply_wake` |
 | `tend_reply` | Finish a claimed request | — |
 | `tend_file_result` | File a result record | — |
@@ -52,7 +52,9 @@ Rules:
 2. **Daemon-derived ids leave the schemas.** `thread_id`, `workspace_id`,
    `work_id` and `run_id` are stamped from the caller's pane; the handlers
    still accept them, they are just not advertised. `parent_request_id`
-   stays: it is a causal fact only the caller knows.
+   stays: it is a causal fact only the caller knows. Handles stay too:
+   receipts keep returning the full `host`/`pane_key`/`request_id`, so a
+   restarted MCP process can still wait or update without resending work.
 3. **No foreground default wait.** `tend_call_peer` defaults to
    `wait=false`; the reply arrives as a wake and is read with
    `tend_inbox(request_id)` or `tend_wait(id)`.

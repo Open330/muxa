@@ -44,7 +44,7 @@ pub(crate) fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tend_wait",
-            "description": "Wait on one handle and return its result: a request id (its final reply; a Fleet request needs no other argument when this process sent it), a dispatch UUID (its status), a swap job, or a pane's next state change (pane, no id). A timeout changes nothing. Prefer wakes over waiting; use 30-60 s foreground waits, not 1 s probes.",
+            "description": "Wait on one handle and return its result: a request id (its final reply; a Fleet request needs no other argument when this process sent it), a dispatch UUID (its current status, returned at once), a swap job (until it ends or timeout), or a pane's next state change (pane, no id). A timeout changes nothing. Prefer wakes over waiting; use 30-60 s foreground waits, not 1 s probes.",
             "inputSchema": {"type": "object", "properties": {
                 "id": {"type": "string", "description": "Request id, dispatch UUID or swap job key."},
                 "kind": {"type": "string", "enum": ["request", "dispatch", "swap"], "description": "Only when the id alone is ambiguous."},
@@ -145,6 +145,21 @@ pub(crate) fn route(name: &str, args: Value) -> Result<Routed, String> {
     }
 }
 
+/// The kind of a wait handle, from its id alone (where it runs is `host`'s
+/// business): a mailbox request id (`req_…`, or `dispatch-<uuid>` for an
+/// idempotent send, Fleet ones included), a remembered Fleet request, a
+/// swap job (`swap-<uuid>`), or a bare dispatch UUID. Anything else is taken
+/// as a caller-chosen swap `request_key`.
+fn handle_kind(id: &str) -> &'static str {
+    if id.starts_with("req_") || id.starts_with("dispatch-") || fleet_handle(id).is_some() {
+        "request"
+    } else if is_uuid(id) {
+        "dispatch"
+    } else {
+        "swap"
+    }
+}
+
 fn route_wait(args: &Value) -> Result<Routed, String> {
     let routed = |name: &str, args: serde_json::Map<String, Value>| Routed {
         name: name.to_string(),
@@ -173,13 +188,7 @@ fn route_wait(args: &Value) -> Result<Routed, String> {
     let kind = args
         .get("kind")
         .and_then(Value::as_str)
-        .unwrap_or(if is_uuid(id) {
-            "dispatch"
-        } else if id.starts_with("req_") || args.get("host").is_some() {
-            "request"
-        } else {
-            "swap"
-        });
+        .unwrap_or_else(|| handle_kind(id));
     match kind {
         "dispatch" => Ok(routed("tend_dispatch_status", {
             let mut out = serde_json::Map::new();
@@ -204,10 +213,15 @@ fn route_wait(args: &Value) -> Result<Routed, String> {
         "request" => {
             let mut out = copy(args, &["timeout_secs", "after_update"]);
             out.insert("request_id".into(), json!(id));
-            let explicit = args
-                .get("host")
-                .and_then(Value::as_str)
-                .filter(|host| *host != "local")
+            // An omitted host may use the remembered Fleet handle; an
+            // explicit `local` always means this daemon.
+            let host = args.get("host").and_then(Value::as_str).map(str::trim);
+            if host == Some("local") {
+                out.remove("after_update");
+                return Ok(routed("tend_wait_reply", out));
+            }
+            let explicit = host
+                .filter(|host| !host.is_empty())
                 .map(|host| (host.to_string(), args.get("pane_key").cloned()));
             match explicit {
                 Some((host, Some(pane_key))) => {
@@ -282,6 +296,38 @@ mod tests {
         assert_eq!(pane.name, "tend_wait_for_change");
         assert!(route("tend_wait", json!({})).is_err());
         assert!(route("tend_wait", json!({"id": "req_2", "host": "mini"})).is_err());
+    }
+
+    #[test]
+    fn real_handle_formats_are_typed_from_the_id_and_host_only_picks_where() {
+        // Idempotent sends (Fleet ones always) get `dispatch-<uuid>` ids.
+        let id = "dispatch-2843585f-9b23-40c9-8b7d-f129aadf6974";
+        assert_eq!(
+            route_ok("tend_wait", json!({"id": id})).name,
+            "tend_wait_reply"
+        );
+        remember_fleet_request(id, "mini", &json!({"pane": "%2"}));
+        let remote = route_ok("tend_wait", json!({"id": id}));
+        assert_eq!(remote.name, "tend_fleet_wait_reply");
+        assert_eq!(remote.args["host"], "mini");
+        // An explicit local never follows the remembered remote handle.
+        let local = route_ok(
+            "tend_wait",
+            json!({"id": id, "kind": "request", "host": "local"}),
+        );
+        assert_eq!(local.name, "tend_wait_reply");
+        assert!(local.args.get("host").is_none());
+        // A swap job stays a swap job wherever it runs.
+        let swap = "swap-2843585f-9b23-40c9-8b7d-f129aadf6974";
+        for host in [None, Some("local"), Some("mini")] {
+            let mut args = json!({"id": swap});
+            if let Some(host) = host {
+                args["host"] = json!(host);
+            }
+            let routed = route_ok("tend_wait", args);
+            assert_eq!(routed.name, "tend_swap_account", "{host:?}");
+            assert_eq!(routed.args.get("host").and_then(Value::as_str), host);
+        }
     }
 
     #[test]

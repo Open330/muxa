@@ -1153,14 +1153,6 @@ async fn call_tool(
     config: &tend::config::Config,
 ) -> Result<Value> {
     let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
-    let mutates = matches!(name, Some("tend_start_agent" | "tend_start_work"))
-        || (name == Some("tend_manage_tmux")
-            && params
-                .and_then(|p| p.pointer("/arguments/action"))
-                .and_then(Value::as_str)
-                .is_some_and(|action| {
-                    matches!(action, "terminate_agent" | "close_work" | "close_workspace")
-                }));
     // Route listed tools onto their handlers; a retired name runs its own
     // handler and its result names the replacement.
     let routed = match name {
@@ -1176,6 +1168,20 @@ async fn call_tool(
         }
         None => None,
     };
+    // Judged on the operation that actually runs, not the name it was
+    // called by.
+    let (run_name, run_args) = match &routed {
+        Some((_, routed)) => (Some(routed.name.as_str()), Some(&routed.args)),
+        None => (name, params.and_then(|p| p.get("arguments"))),
+    };
+    let mutates = matches!(run_name, Some("tend_start_agent" | "tend_start_work"))
+        || (run_name == Some("tend_manage_tmux")
+            && run_args
+                .and_then(|args| args.get("action"))
+                .and_then(Value::as_str)
+                .is_some_and(|action| {
+                    matches!(action, "terminate_agent" | "close_work" | "close_workspace")
+                }));
     let result = match &routed {
         Some((_, routed)) => {
             let params = json!({"name": routed.name, "arguments": routed.args});
@@ -1184,6 +1190,17 @@ async fn call_tool(
         None => call_tool_inner(client, params, config).await,
     };
     let result = match (&routed, result) {
+        // tend_guide's default needs this session's identity; launch
+        // preferences need none, so return those rather than only an error.
+        (Some((old, routed)), Ok(value))
+            if old == "tend_guide"
+                && routed.name == "tend_collaboration_guide"
+                && value["isError"] == true =>
+        {
+            let mut guide = launch_guide_value(config);
+            guide["collaboration_unavailable"] = value["content"][0]["text"].clone();
+            Ok(json_result(&guide))
+        }
         (Some((old, routed)), Ok(value)) => {
             Ok(crate::mcp_surface::annotate(value, routed.replaced_by, old))
         }
