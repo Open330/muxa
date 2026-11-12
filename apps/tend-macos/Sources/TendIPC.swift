@@ -1008,6 +1008,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let reviewItem: TendReviewItem?
     let decisionQueue: TendLenient<TendPendingQueue>?
     let decisionHistory: TendLenient<TendDecisionHistory>?
+    let workRecords: [TendLenient<TendWorkRecord>]?
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
     let swap: TendLenient<TendSwapHealth>?
@@ -1027,6 +1028,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case reviewItem = "review_item"
         case decisionQueue = "decision_queue"
         case decisionHistory = "decision_history"
+        case workRecords = "work_records"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -1554,6 +1556,17 @@ actor TendIPCClient {
             throw TendIPCError.server(String(localized: "tendd sent a decision queue this app cannot read"))
         }
         return queue
+    }
+
+    /// `work_backlog` at `stage`; callers check `work_backlog_v1` first.
+    /// A record this app cannot read is dropped, not fatal.
+    func workRecords(stage: String) async throws -> [TendWorkRecord] {
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "work_backlog",
+            "stage": stage,
+        ], timeout: 10)
+        return (response.workRecords ?? []).compactMap(\.value)
     }
 
     /// Accept, return or withdraw a review item, as the person.
