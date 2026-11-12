@@ -197,6 +197,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var askAgent = "claude"
     @Published private(set) var askEnabled: Bool?
     @Published private(set) var askConfigurationPendingReload = false
+    /// The pid of the process that owns tendd's socket, read after each
+    /// connection; nil until known. Part of `localDaemonIdentity`.
+    @Published private(set) var localDaemonPID: Int32?
+    /// Daemon replacements ("Reload tendd") that completed, so a restart the
+    /// app made is told apart even when the new process reports the same
+    /// generation.
+    @Published private(set) var daemonReplacements: UInt64 = 0
     @Published private(set) var isSendingAsk = false
     @Published private(set) var isEnablingAsk = false
     @Published private(set) var askError: String?
@@ -343,6 +350,7 @@ final class AppModel: ObservableObject {
         connectionGeneration &+= 1
         let generation = connectionGeneration
         connectionState = .connecting
+        localDaemonPID = nil
         refreshTask = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -353,10 +361,12 @@ final class AppModel: ObservableObject {
             do {
                 if replacingExistingDaemon {
                     try await daemon.replaceRunningDaemon(client: client)
+                    daemonReplacements &+= 1
                 } else {
                     try await daemon.ensureRunning(client: client)
                 }
                 guard connectionGeneration == generation else { return }
+                Task { [weak self] in await self?.readLocalDaemonPID(ifGeneration: generation) }
                 if connectionState != .connected { connectionState = .connected }
                 await refresh(ifGeneration: generation)
                 // The Inbox badge and sidebar counts are derived from the
@@ -394,6 +404,15 @@ final class AppModel: ObservableObject {
                 connectionState = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Which process answers on the socket now. Best effort: a failed
+    /// lookup leaves the pid unknown, which the restart bar treats as "could
+    /// still be the same daemon".
+    private func readLocalDaemonPID(ifGeneration generation: UInt64) async {
+        let owner = try? await DaemonSocketOwner.find(socketPath: client.socketPath)
+        guard connectionGeneration == generation else { return }
+        localDaemonPID = owner?.pid
     }
 
     func refresh() async {

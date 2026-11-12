@@ -3294,7 +3294,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "설정한 계정 이름 또는 work@claude 같은 aas 계정입니다. 비워 두면 Tend가 같은 제공자의 사용 가능한 계정을 고릅니다."
+            "value" : "설정한 계정 이름 또는 work@claude 같은 aas 계정입니다. 비워 두면 Tend가 같은 프로바이더의 사용 가능한 계정을 고릅니다."
           }
         }
       }
@@ -3324,7 +3324,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "API Ask 공급자 ID"
+            "value" : "API Ask 프로바이더 ID"
           }
         }
       }
@@ -3667,7 +3667,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "리셋 후"
+            "value" : "초기화 후"
           }
         }
       }
@@ -4186,16 +4186,6 @@
         }
       }
     },
-    "Ask Providers" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ask 프로바이더"
-          }
-        }
-      }
-    },
     "Ask a headless agent a question. You can return to this conversation and continue it later." : {
       "localizations" : {
         "ko" : {
@@ -4543,7 +4533,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "자동화가 일시 중지되어 있어 다시 시작할 때까지 아무것도 자동으로 일어나지 않습니다."
+            "value" : "자동화가 일시 정지되어 있어 다시 시작할 때까지 아무것도 자동으로 일어나지 않습니다."
           }
         }
       }
@@ -4613,17 +4603,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "리셋 전"
-          }
-        }
-      }
-    },
-    "Behaviour" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "동작 방식"
+            "value" : "초기화 전"
           }
         }
       }
@@ -4693,7 +4673,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "길이가 제한된 최근 화면/현재 상태와 작업/워크스페이스 ID가 기기 밖의 선택한 API 공급자로 전송됩니다. 도구를 사용하지 않는 읽기 전용 호출 1회이며 요금이 발생할 수 있습니다. 관찰 전용 모드를 꺼도 동작은 실행하지 않습니다."
+            "value" : "길이가 제한된 최근 화면/현재 상태와 작업/워크스페이스 ID가 기기 밖의 선택한 API 프로바이더로 전송됩니다. 도구를 사용하지 않는 읽기 전용 호출 1회이며 요금이 발생할 수 있습니다. 관찰 전용 모드를 꺼도 동작은 실행하지 않습니다."
           }
         }
       }
@@ -5136,7 +5116,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "OpenAI 또는 Anthropic 기반의 API Ask 공급자 ID를 선택하세요. Ask 공급자 설정에서 API 키를 구성하세요. Claude/Codex CLI 공급자는 지원하지 않습니다."
+            "value" : "OpenAI 또는 Anthropic 기반의 API Ask 프로바이더 ID를 선택하세요. Ask 프로바이더 설정에서 API 키를 구성하세요. Claude/Codex CLI 프로바이더는 지원하지 않습니다."
           }
         }
       }
@@ -5146,7 +5126,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "설정된 Ask 공급자를 명시적으로 선택하세요."
+            "value" : "설정된 Ask 프로바이더를 명시적으로 선택하세요."
           }
         }
       }
@@ -5171,12 +5151,12 @@
         }
       }
     },
-    "Choose what Tend notifies about in Settings › Behaviour." : {
+    "Choose what Tend notifies about in Settings › Notifications." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "알림 받을 항목은 설정 › 동작에서 고를 수 있습니다."
+            "value" : "알림 받을 항목은 설정 › 알림에서 고를 수 있습니다."
           }
         }
       }
@@ -5602,16 +5582,6 @@
         }
       }
     },
-    "Configuration editor" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "설정 편집기"
-          }
-        }
-      }
-    },
     "Configure Claude Code and Codex authentication" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -5629,16 +5599,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work 설정…"
-          }
-        }
-      }
-    },
-    "Configured" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "설정됨"
           }
         }
       }
@@ -5719,16 +5679,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "tendd에 연결하는 중…"
-          }
-        }
-      }
-    },
-    "Connection" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "연결"
           }
         }
       }
@@ -6168,7 +6118,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "데몬 세대"
+            "value" : "데몬 세대(재시작 횟수)"
           }
         }
       }
@@ -6284,7 +6234,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "기본값: openai. API 공급자 설정과 tendd에서 사용할 수 있는 키가 필요합니다. 이 요청은 앱 전용 키체인 키를 전달하지 않습니다. OpenAI, Anthropic 또는 이를 기반으로 이름을 지정한 API 인스턴스만 지원하며, Claude/Codex CLI 공급자는 지원하지 않습니다."
+            "value" : "기본값: openai. API 프로바이더 설정과 tendd에서 사용할 수 있는 키가 필요합니다. 이 요청은 앱 전용 키체인 키를 전달하지 않습니다. OpenAI, Anthropic 또는 이를 기반으로 이름을 지정한 API 인스턴스만 지원하며, Claude/Codex CLI 프로바이더는 지원하지 않습니다."
           }
         }
       }
@@ -6539,16 +6489,6 @@
         }
       }
     },
-    "Detected" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "감지됨"
-          }
-        }
-      }
-    },
     "Did not start" : {
       "localizations" : {
         "ko" : {
@@ -6595,16 +6535,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "버리기"
-          }
-        }
-      }
-    },
-    "Discard Launch Changes" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션 변경 사항 버리기"
           }
         }
       }
@@ -6784,7 +6714,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "각 판단은 도구를 사용하지 않는 읽기 전용 Ask 호출 1회입니다. 길이가 제한된 최근 화면 텍스트, 현재 상태, 작업/워크스페이스 ID만 전송하며 목표 전체를 조회하지 않습니다. 이 컨텍스트는 기기 밖의 선택한 API 공급자로 전송되며 요금이 발생할 수 있습니다. 판단 호출 제한과 동작 실행 제한은 별도로 적용됩니다."
+            "value" : "각 판단은 도구를 사용하지 않는 읽기 전용 Ask 호출 1회입니다. 길이가 제한된 최근 화면 텍스트, 현재 상태, 작업/워크스페이스 ID만 전송하며 목표 전체를 조회하지 않습니다. 이 컨텍스트는 기기 밖의 선택한 API 프로바이더로 전송되며 요금이 발생할 수 있습니다. 판단 호출 제한과 동작 실행 제한은 별도로 적용됩니다."
           }
         }
       }
@@ -7086,16 +7016,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "모든 호스트의 모든 에이전트"
-          }
-        }
-      }
-    },
-    "Every built-in engine is already configured." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "기본 제공 엔진이 모두 설정되어 있습니다."
           }
         }
       }
@@ -7585,7 +7505,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "실행 조건"
+            "value" : "시작 이벤트"
           }
         }
       }
@@ -7931,12 +7851,12 @@
         }
       }
     },
-    "Global Ask is disabled in the tend configuration. Enable it under Settings › Providers." : {
+    "Global Ask is disabled in the tend configuration. Enable it under Settings › Ask." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tend 설정에서 Global Ask가 비활성화되어 있습니다. 설정 › 프로바이더에서 활성화하세요."
+            "value" : "tend 설정에서 Global Ask가 비활성화되어 있습니다. 설정 › Ask에서 활성화하세요."
           }
         }
       }
@@ -8269,12 +8189,12 @@
         }
       }
     },
-    "Host sync needs the updated tendd on this Mac (Settings › Runtime › Reload Bundled tendd)." : {
+    "Host sync needs the updated tendd on this Mac (Settings › Advanced › Reload tendd)." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "호스트 동기화에는 이 Mac의 최신 tendd가 필요합니다 (설정 › 런타임 › 번들 tendd 다시 로드)."
+            "value" : "호스트 동기화에는 이 Mac의 최신 tendd가 필요합니다 (설정 › 고급 › tendd 다시 로드)."
           }
         }
       }
@@ -8464,7 +8384,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "공급자 기본값 상속"
+            "value" : "프로바이더 기본값 상속"
           }
         }
       }
@@ -8970,16 +8890,6 @@
         }
       }
     },
-    "Launch options" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션"
-          }
-        }
-      }
-    },
     "Launch options could not be read. Correct the configuration in Raw TOML and reload." : {
       "localizations" : {
         "ko" : {
@@ -9170,12 +9080,12 @@
         }
       }
     },
-    "Local and SSH hosts registered with the central tendd controller." : {
+    "Local and SSH hosts registered with the central tendd controller. Labels are used by workspace and request selectors." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "중앙 tendd 컨트롤러에 등록된 로컬 및 SSH 호스트입니다."
+            "value" : "중앙 tendd 컨트롤러에 등록된 로컬 및 SSH 호스트입니다. 태그는 워크스페이스와 요청 선택자에서 사용됩니다."
           }
         }
       }
@@ -9640,12 +9550,12 @@
         }
       }
     },
-    "Most changes apply when tendd restarts. Saving checks the file has not changed underneath and refuses a document tend cannot parse." : {
+    "Saving checks the file has not changed underneath and refuses a document tend cannot parse." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "대부분의 변경은 tendd를 다시 시작해야 적용됩니다. 저장할 때 파일이 그 사이 바뀌지 않았는지 확인하고, tend가 해석할 수 없는 문서는 거부합니다."
+            "value" : "저장할 때 파일이 그 사이 바뀌지 않았는지 확인하고, tend가 해석할 수 없는 문서는 거부합니다."
           }
         }
       }
@@ -10014,16 +9924,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이름에는 영문자, 숫자, 하이픈, 밑줄, 마침표만 쓸 수 있습니다."
-          }
-        }
-      }
-    },
-    "Native PTY sessions owned by tendd will end. tmux sessions are not terminated." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "tendd가 소유한 네이티브 PTY 세션이 종료됩니다. tmux 세션은 종료되지 않습니다."
           }
         }
       }
@@ -11293,12 +11193,12 @@
         }
       }
     },
-    "Nothing configured yet. Add a provider, or add one of the detected built-ins below." : {
+    "Nothing configured yet. Add a provider to choose an engine, or one of the built-ins tendd ships with." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "아직 설정된 프로바이더가 없습니다. 프로바이더를 추가하거나 아래에서 감지된 기본 엔진을 추가하세요."
+            "value" : "아직 설정된 프로바이더가 없습니다. 프로바이더를 추가해 엔진을 고르거나, tendd에 기본 포함된 엔진을 추가하세요."
           }
         }
       }
@@ -11313,12 +11213,12 @@
         }
       }
     },
-    "Nothing fires until a rule is added and switched on. Choose a limit policy above to handle capped agents without writing one." : {
+    "Nothing fires until a rule is added and switched on. Choose a limit policy in Accounts to handle capped agents without writing one." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "규칙을 추가하고 켜기 전에는 아무것도 실행되지 않습니다. 규칙을 직접 쓰지 않고 한도에 걸린 에이전트를 처리하려면 위에서 한도 정책을 고르세요."
+            "value" : "규칙을 추가하고 켜기 전에는 아무것도 실행되지 않습니다. 규칙을 직접 쓰지 않고 한도에 걸린 에이전트를 처리하려면 계정 탭에서 한도 정책을 고르세요."
           }
         }
       }
@@ -11559,7 +11459,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "끄면 모든 규칙이 멈추고 tend 설정에 기록됩니다. 일시 중지는 지정한 시각까지만 멈춥니다."
+            "value" : "끄면 모든 규칙이 멈추고 tend 설정에 기록됩니다. 일시 정지는 지정한 시각까지만 멈춥니다."
           }
         }
       }
@@ -12207,16 +12107,6 @@
         }
       }
     },
-    "Optional integrations with tools you already have. Tend works with none of them switched on, and a module only ever adds actions — it never takes over what tend does itself." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이미 쓰고 있는 도구와의 선택적 연동입니다. 모듈을 하나도 켜지 않아도 Tend는 그대로 동작하고, 모듈은 할 수 있는 일을 더하기만 할 뿐 tend가 하는 일을 대신하지 않습니다."
-          }
-        }
-      }
-    },
     "Optional. Choose a default project folder so Start Work and your first agent open in the right place." : {
       "localizations" : {
         "ko" : {
@@ -12624,7 +12514,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "에이전트에게 사람이 필요할 때 데스크탑 알림 표시"
+            "value" : "에이전트에게 사람이 필요할 때 데스크톱 알림 표시"
           }
         }
       }
@@ -12821,16 +12711,6 @@
         }
       }
     },
-    "Provider defaults" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "공급자 기본값"
-          }
-        }
-      }
-    },
     "Provider for new conversations; disabled entries need a CLI install or an API key in Settings" : {
       "localizations" : {
         "ko" : {
@@ -12939,16 +12819,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "원시 데이터"
-          }
-        }
-      }
-    },
-    "Raw TOML" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "TOML 원문"
           }
         }
       }
@@ -13314,7 +13184,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "새로 고침은 aas가 이미 가지고 있는 사용량을 읽습니다. 실시간 새로 고침은 모든 제공자에 다시 물어보므로 — 계정마다 요청 한 번 — 시간이 더 걸립니다."
+            "value" : "새로 고침은 aas가 이미 가지고 있는 사용량을 읽습니다. 실시간 새로 고침은 모든 프로바이더에 다시 물어보므로(계정마다 요청 한 번) 시간이 더 걸립니다."
           }
         }
       }
@@ -13480,16 +13350,6 @@
         }
       }
     },
-    "Reload Bundled tendd…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "번들 tendd 다시 로드…"
-          }
-        }
-      }
-    },
     "Reload tendd" : {
       "localizations" : {
         "ko" : {
@@ -13557,16 +13417,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "다시 불러오면 설정 파일의 최신 실행 옵션을 확인할 수 있습니다."
-          }
-        }
-      }
-    },
-    "Reload to review the current file before applying launch options again." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 옵션을 다시 적용하기 전에 파일을 다시 불러와 현재 내용을 확인하세요."
           }
         }
       }
@@ -13927,16 +13777,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "필수입니다. 키는 Ask마다 tendd에만 전달되며 설정이나 로그에 기록되지 않습니다."
-          }
-        }
-      }
-    },
-    "Reset" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "초기화"
           }
         }
       }
@@ -14718,7 +14558,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "활동을 호스트별로 묶을 때 보입니다. 에이전트는 제공자를 보여 줍니다: Claude는 별 모양, Codex는 >_."
+            "value" : "활동을 호스트별로 묶을 때 보입니다. 에이전트는 프로바이더를 보여 줍니다: Claude는 별 모양, Codex는 >_."
           }
         }
       }
@@ -14738,7 +14578,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "일부 동작이 확인되지 않았습니다. pane을 확인하세요"
+            "value" : "일부 동작이 확인되지 않았습니다. 페인을 확인하세요"
           }
         }
       }
@@ -14936,16 +14776,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%3$@의 %2$@에 [pipeline.%1$@]로 저장됩니다."
-          }
-        }
-      }
-    },
-    "Saved changes apply when tendd restarts." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장한 변경은 tendd를 다시 시작해야 적용됩니다."
           }
         }
       }
@@ -17025,16 +16855,6 @@
         }
       }
     },
-    "The file tendd reads is named at the top of this pane; tend config path prints it from the command line." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "tendd가 읽는 파일 경로는 이 화면 위쪽에 있습니다. 명령줄에서는 tend config path로 확인할 수 있습니다."
-          }
-        }
-      }
-    },
     "The first-launch tour of Work, Explore, Inbox, and Shells, with the setup checklist." : {
       "localizations" : {
         "ko" : {
@@ -17343,16 +17163,6 @@
         }
       }
     },
-    "These values are read from tend configuration." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 값은 tend 설정에서 읽어 옵니다."
-          }
-        }
-      }
-    },
     "Thinking" : {
       "localizations" : {
         "ko" : {
@@ -17544,12 +17354,12 @@
         }
       }
     },
-    "This tendd cannot write its configuration. Copy the block below into the tend configuration file, then reload tendd." : {
+    "This tendd cannot write its configuration. Copy the block below into the tend configuration file, then restart tendd from Advanced." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 tendd는 설정을 저장할 수 없습니다. 아래 블록을 tend 설정 파일에 복사해 넣은 뒤 tendd를 다시 로드하세요."
+            "value" : "이 tendd는 설정을 저장할 수 없습니다. 아래 블록을 tend 설정 파일에 복사해 넣은 뒤 고급에서 tendd를 다시 시작하세요."
           }
         }
       }
@@ -18447,7 +18257,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "대기는 5m 같은 시간이거나, 한도 리셋 기준 오프셋이어야 합니다."
+            "value" : "대기는 5m 같은 시간이거나, 한도 초기화 기준 오프셋이어야 합니다."
           }
         }
       }
@@ -18649,7 +18459,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 동작을 제한하는 가드"
+            "value" : "안전 장치"
           }
         }
       }
@@ -18799,7 +18609,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "한도가 리셋될 때"
+            "value" : "한도가 초기화될 때"
           }
         }
       }
@@ -19192,7 +19002,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "에이전트 제공자별 계정 전부: 각 계정에 얼마나 남았는지, 계정 사이의 전환, 그리고 특정 계정으로 시작하는 셸."
+            "value" : "에이전트 프로바이더별 계정 전부: 각 계정에 얼마나 남았는지, 계정 사이의 전환, 그리고 특정 계정으로 시작하는 셸."
           }
         }
       }
@@ -19252,7 +19062,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "[mcp.guide].options는 여전히 %@의 대체 옵션으로 사용됩니다. 공급자 기본값이 있으면 빈 목록이어도 이를 대체합니다. 기존 설정은 유지되며, 필요하면 TOML 원문에서 수정할 수 있습니다."
+            "value" : "[mcp.guide].options는 여전히 %@의 대체 옵션으로 사용됩니다. 프로바이더 기본값이 있으면 빈 목록이어도 이를 대체합니다. 기존 설정은 유지되며, 필요하면 TOML 원문에서 수정할 수 있습니다."
           }
         }
       }
@@ -19566,7 +19376,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "한도 리셋"
+            "value" : "한도 초기화"
           }
         }
       }
@@ -19820,16 +19630,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "tendd 업그레이드 필요"
-          }
-        }
-      }
-    },
-    "tendd watches your agents and acts on rules you write — resuming a capped session, for one." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "tendd가 에이전트를 지켜보다가 직접 작성한 규칙에 따라 움직입니다. 한도에 걸린 세션을 다시 이어 가는 것이 그 예입니다."
           }
         }
       }
@@ -20512,7 +20312,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Fleet 작업 배치"
+            "value" : "플릿 작업 배치"
           }
         }
       }
@@ -20537,12 +20337,12 @@
         }
       }
     },
-    "Fleet dispatch requires an updated CLI and daemon. Configure the coordinator in Settings → Dispatch." : {
+    "Fleet dispatch requires an updated CLI and daemon. Configure the coordinator in Settings → Fleet → Dispatch." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Fleet 작업 배치에는 최신 CLI와 데몬이 필요합니다. 설정 → 작업 배치에서 coordinator를 지정하세요."
+            "value" : "플릿 작업 배치에는 최신 CLI와 데몬이 필요합니다. 설정 → 플릿 → 작업 배치에서 코디네이터를 지정하세요."
           }
         }
       }
@@ -20552,7 +20352,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Coordinator: %@"
+            "value" : "코디네이터: %@"
           }
         }
       }
@@ -20562,7 +20362,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Workspace 선택"
+            "value" : "워크스페이스 선택"
           }
         }
       }
@@ -20796,7 +20596,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Coordinator"
+            "value" : "코디네이터"
           }
         }
       }
@@ -20806,7 +20606,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Fleet 작업 배치 활성화"
+            "value" : "플릿 작업 배치 활성화"
           }
         }
       }
@@ -20816,7 +20616,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Coordinator 호스트 별칭"
+            "value" : "코디네이터 호스트 별칭"
           }
         }
       }
@@ -20836,7 +20636,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "연결된 데몬의 설정입니다. 다른 호스트에서는 이 coordinator의 Fleet 별칭을 지정해 작업 배치와 Ask 기록을 공유합니다."
+            "value" : "연결된 데몬의 설정입니다. 다른 호스트에서는 이 코디네이터의 플릿 별칭을 지정해 작업 배치와 Ask 기록을 공유합니다."
           }
         }
       }
@@ -20851,32 +20651,12 @@
         }
       }
     },
-    "Workspace policy" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspace 정책"
-          }
-        }
-      }
-    },
     "New workspace ID" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "새 Workspace ID"
-          }
-        }
-      }
-    },
-    "Add workspace" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workspace 추가"
+            "value" : "새 워크스페이스 ID"
           }
         }
       }
@@ -20986,7 +20766,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Workspace와 노드 경로는 coordinator에서 설정하세요. 현재 호스트는 요청을 해당 coordinator로 전달합니다."
+            "value" : "워크스페이스와 노드 경로는 코디네이터에서 설정하세요. 현재 호스트는 요청을 해당 코디네이터로 전달합니다."
           }
         }
       }
@@ -21087,16 +20867,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "노드 태그"
-          }
-        }
-      }
-    },
-    "Edit labels" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "태그 편집"
           }
         }
       }
@@ -22058,7 +21828,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 Mac의 에이전트에만 적용됩니다. Fleet 호스트는 그 호스트 tendd의 규칙을 따르므로, 거기서 한도에 걸린 에이전트는 계속 확인을 요청합니다."
+            "value" : "이 Mac의 에이전트에만 적용됩니다. 플릿 호스트는 그 호스트 tendd의 규칙을 따르므로, 거기서 한도에 걸린 에이전트는 계속 확인을 요청합니다."
           }
         }
       }
@@ -22368,7 +22138,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Agent별"
+            "value" : "에이전트별"
           }
         }
       }
@@ -22388,7 +22158,7 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Fleet 호스트별"
+            "value" : "플릿 호스트별"
           }
         }
       }
@@ -22433,16 +22203,6 @@
         }
       }
     },
-    "AAS appears as a hoverable usage chip when its module is enabled." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AAS 확장을 켜면 마우스 오버 가능한 사용량 칩이 표시됩니다."
-          }
-        }
-      }
-    },
     "Show AAS usage chip" : {
       "localizations" : {
         "ko" : {
@@ -22459,16 +22219,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "마우스를 올리면 활성 계정 사용량을, 클릭하면 모든 계정 사용량을 볼 수 있습니다."
-          }
-        }
-      }
-    },
-    "Enable AAS module" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AAS 확장 켜기"
           }
         }
       }
@@ -22913,16 +22663,6 @@
         }
       }
     },
-    "You have unsaved changes. Save to keep them." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "저장하지 않은 변경 사항이 있습니다. 저장해야 유지됩니다."
-          }
-        }
-      }
-    },
     "Installed · %@" : {
       "localizations" : {
         "ko" : {
@@ -22938,7 +22678,477 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Fleet 작업 배치 설정을 편집하려면 CLI와 데몬을 업데이트하세요."
+            "value" : "플릿 작업 배치 설정을 편집하려면 CLI와 데몬을 업데이트하세요."
+          }
+        }
+      }
+    },
+    "Accounts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정"
+          }
+        }
+      }
+    },
+    "Fleet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "플릿"
+          }
+        }
+      }
+    },
+    "Restart tendd to apply" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tendd를 다시 시작해야 적용됩니다"
+          }
+        }
+      }
+    },
+    "Restart" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 시작"
+          }
+        }
+      }
+    },
+    "Symbol" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기호"
+          }
+        }
+      }
+    },
+    "Use Default" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본값으로"
+          }
+        }
+      }
+    },
+    "Keyboard shortcut" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "키보드 단축키"
+          }
+        }
+      }
+    },
+    "Not set" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 안 됨"
+          }
+        }
+      }
+    },
+    "Fleet settings" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "플릿 설정"
+          }
+        }
+      }
+    },
+    "No labels" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 없음"
+          }
+        }
+      }
+    },
+    "Edit Labels…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 편집…"
+          }
+        }
+      }
+    },
+    "macOS permission" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS 권한"
+          }
+        }
+      }
+    },
+    "When Tend stays quiet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tend가 알리지 않는 경우"
+          }
+        }
+      }
+    },
+    "Workspace policies" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "워크스페이스 정책"
+          }
+        }
+      }
+    },
+    "Path placeholders" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 자리표시자"
+          }
+        }
+      }
+    },
+    "No workspace policies yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 워크스페이스 정책이 없습니다."
+          }
+        }
+      }
+    },
+    "Add Workspace…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "워크스페이스 추가…"
+          }
+        }
+      }
+    },
+    "Saving reconnects Tend to tendd." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장하면 Tend가 tendd에 다시 연결됩니다."
+          }
+        }
+      }
+    },
+    "%lld node overrides" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 재정의 %lld개"
+          }
+        }
+      }
+    },
+    "Inherits every default" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 기본값 상속"
+          }
+        }
+      }
+    },
+    "Node overrides" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 재정의"
+          }
+        }
+      }
+    },
+    "Path overrides" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로 재정의"
+          }
+        }
+      }
+    },
+    "Changes are saved with Save in Dispatch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변경 사항은 작업 배치의 저장 버튼으로 저장됩니다."
+          }
+        }
+      }
+    },
+    "Daemon" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "데몬"
+          }
+        }
+      }
+    },
+    "Configuration file" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 파일"
+          }
+        }
+      }
+    },
+    "Show details" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세부 정보 보기"
+          }
+        }
+      }
+    },
+    "Path" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "경로"
+          }
+        }
+      }
+    },
+    "Edit Raw TOML…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TOML 원문 편집…"
+          }
+        }
+      }
+    },
+    "Launch arguments" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 인자"
+          }
+        }
+      }
+    },
+    "Configuration File" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 파일"
+          }
+        }
+      }
+    },
+    "Also notify from tendd when Tend isn't running" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tend가 꺼져 있을 때 tendd도 알림"
+          }
+        }
+      }
+    },
+    "Notifications from tendd" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tendd 알림"
+          }
+        }
+      }
+    },
+    "Launch arguments have unsaved changes." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장하지 않은 실행 인자 변경 사항이 있습니다."
+          }
+        }
+      }
+    },
+    "Pause" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일시 정지"
+          }
+        }
+      }
+    },
+    "Show All %lld Entries…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "항목 %lld개 모두 보기…"
+          }
+        }
+      }
+    },
+    "%lld entries, newest first" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "항목 %lld개, 최신순"
+          }
+        }
+      }
+    },
+    "Actions for %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 작업"
+          }
+        }
+      }
+    },
+    "Edit, test or remove this rule" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 규칙 편집, 테스트 또는 제거"
+          }
+        }
+      }
+    },
+    "Edit %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 편집"
+          }
+        }
+      }
+    },
+    "Remove %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 제거"
+          }
+        }
+      }
+    },
+    "Add %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 추가"
+          }
+        }
+      }
+    },
+    "New provider" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 프로바이더"
+          }
+        }
+      }
+    },
+    "Built-in engines" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 엔진"
+          }
+        }
+      }
+    },
+    "Discard unsaved Dispatch changes and reload?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장하지 않은 작업 배치 변경 사항을 버리고 다시 로드할까요?"
+          }
+        }
+      }
+    },
+    "Reads the Dispatch settings from the configuration file again" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 파일에서 작업 배치 설정을 다시 읽습니다"
+          }
+        }
+      }
+    },
+    "The configuration file changed elsewhere. Your Dispatch changes are kept; Save again to apply them on top." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 파일이 다른 곳에서 바뀌었습니다. 작업 배치 변경 사항은 그대로 남아 있으니, 다시 저장하면 바뀐 파일 위에 적용됩니다."
+          }
+        }
+      }
+    },
+    "Dispatch settings changed elsewhere. Reload to take them; your unsaved changes are discarded." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 배치 설정이 다른 곳에서 바뀌었습니다. 다시 로드해 반영하세요. 저장하지 않은 변경 사항은 사라집니다."
           }
         }
       }

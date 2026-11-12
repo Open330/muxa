@@ -496,7 +496,7 @@ private struct OnboardingChecklistPage: View {
             }
         } action: {
             if !model.isConnected {
-                OnboardingSettingsButton(tab: .runtime)
+                OnboardingSettingsButton(tab: .advanced)
             }
         }
     }
@@ -560,7 +560,7 @@ private struct OnboardingChecklistPage: View {
             case .some(true):
                 Text("Ask any configured provider from the Ask view without starting an agent.")
             case .some(false):
-                Text("Global Ask is disabled in the tend configuration. Enable it under Settings › Providers.")
+                Text("Global Ask is disabled in the tend configuration. Enable it under Settings › Ask.")
             case .none:
                 Text("Waiting for tendd to report the Ask configuration.")
             }
@@ -573,7 +573,7 @@ private struct OnboardingChecklistPage: View {
                 }
                 .buttonStyle(.tendSecondary)
             case .some(false):
-                OnboardingSettingsButton(tab: .providers)
+                OnboardingSettingsButton(tab: .ask)
             case .none:
                 EmptyView()
             }
@@ -1062,10 +1062,10 @@ private struct OnboardingNotificationsPage: View {
             authorizationRow
 
             HStack(spacing: 8) {
-                Text("Choose what Tend notifies about in Settings › Behaviour.")
+                Text("Choose what Tend notifies about in Settings › Notifications.")
                     .font(TendType.detail)
                     .foregroundStyle(.secondary)
-                OnboardingSettingsButton(tab: .behaviour)
+                OnboardingSettingsButton(tab: .notifications)
                     .controlSize(.small)
             }
         }

@@ -1,15 +1,16 @@
 import SwiftUI
 
-/// Settings › Providers: the one place to set up Global Ask.
+/// Settings › Ask: the one place to set up Global Ask.
 ///
-/// A provider is an *instance* of a closed engine, so the pane shows what the
-/// user has configured first and offers tendd's built-ins below it. Daemons
-/// that predate provider instances fall back to the flat, read-only list.
+/// A provider is an *instance* of a closed engine, so the pane lists what the
+/// user has configured, one collapsed row each, and offers tendd's built-ins
+/// inside Add Provider. Daemons that predate provider instances fall back to
+/// the flat, read-only list.
 struct AskProvidersSettingsPane: View {
     @ObservedObject var model: AppModel
     @ObservedObject var store: AskProviderStore
-    @State private var confirmsReload = false
     @State private var isAddingProvider = false
+    @State private var editingProvider: TendAskProvider?
     @State private var removalTarget: TendAskProvider?
 
     private var selectedProviderIsListed: Bool {
@@ -26,65 +27,39 @@ struct AskProvidersSettingsPane: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                settingsHeading(
-                    "Ask Providers",
-                    detail: "Global Ask runs an installed agent CLI headlessly or calls a hosted API. Add one provider per account: keys stay in the macOS login Keychain, one per provider id."
-                )
+        Form {
+            if model.askEnabled == false {
+                disabledSection
+            }
 
-                if model.askEnabled == false {
-                    disabledBanner
-                }
+            defaultProviderSection
 
-                defaultProviderCard
+            if store.supportsInstances {
+                configuredSection
+            } else {
+                legacySection
+            }
 
-                if let error = store.loadError {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(TendType.detail)
-                        .foregroundStyle(.orange)
-                        .textSelection(.enabled)
-                }
+            statusSection
 
-                if store.supportsInstances {
-                    configuredSection
-                    detectedSection
-                } else {
-                    legacyList
-                }
-
-                statusLines
-
+            Section {
                 HStack(spacing: 10) {
-                    Text("Re-check after installing a CLI. Reload tendd only when its PATH must change too.")
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
+                    TendSettingsCaption("Re-check after installing a CLI. Reload tendd only when its PATH must change too.")
                     Spacer()
-                    Button {
-                        Task {
-                            await store.detectInstalledTools(force: true)
-                            await store.probeAppleModels(force: true)
-                        }
-                    } label: {
-                        Label("Re-check CLIs", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(store.isDetecting)
-                    Button("Reload tendd PATH…") { confirmsReload = true }
+                    TendDaemonReloadButton(model: model, title: "Reload tendd PATH…")
+                        .controlSize(.small)
                 }
             }
-            .padding(20)
         }
+        .formStyle(.grouped)
         .task(id: model.isConnected) {
             await store.reload(model: model)
         }
         .sheet(isPresented: $isAddingProvider) {
             AskProviderAddSheet(model: model, store: store)
         }
-        .alert("Reload the bundled tendd?", isPresented: $confirmsReload) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
-        } message: {
-            Text("Native PTY sessions owned by tendd will end. tmux sessions are not terminated.")
+        .sheet(item: $editingProvider) { provider in
+            AskProviderEditSheet(providerID: provider.id, fallback: provider, store: store, model: model)
         }
         .alert("Remove this provider?", isPresented: isRemoving, presenting: removalTarget) { provider in
             Button("Cancel", role: .cancel) { removalTarget = nil }
@@ -110,66 +85,71 @@ struct AskProvidersSettingsPane: View {
         Task { _ = await store.removeProvider(provider, deletingKey: deletingKey, using: model) }
     }
 
-    private var disabledBanner: some View {
-        HStack {
-            Label(
-                model.askConfigurationPendingReload
-                    ? "Global Ask is enabled in config. Reload tendd to apply it."
-                    : "Global Ask is disabled in tend configuration.",
-                systemImage: "exclamationmark.circle"
-            )
-            .foregroundStyle(.orange)
-            Spacer()
-            if model.isEnablingAsk {
-                ProgressView().controlSize(.small)
-            }
-            Button(model.askConfigurationPendingReload ? "Reload tendd" : "Enable Global Ask") {
-                Task { await model.enableAsk() }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(model.isEnablingAsk)
-        }
-        .padding(12)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var defaultProviderCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Label("Default provider", systemImage: "sparkles")
-                    .font(.headline)
+    private var disabledSection: some View {
+        Section {
+            HStack {
+                Label(
+                    model.askConfigurationPendingReload
+                        ? "Global Ask is enabled in config. Reload tendd to apply it."
+                        : "Global Ask is disabled in tend configuration.",
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(TendType.detail)
+                .foregroundStyle(.orange)
                 Spacer()
-                if store.isLoading {
+                if model.isEnablingAsk {
                     ProgressView().controlSize(.small)
                 }
-                Picker("Default provider", selection: defaultProviderSelection) {
-                    ForEach(store.providers) { provider in
-                        if let reason = store.usability(provider).reason {
-                            Text(verbatim: "\(provider.title) (\(reason))")
-                                .tag(provider.id)
-                                .disabled(true)
-                        } else {
-                            Text(provider.title).tag(provider.id)
-                        }
-                    }
-                    if !selectedProviderIsListed {
-                        Text(store.title(for: model.askAgent)).tag(model.askAgent)
+                Button(model.askConfigurationPendingReload ? "Reload tendd" : "Enable Global Ask") {
+                    Task { await model.enableAsk() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isEnablingAsk)
+            }
+        }
+    }
+
+    private var defaultProviderSection: some View {
+        Section {
+            Picker("Default provider", selection: defaultProviderSelection) {
+                ForEach(store.providers) { provider in
+                    if let reason = store.usability(provider).reason {
+                        Text(verbatim: "\(provider.title) (\(reason))")
+                            .tag(provider.id)
+                            .disabled(true)
+                    } else {
+                        Text(provider.title).tag(provider.id)
                     }
                 }
-                .labelsHidden()
-                .frame(width: 220)
-                .disabled(!model.isConnected)
+                if !selectedProviderIsListed {
+                    Text(store.title(for: model.askAgent)).tag(model.askAgent)
+                }
             }
-            Text(
+            .disabled(!model.isConnected)
+            TendSettingsCaption(
                 store.providersFromDaemon
                     ? "New Ask conversations start with this provider. Entries are disabled until their CLI is installed or a key is saved."
                     : "This tendd predates the provider list; only the built-in CLIs are shown. Update tend or choose Use Bundled tendd for API providers."
             )
-            .font(TendType.detail)
-            .foregroundStyle(.secondary)
+        } header: {
+            HStack {
+                Text("Global Ask")
+                Spacer()
+                if store.isLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button {
+                    Task {
+                        await store.detectInstalledTools(force: true)
+                        await store.probeAppleModels(force: true)
+                    }
+                } label: {
+                    Label("Re-check CLIs", systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
+                .disabled(store.isDetecting)
+            }
         }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var defaultProviderSelection: Binding<String> {
@@ -186,10 +166,22 @@ struct AskProvidersSettingsPane: View {
 
     /// Instances in tend's config: renameable, re-keyable, removable.
     private var configuredSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Label("Configured", systemImage: "checklist")
-                    .font(.headline)
+        Section {
+            if store.configuredProviders.isEmpty {
+                TendSettingsCaption("Nothing configured yet. Add a provider to choose an engine, or one of the built-ins tendd ships with.")
+            }
+            ForEach(store.configuredProviders) { provider in
+                AskProviderRow(
+                    provider: provider,
+                    store: store,
+                    model: model,
+                    onEdit: { editingProvider = provider },
+                    onRemove: { removalTarget = provider }
+                )
+            }
+        } header: {
+            HStack {
+                Text("Providers")
                 Spacer()
                 if store.isConfiguring {
                     ProgressView().controlSize(.small)
@@ -199,44 +191,18 @@ struct AskProvidersSettingsPane: View {
                 } label: {
                     Label("Add Provider…", systemImage: "plus")
                 }
+                .controlSize(.small)
                 .disabled(!model.isConnected || store.isConfiguring)
             }
-            if store.configuredProviders.isEmpty {
-                Text("Nothing configured yet. Add a provider, or add one of the detected built-ins below.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(store.configuredProviders) { provider in
-                AskProviderCard(provider: provider, store: store, model: model) {
-                    removalTarget = provider
-                }
-            }
-        }
-    }
-
-    /// Built-in engines tendd answers with even without config.
-    private var detectedSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Detected", systemImage: "sparkle.magnifyingglass")
-                .font(.headline)
-            Text("Engines tendd ships with. Add one to give it its own title, model and API key; add it twice for two accounts.")
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
-            if store.detectedProviders.isEmpty {
-                Text("Every built-in engine is already configured.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(store.detectedProviders) { provider in
-                AskProviderDetectedRow(provider: provider, store: store, model: model)
-            }
+        } footer: {
+            TendSettingsCaption("Global Ask runs an installed agent CLI headlessly or calls a hosted API. Add one provider per account: keys stay in the macOS login Keychain, one per provider id.")
         }
     }
 
     /// A daemon that lists providers but does not understand instances: the
     /// old flat list, with a note explaining why Add and Remove are missing.
-    private var legacyList: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private var legacySection: some View {
+        Section("Providers") {
             if store.providersFromDaemon {
                 Label(
                     "This tendd lists providers but cannot add or remove them. Update tend or choose Use Bundled tendd to compose your own provider list.",
@@ -246,13 +212,42 @@ struct AskProvidersSettingsPane: View {
                 .foregroundStyle(.secondary)
             }
             ForEach(store.providers) { provider in
-                AskProviderCard(provider: provider, store: store, model: model) {}
+                AskProviderRow(
+                    provider: provider,
+                    store: store,
+                    model: model,
+                    onEdit: { editingProvider = provider },
+                    onRemove: nil
+                )
             }
         }
     }
 
     @ViewBuilder
-    private var statusLines: some View {
+    private var statusSection: some View {
+        let messages = model.askSettingsStatus != nil || store.configureStatus != nil
+            || (model.askSettingsError ?? model.askError) != nil || store.configureError != nil
+            || store.loadError != nil
+        if messages {
+            Section {
+                AskProviderStatusLines(model: model, store: store)
+                if let error = store.loadError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(TendType.detail)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
+/// What the last provider change did, said once.
+private struct AskProviderStatusLines: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var store: AskProviderStore
+
+    var body: some View {
         if let status = model.askSettingsStatus {
             Label(status, systemImage: "checkmark.circle.fill")
                 .font(TendType.detail)
@@ -278,7 +273,7 @@ struct AskProvidersSettingsPane: View {
     }
 }
 
-/// CLI/API pill, shared by the provider card and the detected row.
+/// CLI/API pill, shared by the provider row and the detected row.
 struct AskProviderKindBadge: View {
     let kind: TendAskProvider.Kind
 
@@ -297,11 +292,90 @@ struct AskProviderKindBadge: View {
     }
 }
 
+/// Ready, checking, missing a key…: one badge for where a provider stands.
+struct AskProviderUsabilityBadge: View {
+    let usability: AskProviderUsability
+
+    var body: some View {
+        switch usability {
+        case .usable:
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .font(TendType.meta.weight(.semibold))
+                .foregroundStyle(.green)
+        case .probing:
+            Label("Checking", systemImage: "ellipsis.circle")
+                .font(TendType.meta.weight(.semibold))
+                .foregroundStyle(.secondary)
+        case .notInstalled:
+            Label("Not installed", systemImage: "xmark.circle")
+                .font(TendType.meta.weight(.semibold))
+                .foregroundStyle(.red)
+        case .missingKey:
+            Label("API key required", systemImage: "key")
+                .font(TendType.meta.weight(.semibold))
+                .foregroundStyle(.orange)
+        case .unavailable:
+            Label("Unavailable", systemImage: "exclamationmark.triangle")
+                .font(TendType.meta.weight(.semibold))
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
+/// One provider, collapsed: what it is, whether it can answer, and Edit… /
+/// Remove… for the rest.
+struct AskProviderRow: View {
+    let provider: TendAskProvider
+    @ObservedObject var store: AskProviderStore
+    @ObservedObject var model: AppModel
+    let onEdit: () -> Void
+    /// Nil for a built-in row, which cannot be removed.
+    let onRemove: (() -> Void)?
+
+    private var isConfigured: Bool { store.supportsInstances && provider.isConfigured }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: provider.symbolName)
+                .foregroundStyle(.tint)
+                .frame(width: 20)
+                .accessibilityHidden(true)
+            Text(provider.title)
+                .lineLimit(1)
+            AskProviderKindBadge(kind: provider.kind)
+            AskProviderUsabilityBadge(usability: store.usability(provider))
+            if model.askAgent == provider.id {
+                Label("Default", systemImage: "checkmark")
+                    .font(TendType.meta.weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+            Spacer(minLength: 8)
+            if provider.kind == .cli, provider.takesCredential {
+                Button("Log In…") {
+                    Task { await model.openProviderCLI(provider) }
+                }
+                .disabled(store.detection(for: provider).tool == nil || !model.isConnected)
+                .help("Opens the CLI in a Tend shell so you can sign in")
+            }
+            Button("Edit…", action: onEdit)
+                .accessibilityLabel(Text("Edit \(provider.title)"))
+            if isConfigured, let onRemove {
+                Button("Remove…", role: .destructive, action: onRemove)
+                    .disabled(!model.isConnected || store.isConfiguring)
+                    .help("Deletes this provider from tend's config")
+                    .accessibilityLabel(Text("Remove \(provider.title)"))
+            }
+        }
+        .controlSize(.small)
+    }
+}
+
 /// A built-in engine the user has not configured: what it needs, and Add.
 struct AskProviderDetectedRow: View {
     let provider: TendAskProvider
     @ObservedObject var store: AskProviderStore
     @ObservedObject var model: AppModel
+    var onAdded: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 10) {
@@ -312,24 +386,19 @@ struct AskProviderDetectedRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(provider.title)
-                        .font(.subheadline.weight(.medium))
                     AskProviderKindBadge(kind: provider.kind)
-                    if provider.id == model.askAgent {
-                        Label("Default", systemImage: "checkmark")
-                            .font(TendType.meta.weight(.semibold))
-                            .foregroundStyle(.tint)
-                    }
                 }
                 requirement
             }
             Spacer(minLength: 8)
             Button {
                 Task {
-                    _ = await store.addProvider(
+                    let added = await store.addProvider(
                         id: provider.id,
                         engine: provider.engine,
                         using: model
                     )
+                    if added { onAdded() }
                 }
             } label: {
                 Label("Add", systemImage: "plus")
@@ -337,9 +406,8 @@ struct AskProviderDetectedRow: View {
             .controlSize(.small)
             .disabled(!model.isConnected || store.isConfiguring)
             .help("Writes this engine into tend's config so it can carry its own title, model and key")
+            .accessibilityLabel(Text("Add \(provider.title)"))
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     /// What the engine still needs before it can answer an Ask.
@@ -347,22 +415,16 @@ struct AskProviderDetectedRow: View {
     private var requirement: some View {
         if provider.kind == .api {
             if provider.credentialPresent {
-                Text("Key already in tendd's environment")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("Key already in tendd's environment")
             } else {
-                Text("API key required")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("API key required")
             }
         } else if provider.isApple {
             AskAppleAvailabilityLine(provider: provider, store: store)
         } else {
             switch store.detection(for: provider) {
             case .probing:
-                Text("Looking for \(provider.executable) on your PATH…")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("Looking for \(provider.executable) on your PATH…")
             case .installed(let tool):
                 Text("CLI found at \(tool.path)")
                     .font(TendType.detail.monospaced())
@@ -428,23 +490,26 @@ struct AskAppleAvailabilityLine: View {
     }
 }
 
-/// One configured provider: kind badge, detection, credential state, the
-/// `[ask.providers.<id>]` fields, and Remove.
-struct AskProviderCard: View {
-    let provider: TendAskProvider
+/// One provider, opened: detection, credential state, the
+/// `[ask.providers.<id>]` fields with their labels, and Remove.
+struct AskProviderEditSheet: View {
+    let providerID: String
+    let fallback: TendAskProvider
     @ObservedObject var store: AskProviderStore
     @ObservedObject var model: AppModel
-    /// Asks the pane to confirm removal; ignored for a built-in row.
-    let onRemove: () -> Void
+    @Environment(\.dismiss) private var dismiss
     @State private var key = ""
     @State private var titleText = ""
     @State private var modelName = ""
     @State private var executablePath = ""
 
+    /// The provider as the store now describes it, so a save shows through.
+    private var provider: TendAskProvider {
+        store.providers.first { $0.id == providerID } ?? fallback
+    }
+
     private var hasKey: Bool { store.hasKey(provider) }
     private var detection: AskProviderDetection { store.detection(for: provider) }
-    private var usability: AskProviderUsability { store.usability(provider) }
-    private var isSelected: Bool { model.askAgent == provider.id }
     /// Only an instance that exists in config can be edited or removed.
     private var isConfigured: Bool { store.supportsInstances && provider.isConfigured }
 
@@ -477,94 +542,73 @@ struct AskProviderCard: View {
     private var modelChanged: Bool { modelUpdate != .keep }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            header
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    HStack(spacing: 8) {
+                        AskProviderKindBadge(kind: provider.kind)
+                        AskProviderUsabilityBadge(usability: store.usability(provider))
+                        if model.askAgent == provider.id {
+                            Label("Default", systemImage: "checkmark")
+                                .font(TendType.meta.weight(.semibold))
+                                .foregroundStyle(.tint)
+                        }
+                        Spacer()
+                        Text(verbatim: provider.id)
+                            .font(TendType.detail.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    if provider.isApple {
+                        AskAppleAvailabilityLine(provider: provider, store: store)
+                    } else if provider.kind == .cli {
+                        detectionLine
+                    }
+                } header: {
+                    Label {
+                        Text(provider.title)
+                    } icon: {
+                        Image(systemName: provider.symbolName).accessibilityHidden(true)
+                    }
+                }
 
-            if provider.isApple {
-                AskAppleAvailabilityLine(provider: provider, store: store)
-            } else if provider.kind == .cli {
-                detectionLine
-            }
+                if provider.takesCredential {
+                    credentialSection
+                }
 
-            if provider.takesCredential {
-                credentialRow
-            }
+                if isConfigured {
+                    detailsSection
+                } else if provider.kind == .api, store.providersFromDaemon {
+                    modelSection
+                }
 
-            if isConfigured {
-                detailsEditor
-            } else if provider.kind == .api, store.providersFromDaemon {
-                modelRow
+                if store.configureError != nil || store.configureStatus != nil {
+                    Section {
+                        AskProviderStatusLines(model: model, store: store)
+                    }
+                }
             }
+            .formStyle(.grouped)
+
+            Divider()
+            HStack {
+                if store.isConfiguring {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(14)
         }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(isSelected ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.06), lineWidth: 1)
+        .frame(minWidth: 520, idealWidth: 560, minHeight: 420, idealHeight: 520)
+        .onAppear {
+            store.clearStatus()
+            resetFields()
         }
-        .onAppear(perform: resetFields)
         .onChange(of: provider.title) { _ in resetFields() }
         .onChange(of: provider.model) { _ in resetFields() }
         .onChange(of: provider.cliExecutable) { _ in resetFields() }
-    }
-
-    private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: provider.symbolName)
-                .foregroundStyle(.tint)
-                .frame(width: 20)
-                .accessibilityHidden(true)
-            Text(provider.title)
-                .font(.headline)
-            AskProviderKindBadge(kind: provider.kind)
-            usabilityBadge
-            if isSelected {
-                Label("Default", systemImage: "checkmark")
-                    .font(TendType.meta.weight(.semibold))
-                    .foregroundStyle(.tint)
-            }
-            Spacer()
-            if provider.kind == .cli, provider.takesCredential {
-                Button("Log In…") {
-                    Task { await model.openProviderCLI(provider) }
-                }
-                .controlSize(.small)
-                .disabled(detection.tool == nil || !model.isConnected)
-                .help("Opens the CLI in a Tend shell so you can sign in")
-            }
-            if isConfigured {
-                Button("Remove…", role: .destructive, action: onRemove)
-                    .controlSize(.small)
-                    .disabled(!model.isConnected || store.isConfiguring)
-                    .help("Deletes this provider from tend's config")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var usabilityBadge: some View {
-        switch usability {
-        case .usable:
-            Label("Ready", systemImage: "checkmark.circle.fill")
-                .font(TendType.meta.weight(.semibold))
-                .foregroundStyle(.green)
-        case .probing:
-            Label("Checking", systemImage: "ellipsis.circle")
-                .font(TendType.meta.weight(.semibold))
-                .foregroundStyle(.secondary)
-        case .notInstalled:
-            Label("Not installed", systemImage: "xmark.circle")
-                .font(TendType.meta.weight(.semibold))
-                .foregroundStyle(.red)
-        case .missingKey:
-            Label("API key required", systemImage: "key")
-                .font(TendType.meta.weight(.semibold))
-                .foregroundStyle(.orange)
-        case .unavailable:
-            Label("Unavailable", systemImage: "exclamationmark.triangle")
-                .font(TendType.meta.weight(.semibold))
-                .foregroundStyle(.orange)
-        }
     }
 
     @ViewBuilder
@@ -573,9 +617,7 @@ struct AskProviderCard: View {
         case .probing:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
-                Text("Looking for \(provider.executable) on your PATH…")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("Looking for \(provider.executable) on your PATH…")
             }
         case .installed(let tool):
             // The version line often carries its own parentheses
@@ -596,9 +638,7 @@ struct AskProviderCard: View {
             }
         case .notInstalled:
             VStack(alignment: .leading, spacing: 4) {
-                Text("Install the \(provider.executable) command and make sure it is on your PATH, then re-check.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("Install the \(provider.executable) command and make sure it is on your PATH, then re-check.")
                 if let command = provider.installCommand {
                     Text(verbatim: command)
                         .font(TendType.detail.monospaced())
@@ -609,13 +649,10 @@ struct AskProviderCard: View {
         }
     }
 
-    private var credentialRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private var credentialSection: some View {
+        Section {
             HStack(spacing: 8) {
-                AskProviderFieldLabel(title: "API key")
-                SecureField(keyFieldTitle, text: $key)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel(Text(keyFieldTitle))
+                SecureField("API key", text: $key, prompt: Text(keyFieldTitle))
                     .onSubmit(saveKey)
                 Button("Save", action: saveKey)
                     .controlSize(.small)
@@ -630,26 +667,24 @@ struct AskProviderCard: View {
             HStack(spacing: 8) {
                 if hasKey {
                     Label("Key saved in Keychain", systemImage: "key.fill")
-                        .font(TendType.meta.weight(.semibold))
+                        .font(TendType.detail)
                         .foregroundStyle(.blue)
                 } else if provider.credentialPresent {
                     Label("tendd already has this key in its environment", systemImage: "checkmark.seal.fill")
-                        .font(TendType.meta.weight(.semibold))
+                        .font(TendType.detail)
                         .foregroundStyle(.green)
                 } else if provider.kind == .cli {
-                    Text("Optional. Without a key the CLI's own sign-in is used.")
-                        .font(TendType.meta)
-                        .foregroundStyle(.secondary)
+                    TendSettingsCaption("Optional. Without a key the CLI's own sign-in is used.")
                 } else {
-                    Text("Required. The key is sent to tendd only for each Ask, never written to config or logs.")
-                        .font(TendType.meta)
-                        .foregroundStyle(.secondary)
+                    TendSettingsCaption("Required. The key is sent to tendd only for each Ask, never written to config or logs.")
                 }
                 Spacer()
                 Text(verbatim: provider.environmentKey)
-                    .font(TendType.meta.monospaced())
+                    .font(TendType.detail.monospaced())
                     .foregroundStyle(.secondary)
             }
+        } header: {
+            Text("API key")
         }
     }
 
@@ -663,69 +698,41 @@ struct AskProviderCard: View {
     }
 
     /// The instance's `[ask.providers.<id>]` fields, saved in one request.
-    private var detailsEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Outside a Form a TextField shows no label of its own, so each
-            // field gets a visible one beside it.
-            HStack(spacing: 8) {
-                AskProviderFieldLabel(title: "Title")
-                TextField("Title", text: $titleText, prompt: Text(verbatim: provider.title))
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel(Text("Title"))
-            }
-            HStack(spacing: 8) {
-                AskProviderFieldLabel(title: "Model")
-                TextField("Model", text: $modelName, prompt: modelPrompt)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel(Text("Model"))
-            }
+    private var detailsSection: some View {
+        Section {
+            TextField("Title", text: $titleText, prompt: Text(verbatim: provider.title))
+            TextField("Model", text: $modelName, prompt: modelPrompt)
             if provider.kind == .cli {
-                HStack(spacing: 8) {
-                    AskProviderFieldLabel(title: "Executable")
-                    TextField("Executable", text: $executablePath, prompt: executablePrompt)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.body.monospaced())
-                        .accessibilityLabel(Text("Executable"))
-                }
+                TextField("Executable", text: $executablePath, prompt: executablePrompt)
+                    .font(.body.monospaced())
             }
             if provider.isApple {
-                Text("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later; not working yet).")
-                    .font(TendType.meta)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later; not working yet).")
             }
-            HStack(spacing: 8) {
-                Text("Stored under this provider's id in tend's config. Empty fields fall back to the engine's defaults.")
-                    .font(TendType.meta)
-                    .foregroundStyle(.secondary)
+            HStack {
+                TendSettingsCaption("Stored under this provider's id in tend's config. Empty fields fall back to the engine's defaults.")
                 Spacer()
-                if store.isConfiguring {
-                    ProgressView().controlSize(.small)
-                }
                 Button("Save Changes", action: saveDetails)
                     .controlSize(.small)
                     .disabled(!detailsChanged || store.isConfiguring || !model.isConnected)
             }
+        } header: {
+            Text("Details")
         }
     }
 
-    private var modelRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private var modelSection: some View {
+        Section {
             HStack(spacing: 8) {
-                AskProviderFieldLabel(title: "Model")
                 TextField("Model", text: $modelName, prompt: modelPrompt)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel(Text("Model"))
                     .onSubmit(saveModel)
                 Button("Save Model", action: saveModel)
                     .controlSize(.small)
                     .disabled(!modelChanged || store.isConfiguring || !model.isConnected)
-                if store.isConfiguring {
-                    ProgressView().controlSize(.small)
-                }
             }
-            Text("Saved to tendd's config for this provider. Leave the field empty to use the daemon's default.")
-                .font(TendType.meta)
-                .foregroundStyle(.secondary)
+            TendSettingsCaption("Saved to tendd's config for this provider. Leave the field empty to use the daemon's default.")
+        } header: {
+            Text("Details")
         }
     }
 
@@ -810,20 +817,35 @@ struct AskProviderAddSheet: View {
             }
 
             Form {
-                Picker("Engine", selection: $draft.engine) {
-                    ForEach(AskProviderEngine.allCases) { engine in
-                        Text(verbatim: engine.title).tag(engine)
+                if store.supportsInstances, !store.detectedProviders.isEmpty {
+                    Section {
+                        ForEach(store.detectedProviders) { provider in
+                            AskProviderDetectedRow(provider: provider, store: store, model: model) {
+                                dismiss()
+                            }
+                        }
+                    } header: {
+                        Text("Built-in engines")
+                    } footer: {
+                        TendSettingsCaption("Engines tendd ships with. Add one to give it its own title, model and API key; add it twice for two accounts.")
                     }
                 }
-                TextField("Id", text: identifier, prompt: Text(verbatim: suggestedIdentifier))
-                    .font(.body.monospaced())
-                TextField("Title", text: $draft.title, prompt: Text("Optional"))
-                TextField("Model", text: $draft.model, prompt: modelPrompt)
-                if draft.engine.kind == .cli {
-                    TextField("Executable", text: $draft.executable, prompt: executablePrompt)
+                Section("New provider") {
+                    Picker("Engine", selection: $draft.engine) {
+                        ForEach(AskProviderEngine.allCases) { engine in
+                            Text(verbatim: engine.title).tag(engine)
+                        }
+                    }
+                    TextField("Id", text: identifier, prompt: Text(verbatim: suggestedIdentifier))
                         .font(.body.monospaced())
-                } else {
-                    SecureField("API key", text: $draft.apiKey)
+                    TextField("Title", text: $draft.title, prompt: Text("Optional"))
+                    TextField("Model", text: $draft.model, prompt: modelPrompt)
+                    if draft.engine.kind == .cli {
+                        TextField("Executable", text: $draft.executable, prompt: executablePrompt)
+                            .font(.body.monospaced())
+                    } else {
+                        SecureField("API key", text: $draft.apiKey)
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -856,7 +878,8 @@ struct AskProviderAddSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 520)
+        .frame(minHeight: 460, idealHeight: 600)
         .onAppear {
             store.clearStatus()
             prefillIdentifier()
@@ -916,21 +939,5 @@ struct AskProviderAddSheet: View {
             )
             if added { dismiss() }
         }
-    }
-}
-
-/// The visible caption beside a provider card's field. The field carries the
-/// same words as its accessibility label, so VoiceOver skips this one.
-private struct AskProviderFieldLabel: View {
-    let title: LocalizedStringKey
-
-    var body: some View {
-        Text(title)
-            .font(TendType.detail)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .fixedSize()
-            .frame(minWidth: 72, alignment: .leading)
-            .accessibilityHidden(true)
     }
 }

@@ -348,7 +348,7 @@ enum TendTOMLPatcher {
     }
 }
 
-// MARK: - The two sections the Behaviour tab owns
+// MARK: - The two sections the Notifications and Agents tabs edit
 
 enum TendNotifierBackend: String, CaseIterable, Hashable, Sendable, Identifiable {
     case none
@@ -456,7 +456,7 @@ struct TendBehaviourSettings: Hashable, Sendable {
 
 // MARK: - Store
 
-/// The daemon's `config.toml` for the Advanced and Behaviour tabs.
+/// The daemon's `config.toml` for the Notifications, Agents and Advanced tabs.
 ///
 /// `@Published` state cannot live in an `AppModel` extension, so both panes
 /// share this object: one load, one draft, one `expected_text` baseline.
@@ -485,6 +485,9 @@ final class TendConfigStore: ObservableObject {
     /// put them on top of the file as it now stands with one button.
     @Published private(set) var retryEdits: [TendTOMLEdit] = []
     @Published private(set) var status: String?
+    /// A saved change that waits for tendd to restart; drives the Settings
+    /// window's restart bar.
+    @Published private(set) var restartNotice = TendRestartNotice()
 
     init(document: TendDaemonConfigDocument? = nil, launch: TendLaunchSettings? = nil) {
         self.document = document
@@ -555,7 +558,9 @@ final class TendConfigStore: ObservableObject {
     /// Writes the Advanced editor's buffer.
     @discardableResult
     func save(model: AppModel) async -> Bool {
-        await save(client: model.client.makeConfigClient())
+        let saved = await save(client: model.client.makeConfigClient())
+        if saved { restartNotice.noteSaved(under: model.localDaemonIdentity) }
+        return saved
     }
 
     @discardableResult
@@ -584,6 +589,7 @@ final class TendConfigStore: ObservableObject {
         // A conflict leaves `document` holding the file as it now stands, so
         // the same edits re-applied land on top of whatever changed.
         retryEdits = wrote || conflictMessage == nil ? [] : edits
+        if wrote { restartNotice.noteSaved(under: model.localDaemonIdentity) }
         return wrote
     }
 

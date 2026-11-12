@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Darwin
 import Testing
@@ -3000,19 +3001,156 @@ func askProviderFallbackListMirrorsTheSelectedAgent() {
 }
 
 @Test
-func askSettingsTabKeySelectsTheProvidersTab() throws {
+func askSettingsTabKeySelectsTheAskTab() throws {
     let suite = "dev.tend.tests.ask-settings.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suite))
     defer { defaults.removePersistentDomain(forName: suite) }
     #expect(TendPreferences.settingsTabKey == "tend.settings.selectedTab")
-    #expect(TendSettingsTab.providers.rawValue == "providers")
+    #expect(TendSettingsTab.ask.rawValue == "ask")
 
-    TendSettingsOpener.select(.providers, in: defaults)
-    #expect(defaults.string(forKey: TendPreferences.settingsTabKey) == "providers")
-    #expect(TendSettingsTab(rawValue: defaults.string(forKey: TendPreferences.settingsTabKey) ?? "") == .providers)
+    TendSettingsOpener.select(.ask, in: defaults)
+    #expect(defaults.string(forKey: TendPreferences.settingsTabKey) == "ask")
+    #expect(TendSettingsTab.resolve(defaults.string(forKey: TendPreferences.settingsTabKey) ?? "") == .ask)
 
     TendSettingsOpener.select(.general, in: defaults)
     #expect(defaults.string(forKey: TendPreferences.settingsTabKey) == "general")
+}
+
+@Test
+func settingsTabsKeepTheApprovedOrderAndSymbols() {
+    #expect(TendSettingsTab.allCases == [
+        .general, .notifications, .menuBar, .accounts, .ask, .agents, .automations, .fleet, .advanced,
+    ])
+    #expect(TendSettingsTab.allCases.map(\.preferredSystemImage) == [
+        "gearshape", "bell.badge", "menubar.rectangle", "person.2",
+        "bubble.left.and.text.bubble.right", "person.3.sequence", "bolt.badge.automatic",
+        "server.rack", "slider.horizontal.3",
+    ])
+    // Every tab draws a symbol that exists on this macOS.
+    for tab in TendSettingsTab.allCases {
+        #expect(NSImage(systemSymbolName: tab.systemImage, accessibilityDescription: nil) != nil, "\(tab)")
+    }
+}
+
+@Test
+func settingsTabSelectionsFromEarlierBuildsOpenTheirNewHome() {
+    #expect(TendSettingsTab.resolve("providers") == .ask)
+    #expect(TendSettingsTab.resolve("behaviour") == .notifications)
+    #expect(TendSettingsTab.resolve("modules") == .accounts)
+    #expect(TendSettingsTab.resolve("dispatch") == .fleet)
+    #expect(TendSettingsTab.resolve("runtime") == .advanced)
+    #expect(TendSettingsTab.resolve("fleet") == .fleet)
+    #expect(TendSettingsTab.resolve("menuBar") == .menuBar)
+    #expect(TendSettingsTab.resolve("") == .general)
+    #expect(TendSettingsTab.resolve("no-such-tab") == .general)
+    #expect(TendSettingsTab.fleetSection(for: "dispatch") == .dispatch)
+    #expect(TendSettingsTab.fleetSection(for: "fleet") == nil)
+    for tab in TendSettingsTab.allCases {
+        #expect(TendSettingsTab.resolve(tab.rawValue) == tab)
+    }
+}
+
+@Test
+func restartNoticeShowsUntilADifferentDaemonAnswers() {
+    let first = TendDaemonIdentity(generation: 4, pid: 100)
+    var notice = TendRestartNotice()
+    #expect(!notice.isShown(current: first))
+
+    notice.noteSaved(under: first)
+    #expect(notice.isShown(current: first))
+    // Disconnected mid-restart: nothing known to compare, so keep asking.
+    #expect(notice.isShown(current: TendDaemonIdentity()))
+    // A second save before the restart keeps the first daemon.
+    notice.noteSaved(under: first)
+    #expect(notice.savedUnder == first)
+    // tendd re-exec'd itself: a new generation.
+    #expect(!notice.isShown(current: TendDaemonIdentity(generation: 5, pid: 100)))
+
+    // A save under the new daemon shows the bar again.
+    let second = TendDaemonIdentity(generation: 5, pid: 100)
+    notice.noteSaved(under: second)
+    #expect(notice.isShown(current: second))
+    #expect(notice.savedUnder == second)
+
+    notice.clear()
+    #expect(!notice.isShown(current: second))
+}
+
+@Test
+func restartNoticeTellsAFreshProcessFromTheOldOneAtGenerationZero() {
+    // A fresh tendd starts at generation 0 again, so generation alone
+    // cannot tell an outside restart apart; the socket owner's pid can.
+    var notice = TendRestartNotice()
+    notice.noteSaved(under: TendDaemonIdentity(generation: 0, pid: 100))
+    #expect(notice.isShown(current: TendDaemonIdentity(generation: 0, pid: 100)))
+    #expect(!notice.isShown(current: TendDaemonIdentity(generation: 0, pid: 200)))
+    // The new process's pid not read yet: the same daemon, as far as known.
+    #expect(notice.isShown(current: TendDaemonIdentity(generation: 0, pid: nil)))
+}
+
+@Test
+func restartNoticeStaysUntilAReplacementSucceeds() {
+    // Pressing Restart changes nothing by itself; a replacement that failed
+    // (old daemon still running, same pid and generation) keeps the bar.
+    var notice = TendRestartNotice()
+    let before = TendDaemonIdentity(generation: 0, pid: nil, replacements: 0)
+    notice.noteSaved(under: before)
+    #expect(notice.isShown(current: before))
+    // A completed replacement counts, even with nothing else known.
+    #expect(!notice.isShown(current: TendDaemonIdentity(generation: 0, pid: nil, replacements: 1)))
+}
+
+@MainActor
+@Test
+func behaviourDraftKeepsEditsWhenTheDaemonCannotWriteItsConfiguration() async {
+    let store = TendConfigStore()
+    #expect(!store.isSupported)
+    let draft = TendBehaviourDraft(store: store)
+    draft.attach(AppModel())
+    draft.settings.notifierEnabled = true
+    draft.settings.collaborationScope = .host
+    for _ in 0..<50 { await Task.yield() }
+    #expect(draft.pendingWrites == 0)
+    #expect(draft.settings.notifierEnabled)
+    #expect(draft.settings.collaborationScope == .host)
+    // Reopening the tab must not put the defaults back over the edits.
+    draft.syncFromStore()
+    #expect(draft.settings.notifierEnabled)
+    #expect(draft.settings.edits(against: .daemonDefaults).count == 2)
+}
+
+@Test
+func automationRunLogShowsTheNewestTenEntries() {
+    let entries = Array(1...23)
+    let preview = AutomationRunLogPreview.split(entries)
+    #expect(AutomationRunLogPreview.limit == 10)
+    #expect(preview.shown == Array(1...10))
+    #expect(preview.hidden == 13)
+
+    let short = AutomationRunLogPreview.split([1, 2, 3])
+    #expect(short.shown == [1, 2, 3])
+    #expect(short.hidden == 0)
+
+    let exact = AutomationRunLogPreview.split(Array(1...10))
+    #expect(exact.hidden == 0)
+
+    let empty = AutomationRunLogPreview.split([Int]())
+    #expect(empty.shown.isEmpty)
+    #expect(empty.hidden == 0)
+}
+
+@Test
+func aasAccountRowShowsTheMeterNearestItsLimit() {
+    let account = AasAccount(
+        provider: "claude",
+        name: "work@claude",
+        meters: [
+            AasMeter(label: "5h", usedPct: 40, resetMs: nil),
+            AasMeter(label: "7d", usedPct: 85, resetMs: nil),
+        ]
+    )
+    #expect(account.worstMeter?.label == "7d")
+    #expect(AasAccount(provider: "codex", name: "idle@codex").worstMeter == nil)
 }
 
 // MARK: - Pipeline composer (ask-pipeline peer)

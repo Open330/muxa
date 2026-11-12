@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The macOS Settings window has nine tabs instead of ten: General,
+  Notifications, Menu Bar, Accounts, Ask, Agents, Automations, Fleet and
+  Advanced, each with its own icon. Behaviour, Modules, Runtime and Dispatch
+  are folded into them (Fleet has Hosts and Dispatch sections), every tab uses
+  the same grouped form, and the window can be resized. Notification and
+  collaboration settings apply as you change them; a "Restart tendd to apply"
+  bar along the bottom offers the one daemon restart when a saved change
+  needs it. The Automations run log shows the last 10 entries with Show All,
+  the usage-limit policy moves to Accounts, and the raw configuration file
+  opens in its own window from Advanced.
+
 ## [0.10.10] - 2026-11-12
 
 ### Changed

@@ -85,7 +85,6 @@ struct TendLanguageSettingsSection: View {
                 Text(verbatim: "English").tag(TendLanguage.english)
                 Text(verbatim: "한국어").tag(TendLanguage.korean)
             }
-            .pickerStyle(.segmented)
             .onChange(of: selection) { language in
                 language.apply()
             }
@@ -99,9 +98,7 @@ struct TendLanguageSettingsSection: View {
                         .controlSize(.small)
                 }
             } else {
-                Text("System follows the macOS language list. Tend is available in English and Korean.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("System follows the macOS language list. Tend is available in English and Korean.")
             }
         }
     }

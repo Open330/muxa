@@ -1,6 +1,17 @@
 import AppKit
 import SwiftUI
 
+/// How much of the run log the Automations tab shows before "Show All…".
+enum AutomationRunLogPreview {
+    static let limit = 10
+
+    /// The newest `limit` entries, and how many more the full log holds.
+    static func split<Entry>(_ entries: [Entry], limit: Int = limit) -> (shown: [Entry], hidden: Int) {
+        let bounded = max(0, limit)
+        return (Array(entries.prefix(bounded)), max(0, entries.count - bounded))
+    }
+}
+
 /// Settings › Automations: the rules tendd fires on its own, the switches
 /// that gate them, and what they have done.
 struct AutomationSettingsPane: View {
@@ -9,30 +20,20 @@ struct AutomationSettingsPane: View {
     @ObservedObject var configStore: TendConfigStore
     @State private var editorTarget: AutomationRuleEditorTarget?
     @State private var removalTarget: TendAutomationRule?
-    @State private var safetyExpanded = false
+    @State private var showsFullLog = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                settingsHeading(
-                    "Automations",
-                    detail: "tendd watches your agents and acts on rules you write — resuming a capped session, for one."
-                )
-
-                if store.hasLoaded, !store.isSupported, model.isConnected {
-                    unsupportedCard
-                } else {
-                    switchesCard
-                    limitPolicyCard
-                    safetyCard
-                    rulesCard
-                    logCard
-                }
-
-                statusLines
+        Form {
+            if store.hasLoaded, !store.isSupported, model.isConnected {
+                unsupportedSection
+            } else {
+                engineSection
+                rulesSection
+                logSection
             }
-            .padding(20)
+            statusSection
         }
+        .formStyle(.grouped)
         .task(id: model.isConnected) {
             await store.reload(model: model)
             await configStore.load(model: model)
@@ -49,6 +50,9 @@ struct AutomationSettingsPane: View {
             if let report = store.testReport {
                 AutomationTestSheet(report: report)
             }
+        }
+        .sheet(isPresented: $showsFullLog) {
+            AutomationFullLogSheet(model: model, store: store)
         }
         .alert("Remove this rule?", isPresented: removalAlertBinding, presenting: removalTarget) { rule in
             Button("Cancel", role: .cancel) { removalTarget = nil }
@@ -72,78 +76,71 @@ struct AutomationSettingsPane: View {
 
     // MARK: Capability fallback
 
-    private var unsupportedCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private var unsupportedSection: some View {
+        Section {
             Label("This tendd has no automation engine", systemImage: "wand.and.rays")
                 .font(.headline)
-            Text("Update tend and restart tendd to write rules from here. Until then, rules can be written by hand in the configuration file and read with tend automation list.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            HStack {
-                Text("The Advanced tab opens that file.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                TendDaemonReloadButton(model: model)
-                    .controlSize(.small)
-            }
+            TendSettingsCaption("Update tend and restart tendd to write rules from here. Until then, rules can be written by hand in the configuration file and read with tend automation list.")
+            TendSettingsCaption("The Advanced tab opens that file.")
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
-    // MARK: Master switch and pause
+    // MARK: Engine switch and pause
 
-    private var switchesCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("Automation engine", systemImage: "power")
+    private var isPaused: Bool {
+        store.snapshot.pausedUntil != nil && store.snapshot.isPaused()
+    }
+
+    private var engineSection: some View {
+        Section {
+            HStack(spacing: 10) {
+                Toggle("Automation engine", isOn: masterBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(!store.isSupported || !store.hasLoaded || store.isMutating)
+                Text("Automation engine")
                     .font(.headline)
-                Spacer()
+                    .accessibilityHidden(true)
+                engineStatus
+                Spacer(minLength: 8)
                 if store.isLoading || store.isMutating || configStore.isSaving {
                     ProgressView().controlSize(.small)
                 }
-                Toggle("Enabled", isOn: masterBinding)
-                    .labelsHidden()
-                    .disabled(!store.isSupported || !store.hasLoaded || store.isMutating)
-            }
-
-            Text("Off stops every rule and is remembered in tend configuration. Pause stops them until a time you choose.")
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
-
-            Divider()
-
-            HStack(spacing: 10) {
-                if let until = store.snapshot.pausedUntil, store.snapshot.isPaused() {
-                    Label("Paused until \(until.formatted(date: .abbreviated, time: .shortened))", systemImage: "pause.circle.fill")
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                    Spacer()
-                    Button("Resume") {
-                        Task { await store.pause(until: nil, model: model) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                } else {
-                    Label("Running", systemImage: "play.circle.fill")
-                        .font(.callout)
-                        .foregroundStyle(.green)
-                    Spacer()
+                Menu {
                     Button("Pause for 1 Hour") {
                         Task { await store.pause(until: Date().addingTimeInterval(3600), model: model) }
                     }
                     Button("Pause Until Tomorrow") {
                         Task { await store.pause(until: TendAutomationTime.tomorrowMorning(), model: model) }
                     }
+                    Divider()
+                    Button("Resume") {
+                        Task { await store.pause(until: nil, model: model) }
+                    }
+                    .disabled(!isPaused)
+                } label: {
+                    Text("Pause")
                 }
+                .fixedSize()
+                .disabled(store.isMutating || !store.isSupported)
+                safetyInfo
             }
-            .controlSize(.small)
-            .disabled(store.isMutating || !store.isSupported)
+            TendSettingsCaption("Off stops every rule and is remembered in tend configuration. Pause stops them until a time you choose.")
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    @ViewBuilder
+    private var engineStatus: some View {
+        if let until = store.snapshot.pausedUntil, store.snapshot.isPaused() {
+            Label("Paused until \(until.formatted(date: .abbreviated, time: .shortened))", systemImage: "pause.circle.fill")
+                .font(TendType.detail)
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+        } else {
+            Label("Running", systemImage: "play.circle.fill")
+                .font(TendType.detail)
+                .foregroundStyle(.green)
+        }
     }
 
     /// The engine's own switch: the daemon applies it live and writes it
@@ -159,44 +156,26 @@ struct AutomationSettingsPane: View {
 
     // MARK: Safety
 
-    /// What a rule may do, said once and calmly, with the guard list behind
-    /// a disclosure: it is worth reading once and re-opening later, not a
-    /// warning poster to scroll past on every visit. The accent turns orange
-    /// only once a rule that types into a pane actually exists.
-    private var safetyCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label {
+    /// What a rule may do, behind ⓘ: worth reading once and re-opening
+    /// later, not a warning poster to scroll past on every visit. The icon
+    /// turns orange only once a rule that types into a pane actually exists.
+    private var safetyInfo: some View {
+        TendSettingsInfoButton(title: "What bounds this", tint: hasTypingRule ? .orange : .secondary) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text("A rule types into a live agent's pane, exactly as a person would.")
-                    .font(.callout)
-            } icon: {
-                Image(systemName: "keyboard")
-                    .foregroundStyle(hasTypingRule ? Color.orange : Color.secondary)
-            }
-
-            DisclosureGroup(isExpanded: $safetyExpanded) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("• The master switch and the pause above stop every rule.")
-                    Text("• Each rule has its own switch.")
-                    Text("• Firings per hour and the cooldown cap how often one rule may act on one pane.")
-                    Text("• A ceiling of \(store.snapshot.globalMaxPerHour) firings an hour bounds every rule together.")
-                    Text("• The condition is re-checked at fire time; a recovered agent is left alone.")
-                    Text("• One rate-limit episode fires a rule once.")
-                    Text("• Every firing and every skip is written to the run log below.")
-                    Text("Test on a rule shows what it would do right now without firing anything.")
-                        .padding(.top, 3)
-                }
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 5)
-            } label: {
-                Text("What bounds this")
-                    .font(TendType.detail.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .padding(.bottom, 3)
+                Text("• The master switch and the pause above stop every rule.")
+                Text("• Each rule has its own switch.")
+                Text("• Firings per hour and the cooldown cap how often one rule may act on one pane.")
+                Text("• A ceiling of \(store.snapshot.globalMaxPerHour) firings an hour bounds every rule together.")
+                Text("• The condition is re-checked at fire time; a recovered agent is left alone.")
+                Text("• One rate-limit episode fires a rule once.")
+                Text("• Every firing and every skip is written to the run log below.")
+                Text("Test on a rule shows what it would do right now without firing anything.")
+                    .padding(.top, 3)
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     /// `send_prompt` is the action that reaches the keyboard, so it is the
@@ -207,76 +186,62 @@ struct AutomationSettingsPane: View {
 
     // MARK: Rules
 
-    /// The limit policy: the common case, as one choice, above the rules
-    /// that implement it.
-    private var limitPolicyCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            TendLimitPolicyPicker(model: model, store: store)
-            if store.limitPolicy == .switchAccount {
-                Divider()
-                TendSwapHealthSection(swaps: model.swaps)
+    private var rulesSection: some View {
+        Section {
+            if store.rules.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("No rules yet")
+                    TendSettingsCaption("Nothing fires until a rule is added and switched on. Choose a limit policy in Accounts to handle capped agents without writing one.")
+                }
+            } else {
+                ForEach(store.rules) { rule in
+                    AutomationRuleRow(
+                        model: model,
+                        store: store,
+                        rule: rule,
+                        onEdit: {
+                            editorTarget = AutomationRuleEditorTarget(
+                                TendAutomationRuleDraft.draft(editing: rule)
+                            )
+                        },
+                        onRemove: { removalTarget = rule }
+                    )
+                }
             }
-        }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var rulesCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        } header: {
             HStack {
-                Label("Rules", systemImage: "list.bullet.rectangle")
-                    .font(.headline)
+                Text("Rules")
                 Spacer()
                 Button {
                     editorTarget = AutomationRuleEditorTarget(TendAutomationRuleDraft())
                 } label: {
                     Label("Add Rule…", systemImage: "plus")
                 }
-                .buttonStyle(.borderedProminent)
-            }
-            .controlSize(.small)
-            .disabled(!store.isSupported)
-
-            if store.rules.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("No rules yet").font(.callout.weight(.semibold))
-                    Text("Nothing fires until a rule is added and switched on. Choose a limit policy above to handle capped agents without writing one.")
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 10)
-            } else {
-                VStack(spacing: 8) {
-                    ForEach(store.rules) { rule in
-                        AutomationRuleRow(
-                            model: model,
-                            store: store,
-                            rule: rule,
-                            onEdit: {
-                                editorTarget = AutomationRuleEditorTarget(
-                                    TendAutomationRuleDraft.draft(editing: rule)
-                                )
-                            },
-                            onRemove: { removalTarget = rule }
-                        )
-                    }
-                }
+                .controlSize(.small)
+                .disabled(!store.isSupported)
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: Run log
 
-    private var logCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private var logSection: some View {
+        let preview = AutomationRunLogPreview.split(store.log)
+        return Section {
+            if store.log.isEmpty {
+                TendSettingsCaption("Nothing has fired yet. Every firing and every skipped firing lands here, newest first.")
+            } else {
+                ForEach(Array(preview.shown.enumerated()), id: \.offset) { _, entry in
+                    AutomationLogRow(entry: entry, model: model)
+                }
+                if preview.hidden > 0 {
+                    Button("Show All \(store.log.count) Entries…") { showsFullLog = true }
+                        .buttonStyle(.link)
+                }
+            }
+        } header: {
             HStack {
-                Label("Run log", systemImage: "clock.arrow.circlepath")
-                    .font(.headline)
+                Text("Run log")
                 Spacer()
                 Button {
                     Task { await store.reload(model: model) }
@@ -286,47 +251,64 @@ struct AutomationSettingsPane: View {
                 .controlSize(.small)
                 .disabled(store.isLoading || !store.isSupported)
             }
+        }
+    }
 
-            if store.log.isEmpty {
-                Text("Nothing has fired yet. Every firing and every skipped firing lands here, newest first.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 6)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(store.log.enumerated()), id: \.offset) { index, entry in
-                        if index > 0 { Divider() }
+    @ViewBuilder
+    private var statusSection: some View {
+        if store.loadError != nil || store.actionError != nil || configStore.saveError != nil {
+            Section {
+                if let error = store.loadError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(TendType.detail)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+                if let error = store.actionError {
+                    Label(error, systemImage: "xmark.octagon.fill")
+                        .font(TendType.detail)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+                if let error = configStore.saveError {
+                    Label(error, systemImage: "xmark.octagon.fill")
+                        .font(TendType.detail)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
+/// Every entry of the run log, for when the tab's last ten are not enough.
+private struct AutomationFullLogSheet: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var store: AutomationStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section("Run log") {
+                    ForEach(Array(store.log.enumerated()), id: \.offset) { _, entry in
                         AutomationLogRow(entry: entry, model: model)
                     }
                 }
             }
+            .formStyle(.grouped)
+            Divider()
+            HStack {
+                Text("\(store.log.count) entries, newest first")
+                    .font(TendType.detail)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(14)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    @ViewBuilder
-    private var statusLines: some View {
-        if let error = store.loadError {
-            Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(TendType.detail)
-                .foregroundStyle(.orange)
-                .textSelection(.enabled)
-        }
-        if let error = store.actionError {
-            Label(error, systemImage: "xmark.octagon.fill")
-                .font(TendType.detail)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
-        }
-        if let error = configStore.saveError {
-            Label(error, systemImage: "xmark.octagon.fill")
-                .font(TendType.detail)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
-        }
+        .frame(minWidth: 620, idealWidth: 720, minHeight: 420, idealHeight: 620)
     }
 }
 
@@ -363,48 +345,51 @@ private struct AutomationRuleRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            // The label stays hidden on screen but names the rule, so
-            // VoiceOver says which rule the switch is for.
-            Toggle(isOn: enabledBinding) { Text(verbatim: rule.name) }
-                .labelsHidden()
-                .disabled(store.isMutating)
-                .padding(.top, 2)
-
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 8) {
-                    Text(verbatim: rule.name)
-                        .font(.headline)
-                    AutomationBadge(text: automationEventTitle(rule.on), symbol: "bolt.horizontal")
-                    AutomationBadge(text: automationActionTitle(rule.action), symbol: "arrow.right.circle")
+        HStack(alignment: .top, spacing: 10) {
+            Toggle(isOn: enabledBinding) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(verbatim: rule.name)
+                            .font(.headline)
+                        AutomationBadge(text: automationEventTitle(rule.on), symbol: "bolt.horizontal")
+                        AutomationBadge(text: automationActionTitle(rule.action), symbol: "arrow.right.circle")
+                    }
+                    Group {
+                        AutomationTargetSummary(rule: rule)
+                        if let condition = rule.askCondition {
+                            Text(condition.observeOnly ? "Ask condition · Observe only (no action)" : "Ask condition · Fixed action on match")
+                                .font(TendType.detail)
+                            Text(verbatim: condition.prompt).font(TendType.detail).lineLimit(2)
+                        }
+                        AutomationGuardSummary(rule: rule)
+                        AutomationActivitySummary(rule: rule)
+                    }
+                    .opacity(rule.enabled ? 1 : 0.6)
                 }
-                AutomationTargetSummary(rule: rule)
-                if let condition = rule.askCondition {
-                    Text(condition.observeOnly ? "Ask condition · Observe only (no action)" : "Ask condition · Fixed action on match")
-                        .font(TendType.detail)
-                    Text(verbatim: condition.prompt).font(TendType.detail).lineLimit(2)
-                }
-                AutomationGuardSummary(rule: rule)
-                AutomationActivitySummary(rule: rule)
             }
+            .toggleStyle(.switch)
+            .disabled(store.isMutating)
 
-            Spacer(minLength: 8)
-
-            VStack(alignment: .trailing, spacing: 6) {
+            Menu {
                 Button("Edit…", action: onEdit)
                 Button("Test") {
                     Task { await store.test(rule, model: model) }
                 }
                 .help("Shows what this rule would do right now. Fires nothing.")
                 .disabled(store.isTesting)
-                Button("Remove", action: onRemove)
+                Divider()
+                Button("Remove…", role: .destructive, action: onRemove)
+            } label: {
+                Image(systemName: "ellipsis.circle")
             }
-            .controlSize(.small)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
             .disabled(store.isMutating)
+            .help("Edit, test or remove this rule")
+            .accessibilityLabel(Text("Actions for \(rule.name)"))
         }
-        .padding(11)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
-        .opacity(rule.enabled ? 1 : 0.55)
+        .padding(.vertical, 2)
     }
 }
 
