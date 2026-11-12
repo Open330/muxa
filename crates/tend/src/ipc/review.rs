@@ -89,49 +89,18 @@ pub(super) async fn decision_response(
     store: &super::SharedStore,
     body: RequestBody,
 ) -> (&'static str, Response) {
-    use crate::decision_queue::{assemble_history, assemble_queue, MAX_QUEUE_LIMIT};
     match body {
         RequestBody::DecisionQueue { limit, origin } => {
-            let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
-            let mut unavailable = Vec::new();
-            let mut truncated = false;
-            let human = match operator_only(origin.as_ref()) {
-                Some(refused) => Err(refused),
-                None => collaboration.open_human_requests(limit).await,
-            };
-            let human = match human {
-                Ok((requests, more)) => {
-                    truncated |= more;
-                    requests
-                }
-                Err(crate::collaboration::CollaborationError::Disabled) => Vec::new(),
-                Err(error) => {
-                    unavailable.push(format!("human requests: {error}"));
-                    Vec::new()
-                }
-            };
-            let page = reviews
-                .list(crate::review::ReviewQuery {
-                    open_only: true,
-                    oldest_first: true,
-                    limit,
-                    offset: 0,
-                })
-                .await;
-            let reviews = match page {
-                Ok(page) => {
-                    truncated |= page.has_more;
-                    page.items
-                }
-                Err(error) => {
-                    unavailable.push(format!("review items: {error}"));
-                    Vec::new()
-                }
-            };
+            let operator = operator_only(origin.as_ref()).is_none();
             let agents = store.snapshot().await;
-            let mut queue = assemble_queue(&human, &agents, reviews, limit);
-            queue.truncated |= truncated;
-            queue.unavailable = unavailable;
+            let queue = crate::decision_queue::read_pending(
+                reviews,
+                collaboration,
+                &agents,
+                limit,
+                operator,
+            )
+            .await;
             (
                 "decision_queue",
                 Response {
@@ -141,37 +110,9 @@ pub(super) async fn decision_response(
             )
         }
         RequestBody::DecisionHistory { limit, origin } => {
-            let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
-            let mut unavailable = Vec::new();
-            let mut truncated = false;
-            let answered = match operator_only(origin.as_ref()) {
-                Some(refused) => Err(refused),
-                None => collaboration.answered_human_requests(limit).await,
-            };
-            let answered = match answered {
-                Ok((requests, more)) => {
-                    truncated |= more;
-                    requests
-                }
-                Err(crate::collaboration::CollaborationError::Disabled) => Vec::new(),
-                Err(error) => {
-                    unavailable.push(format!("human requests: {error}"));
-                    Vec::new()
-                }
-            };
-            let decided = match reviews.decided(limit).await {
-                Ok(page) => {
-                    truncated |= page.has_more;
-                    page.items
-                }
-                Err(error) => {
-                    unavailable.push(format!("review items: {error}"));
-                    Vec::new()
-                }
-            };
-            let mut history = assemble_history(decided, &answered, limit);
-            history.truncated |= truncated;
-            history.unavailable = unavailable;
+            let operator = operator_only(origin.as_ref()).is_none();
+            let history =
+                crate::decision_queue::read_history(reviews, collaboration, limit, operator).await;
             (
                 "decision_history",
                 Response {

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark light"><title>Needs you · tend</title><link rel="icon" href="/static/icon.svg"><link rel="stylesheet" href="/static/needs.css"></head>
+<body>
+<header class="bar"><a class="home" href="/">tend</a><h1>Needs you</h1><span id="count" class="count"></span></header>
+<nav class="tabs" role="tablist"><button id="tab-queue" role="tab" aria-selected="true">Waiting</button><button id="tab-history" role="tab" aria-selected="false">Decided</button></nav>
+<main>
+<p id="status" role="status" aria-live="polite">Loading…</p>
+<a id="login" class="login" hidden>Sign in as an operator</a>
+<ol id="queue" class="cards"></ol>
+<ol id="history" class="cards" hidden></ol>
+<p id="covers" class="covers"></p>
+</main>
+<script type="module" src="/static/needs.mjs"></script>
+</body></html>

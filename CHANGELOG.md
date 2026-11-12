@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The web dashboard has a "Needs you" page (`/needs`, linked from the top
+  bar): the decision queue and its history, phone-first, from the same daemon
+  reads as `tend review queue` and the Mac app. Operator-only:
+  `GET /api/decisions` and `/api/decisions/history` need the token or an
+  operator sign-in, never a viewer, public-read or anonymous visitor.
+
 ### Changed
 
 - Account swap binds the conversation it resumes from the provider's own
