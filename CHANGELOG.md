@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The daemon removes terminal launch archives after 30 days, retaining live
   agents’ launch records and unfinished launch tickets.
+- The Mac app lists swap accounts configured in `config.toml`, falling back to
+  optional aas accounts through the daemon, and explains unavailable providers.
 
 ## [0.10.8] - 2026-11-12
 

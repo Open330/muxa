@@ -2448,3 +2448,22 @@ async fn unavailable_review_store_refuses_without_breaking_the_daemon() {
     let _ = tx.send(());
     handle.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_accounts_returns_configured_metadata_even_when_jobs_are_halted() {
+    let swap = FakeSwap::new(false);
+    let (_dir, client, tx, handle) = swap_server(Some(swap)).await;
+    let hello = client.hello(Duration::from_secs(2)).await.unwrap();
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == "swap_accounts_v1"));
+    let accounts = client.swap_accounts().await.unwrap();
+    assert_eq!(accounts[0].source, "configured");
+    assert_eq!(accounts[0].candidates[0].name, "work");
+    assert!(!serde_json::to_string(&accounts)
+        .unwrap()
+        .contains("private"));
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}

@@ -149,6 +149,8 @@ pub(super) enum RequestBody {
     },
     /// `swap_health_v1`: how the swap service is, read-only.
     SwapHealth,
+    /// `swap_accounts_v1`: configured accounts first, then optional aas.
+    SwapAccounts,
     /// `swap_cancel_v1`: ask a job to start no further target.
     SwapJobCancel {
         job: crate::swap_service::JobRef,
@@ -1172,6 +1174,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_spawns: Option<Vec<collaboration::WorkerSpawnView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_accounts: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_inventory: Option<collaboration::WorkerInventory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
@@ -1308,6 +1312,7 @@ impl Response {
             worker_drains: None,
             worker_spawn: None,
             worker_spawns: None,
+            swap_accounts: None,
             worker_inventory: None,
             collaboration_request: None,
             restarting: None,

@@ -490,7 +490,7 @@ fn select_at<'a>(
 }
 
 /// One row of `aas candidates --json`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
     pub name: String,

@@ -225,6 +225,7 @@ pub(super) async fn handle(
                         if let Some(capabilities) = r.capabilities.as_mut() {
                             capabilities.push(SWAP_SERVICE_CAPABILITY);
                             capabilities.push(SWAP_HEALTH_CAPABILITY);
+                            capabilities.push("swap_accounts_v1");
                             if swap.as_ref().is_some_and(|swap| swap.exists()) {
                                 capabilities.push(SWAP_CANCEL_CAPABILITY);
                             }
@@ -472,6 +473,16 @@ pub(super) async fn handle(
                             .and_then(|accepted| to_swap_value(&accepted))
                     })
                     .await
+                }
+                RequestBody::SwapAccounts => {
+                    kind = "swap_accounts";
+                    let mut response = swap_call(swap.as_ref(), move |swap| {
+                        swap.accounts()
+                            .and_then(|accounts| to_swap_value(&accounts))
+                    })
+                    .await;
+                    response.swap_accounts = response.swap.take();
+                    response
                 }
                 RequestBody::SwapHealth => {
                     kind = "swap_health";
