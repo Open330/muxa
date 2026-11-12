@@ -1394,6 +1394,9 @@ struct WorkControlResult {
     pane: String,
     sent: bool,
     submitted: bool,
+    /// Why nothing was typed, when the pane refused rather than failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
 }
 
 /// Stand a work item's pipeline up from the dashboard.
@@ -1586,29 +1589,48 @@ async fn run_work_control(
         );
     }
 
-    let results = tokio::task::spawn_blocking(move || {
-        candidates
-            .into_iter()
-            .map(|(backend, socket, pane)| {
-                let sent = backend.send_prompt_text_on(Some(&socket), &pane, &text);
-                let submitted = if sent && submit {
-                    std::thread::sleep(crate::backend::prompt_submit_grace(&pane));
-                    backend.send_text_on(Some(&socket), &pane, "\r")
-                } else {
-                    false
-                };
-                WorkControlResult {
-                    pane,
-                    sent,
-                    submitted,
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
+    // One pane at a time through the guarded delivery path: a draining
+    // worker is refused, and no pane takes input while another delivery is
+    // still between its text and its Enter.
+    let mut results = Vec::with_capacity(candidates.len());
+    for (backend, socket, pane) in candidates {
+        let delivered = crate::prompt_delivery::deliver_prompt(
+            &state.collaboration,
+            &state.store,
+            backend,
+            crate::prompt_delivery::PromptDelivery {
+                pane: &pane,
+                socket: Some(&socket),
+                text: &text,
+                submit,
+                origin: None,
+            },
+        )
+        .await;
+        results.push(match delivered {
+            Ok(delivered) => WorkControlResult {
+                pane,
+                sent: true,
+                submitted: delivered.submitted,
+                error: None,
+            },
+            Err(refused) => WorkControlResult {
+                pane,
+                sent: false,
+                submitted: false,
+                error: (refused == crate::prompt_delivery::DeliveryRefused::WorkerDraining)
+                    .then_some(crate::prompt_delivery::WORKER_DRAINING),
+            },
+        });
+    }
     let succeeded = results.iter().filter(|result| result.sent).count();
     if succeeded == 0 {
+        if results.iter().all(|result| result.error.is_some()) {
+            return control_error(
+                StatusCode::CONFLICT,
+                crate::prompt_delivery::WORKER_DRAINING,
+            );
+        }
         return control_error(
             StatusCode::BAD_GATEWAY,
             format!("{action} failed for every agent pane"),
@@ -1866,36 +1888,45 @@ async fn pane_prompt_handler(
         Ok(socket) => socket,
         Err(failure) => return failure.into_response(),
     };
-    let text = input.text;
-    let submit = input.submit;
-    let pane_for_send = pane.clone();
-    let (sent, submitted) = tokio::task::spawn_blocking(move || {
-        let socket = socket.as_deref();
-        let sent = backend.send_prompt_text_on(socket, &pane_for_send, &text);
-        let submitted = if sent && submit {
-            std::thread::sleep(crate::backend::prompt_submit_grace(&pane_for_send));
-            backend.send_text_on(socket, &pane_for_send, "\r")
-        } else {
-            false
-        };
-        (sent, submitted)
-    })
-    .await
-    .unwrap_or((false, false));
-
-    if !sent {
-        return control_error(
-            StatusCode::BAD_GATEWAY,
-            "pane input failed: pane gone or backend unreachable",
-        );
+    // The same guarded path as IPC `send_prompt`, so a dashboard prompt
+    // cannot land in a line a collaboration wake is still submitting. The
+    // dashboard registers no origin: its hook attribution is unchanged.
+    let delivered = crate::prompt_delivery::deliver_prompt(
+        &state.collaboration,
+        &state.store,
+        backend,
+        crate::prompt_delivery::PromptDelivery {
+            pane: &pane,
+            socket: socket.as_deref(),
+            text: &input.text,
+            submit: input.submit,
+            origin: None,
+        },
+    )
+    .await;
+    match delivered {
+        Err(refused) => delivery_refused(refused, "pane input failed"),
+        Ok(delivered) => Json(json!({
+            "ok": true,
+            "pane": pane,
+            "sent": true,
+            "submitted": delivered.submitted,
+        }))
+        .into_response(),
     }
-    Json(json!({
-        "ok": true,
-        "pane": pane,
-        "sent": sent,
-        "submitted": submitted,
-    }))
-    .into_response()
+}
+
+fn delivery_refused(refused: crate::prompt_delivery::DeliveryRefused, what: &str) -> Response {
+    match refused {
+        crate::prompt_delivery::DeliveryRefused::WorkerDraining => control_error(
+            StatusCode::CONFLICT,
+            crate::prompt_delivery::WORKER_DRAINING,
+        ),
+        crate::prompt_delivery::DeliveryRefused::NotSent => control_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{what}: pane gone or backend unreachable"),
+        ),
+    }
 }
 
 async fn pane_abort_handler(
@@ -4623,6 +4654,68 @@ mod tests {
         assert_eq!(
             sent.lock().unwrap()[0].1,
             "Run the peer review workflow.\n\ncheck ENG-101\n\nInvocation context:\ntests pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_to_a_draining_worker_is_refused() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let panes = vec![test_pane(
+            "herdr:p1",
+            "session-1",
+            "tend",
+            "window-1",
+            "ENG-101",
+        )];
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes,
+        });
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        collaboration
+            .block_worker_input_for_test("herdr:p1", Some("herdr"))
+            .await;
+        let state = public_read_state("edit-pat")
+            .with_backend(backend)
+            .with_collaboration(collaboration);
+        seed_agent(&state, "agent-1", "herdr:p1").await;
+        let app = router(state);
+
+        for (uri, body) in [
+            (
+                "/api/panes/herdr%3Ap1/prompt",
+                r#"{"text":"review this","submit":true}"#,
+            ),
+            (
+                "/api/work-control/prompt",
+                r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"text":"review this","submit":true}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer edit-pat")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("worker_draining"),
+                "{uri}"
+            );
+        }
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "typed into a draining worker"
         );
     }
 

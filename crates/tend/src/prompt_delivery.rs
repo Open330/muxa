@@ -1,7 +1,10 @@
-//! Evidence of submission is distinct from successful keystroke injection.
-use crate::{Agent, PromptRecord, Store};
+//! Prompt delivery into agent panes, and evidence of submission, which is
+//! distinct from successful keystroke injection.
+use crate::collaboration::CollaborationStore;
+use crate::{Agent, PromptOrigin, PromptRecord, SharedBackend, Store};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OwnedMutexGuard};
 
 pub struct SubmissionObserver {
     receiver: broadcast::Receiver<PromptRecord>,
@@ -52,6 +55,140 @@ impl SubmissionObserver {
         .await
         .ok()
         .flatten()
+    }
+}
+
+/// The exclusive right to type into one pane: the collaboration store's
+/// per-pane worker action gate. Shared so a caller can hold it across several
+/// injections (a wake body, then its Enter) and across endpoint checks.
+pub type PaneInputGuard = Arc<OwnedMutexGuard<()>>;
+
+/// Refusal text when a worker drain has paused the pane's input. Every
+/// prompt path reports it the same way.
+pub const WORKER_DRAINING: &str = "worker_draining: managed terminal input is paused";
+
+/// Take the pane's input guard. Waiting here is what keeps a second prompt
+/// out of an input line another delivery is still submitting.
+pub async fn lock_pane(collaboration: &CollaborationStore, pane: &str) -> PaneInputGuard {
+    Arc::new(collaboration.worker_action_guard(pane).await)
+}
+
+/// One prompt to type into one pane.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptDelivery<'a> {
+    pub pane: &'a str,
+    pub socket: Option<&'a str>,
+    pub text: &'a str,
+    /// Press Enter after the text.
+    pub submit: bool,
+    /// `Some` registers the prompt before typing, so the hook reporting it
+    /// is stamped with this origin. `None` registers nothing and leaves the
+    /// hook's own attribution.
+    pub origin: Option<PromptOrigin>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryRefused {
+    /// A worker drain paused this endpoint's input; nothing was typed.
+    WorkerDraining,
+    /// The backend did not take the text; nothing landed, so a caller may
+    /// retry the whole delivery.
+    NotSent,
+}
+
+/// The text was typed. `submitted` says whether Enter was too.
+pub struct Delivered {
+    pub submitted: bool,
+    observer: SubmissionObserver,
+}
+
+impl Delivered {
+    /// Application evidence that the submitted prompt arrived; `None` when
+    /// unknown or not submitted.
+    pub async fn confirm(self) -> Option<bool> {
+        if self.submitted {
+            self.observer.confirm().await
+        } else {
+            None
+        }
+    }
+}
+
+/// Take the pane's guard, then deliver. See [`deliver_prompt_holding`].
+pub async fn deliver_prompt(
+    collaboration: &CollaborationStore,
+    store: &Store,
+    backend: SharedBackend,
+    delivery: PromptDelivery<'_>,
+) -> Result<Delivered, DeliveryRefused> {
+    let guard = lock_pane(collaboration, delivery.pane).await;
+    let agents = store.by_pane(delivery.pane).await;
+    deliver_prompt_holding(guard, collaboration, store, &agents, backend, delivery).await
+}
+
+/// The one prompt delivery path. With the pane's guard held for the whole
+/// sequence: refuse a draining worker, register the expected prompt, type the
+/// text, wait the host's submit grace, press Enter, and forget the
+/// registration if Enter did not land. Text and Enter are two non-atomic
+/// injections; holding the guard across both is what stops another delivery
+/// from typing into the same line and being submitted with this one.
+///
+/// `agents` are the pane's rows, read after the guard was taken.
+pub async fn deliver_prompt_holding(
+    guard: PaneInputGuard,
+    collaboration: &CollaborationStore,
+    store: &Store,
+    agents: &[Agent],
+    backend: SharedBackend,
+    delivery: PromptDelivery<'_>,
+) -> Result<Delivered, DeliveryRefused> {
+    let PromptDelivery {
+        pane,
+        socket,
+        text,
+        submit,
+        origin,
+    } = delivery;
+    if collaboration.worker_input_blocked(pane, socket).await {
+        return Err(DeliveryRefused::WorkerDraining);
+    }
+    let observer = SubmissionObserver::new(store, agents, socket, text);
+    let expected = match origin {
+        Some(origin) if submit && !text.is_empty() => {
+            store.expect_prompt(pane, socket, text, origin).await
+        }
+        _ => None,
+    };
+    let (pane, socket, text) = (pane.to_owned(), socket.map(str::to_owned), text.to_owned());
+    // `send_text_on` is a blocking shell-out / socket call.
+    let (sent, submitted) = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let socket = socket.as_deref();
+        let sent = backend.send_prompt_text_on(socket, &pane, &text);
+        let submitted = if sent && submit {
+            if !text.is_empty() {
+                std::thread::sleep(crate::backend::prompt_submit_grace(&pane));
+            }
+            backend.send_text_on(socket, &pane, "\r")
+        } else {
+            false
+        };
+        (sent, submitted)
+    })
+    .await
+    .unwrap_or((false, false));
+    if !submitted {
+        if let Some(token) = expected {
+            store.forget_expected_prompt(token);
+        }
+    }
+    if sent {
+        Ok(Delivered {
+            submitted,
+            observer,
+        })
+    } else {
+        Err(DeliveryRefused::NotSent)
     }
 }
 
@@ -371,6 +508,132 @@ mod tests {
         assert_eq!(
             PromptOrigin::declared(Some(PromptOrigin::PersonViaTend)),
             PromptOrigin::PersonViaTend
+        );
+    }
+
+    /// Records every injection. Typing is slow, so two unguarded deliveries
+    /// would both type before either presses Enter.
+    struct SlowPane {
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::PaneBackend for SlowPane {
+        fn kind(&self) -> crate::HostKind {
+            crate::HostKind::Tmux
+        }
+        fn list_panes(&self) -> Vec<crate::tmux::PaneInfo> {
+            Vec::new()
+        }
+        fn resolve_pane(&self, _: &str) -> Option<crate::tmux::PaneInfo> {
+            None
+        }
+        fn capture_pane(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn pane_pid_map(&self) -> std::collections::HashMap<u32, String> {
+            std::collections::HashMap::new()
+        }
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+        fn focus_pane(&self, _: &str) -> bool {
+            false
+        }
+        fn send_text(&self, _: &str, text: &str) -> bool {
+            self.keys.lock().unwrap().push(text.into());
+            true
+        }
+        fn send_prompt_text_on(&self, _: Option<&str>, _: &str, text: &str) -> bool {
+            std::thread::sleep(Duration::from_millis(100));
+            self.keys.lock().unwrap().push(text.into());
+            true
+        }
+    }
+
+    fn slow_pane() -> Arc<SlowPane> {
+        Arc::new(SlowPane {
+            keys: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn delivery(text: &str) -> PromptDelivery<'_> {
+        PromptDelivery {
+            pane: "rmux:%7",
+            socket: Some("/test.sock"),
+            text,
+            submit: true,
+            origin: Some(PromptOrigin::Peer),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pane_guard_keeps_two_deliveries_out_of_one_input_line() {
+        let store = Store::shared();
+        start(&store).await;
+        let collaboration =
+            CollaborationStore::in_memory(crate::collaboration::CollaborationOptions::default());
+        let pane = slow_pane();
+        let backend: SharedBackend = pane.clone();
+        let (first, second) = tokio::join!(
+            deliver_prompt(&collaboration, &store, backend.clone(), delivery("wake")),
+            deliver_prompt(&collaboration, &store, backend.clone(), delivery("review")),
+        );
+        assert!(first.unwrap().submitted);
+        assert!(second.unwrap().submitted);
+        let keys = pane.keys.lock().unwrap().clone();
+        // Each prompt is followed by its own Enter, in either order.
+        assert!(
+            keys == ["wake", "\r", "review", "\r"] || keys == ["review", "\r", "wake", "\r"],
+            "deliveries interleaved: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_waits_for_a_held_pane_guard() {
+        let store = Store::shared();
+        start(&store).await;
+        let collaboration =
+            CollaborationStore::in_memory(crate::collaboration::CollaborationOptions::default());
+        let pane = slow_pane();
+        let held = lock_pane(&collaboration, "rmux:%7").await;
+        let waiting = tokio::spawn({
+            let collaboration = collaboration.clone();
+            let store = store.clone();
+            let backend: SharedBackend = pane.clone();
+            async move {
+                deliver_prompt(&collaboration, &store, backend, delivery("late"))
+                    .await
+                    .map(|d| d.submitted)
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            pane.keys.lock().unwrap().is_empty(),
+            "typed under a held guard"
+        );
+        drop(held);
+        assert_eq!(waiting.await.unwrap(), Ok(true));
+        assert_eq!(*pane.keys.lock().unwrap(), ["late", "\r"]);
+    }
+
+    #[tokio::test]
+    async fn a_draining_worker_is_refused_and_nothing_is_registered() {
+        let store = Store::shared();
+        start(&store).await;
+        let collaboration =
+            CollaborationStore::in_memory(crate::collaboration::CollaborationOptions::default());
+        collaboration
+            .block_worker_input_for_test("rmux:%7", Some("/test.sock"))
+            .await;
+        let pane = slow_pane();
+        let refused = deliver_prompt(&collaboration, &store, pane.clone(), delivery("go")).await;
+        assert!(matches!(refused, Err(DeliveryRefused::WorkerDraining)));
+        assert!(pane.keys.lock().unwrap().is_empty());
+        // No expected prompt was left behind for a later hook to take.
+        submit(&store, "original", "/test.sock", "go").await;
+        assert_eq!(
+            origin_of(&store, "original").await,
+            Some(PromptOrigin::Unknown)
         );
     }
 }

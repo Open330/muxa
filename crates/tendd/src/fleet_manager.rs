@@ -33,10 +33,12 @@ use uuid::Uuid;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_PENDING_REQUESTS: usize = 64;
 
+#[allow(clippy::too_many_arguments)] // One call site; each is a distinct daemon handle.
 pub(crate) async fn start(
     cfg: &FleetConfig,
     local_agents: SharedStore,
     backends: Vec<SharedBackend>,
+    collaboration: Arc<tend::collaboration::CollaborationStore>,
     local_client: tend::ipc::Client,
     daemon_generation: u64,
     mailbox_changes: watch::Receiver<u64>,
@@ -70,6 +72,7 @@ pub(crate) async fn start(
             local: LocalManagerInput {
                 agents: local_agents,
                 backends,
+                collaboration,
                 client: local_client,
                 mailbox_changes,
                 transitions: local_transitions,
@@ -125,6 +128,7 @@ struct ManagerInput {
 struct LocalManagerInput {
     agents: SharedStore,
     backends: Vec<SharedBackend>,
+    collaboration: Arc<tend::collaboration::CollaborationStore>,
     client: tend::ipc::Client,
     transitions: broadcast::Receiver<tend::Transition>,
     mailbox_changes: watch::Receiver<u64>,
@@ -157,6 +161,7 @@ async fn run_manager(input: ManagerInput) {
             store: Arc::clone(&store),
             agents: local.agents,
             backends: local.backends,
+            collaboration: local.collaboration,
             client: local.client,
             commands: local_rx,
             transitions: local.transitions,
@@ -295,6 +300,9 @@ struct LocalTask {
     store: Arc<FleetStore>,
     agents: SharedStore,
     backends: Vec<SharedBackend>,
+    /// The daemon's store, for the pane input guard and drain check every
+    /// prompt delivery goes through.
+    collaboration: Arc<tend::collaboration::CollaborationStore>,
     client: tend::ipc::Client,
     commands: mpsc::Receiver<HostCommand>,
     transitions: broadcast::Receiver<tend::Transition>,
@@ -445,7 +453,16 @@ impl LocalTask {
                     ));
                 }
                 audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
-                local_send_prompt(&self.backends, &self.agents, pane, text, submit, origin).await
+                local_send_prompt(
+                    &self.backends,
+                    &self.agents,
+                    &self.collaboration,
+                    pane,
+                    text,
+                    submit,
+                    origin,
+                )
+                .await
             }
             FleetOperation::SendKeys { pane, keys } => {
                 if keys.is_empty() || keys.len() > tend::fleet::FLEET_MAX_KEYS {
@@ -1019,6 +1036,7 @@ async fn local_capture_window(
 async fn local_send_prompt(
     backends: &[SharedBackend],
     store: &SharedStore,
+    collaboration: &tend::collaboration::CollaborationStore,
     pane: PaneKey,
     text: String,
     submit: bool,
@@ -1032,46 +1050,34 @@ async fn local_send_prompt(
         ));
     }
     let socket = pane.window.session.endpoint.socket;
-    let pane_id = pane.pane_id;
-    // Registered before typing, so the hook reporting it carries its origin.
-    let expected = if submit && !text.is_empty() {
-        store
-            .expect_prompt(
-                &pane_id,
-                Some(&socket),
-                &text,
-                tend::PromptOrigin::declared(origin),
-            )
-            .await
-    } else {
-        None
-    };
-    let forget = store.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
-            return None;
-        }
-        let submitted = if submit {
-            std::thread::sleep(tend::backend::prompt_submit_grace(&pane_id));
-            backend.send_text_on(Some(&socket), &pane_id, "\r")
-        } else {
-            false
-        };
-        Some(tend::ipc::SendPromptOutcome {
+    // The same guarded path as IPC `send_prompt`: a fleet prompt waits out a
+    // collaboration wake on this pane and is refused while it drains.
+    let delivered = tend::prompt_delivery::deliver_prompt(
+        collaboration,
+        store,
+        backend,
+        tend::prompt_delivery::PromptDelivery {
+            pane: &pane.pane_id,
+            socket: Some(&socket),
+            text: &text,
+            submit,
+            origin: Some(tend::PromptOrigin::declared(origin)),
+        },
+    )
+    .await;
+    match delivered {
+        Ok(delivered) => Ok(FleetCommandResult::sent(tend::ipc::SendPromptOutcome {
             sent: true,
-            submitted,
+            submitted: delivered.submitted,
             submission_confirmed: None,
-        })
-    })
-    .await
-    .map_err(|error| format!("local send task panicked: {error}"))?;
-    if !outcome.as_ref().is_some_and(|outcome| outcome.submitted) {
-        if let Some(token) = expected {
-            forget.forget_expected_prompt(token);
+        })),
+        Err(tend::prompt_delivery::DeliveryRefused::WorkerDraining) => {
+            Err(tend::prompt_delivery::WORKER_DRAINING.to_string())
+        }
+        Err(tend::prompt_delivery::DeliveryRefused::NotSent) => {
+            Err("backend refused text injection".to_string())
         }
     }
-    let outcome = outcome.ok_or_else(|| "backend refused text injection".to_string())?;
-    Ok(FleetCommandResult::sent(outcome))
 }
 
 async fn local_send_keys(
@@ -2362,6 +2368,9 @@ mod tests {
             transitions: agents.subscribe(),
             agents,
             backends: Vec::new(),
+            collaboration: tend::collaboration::CollaborationStore::in_memory(
+                tend::collaboration::CollaborationOptions::default(),
+            ),
             client: tend::ipc::Client::new(dir.path().join("absent.sock")),
             mailbox_changes,
             commands: receiver,
