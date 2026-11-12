@@ -87,6 +87,13 @@ pub struct UpArgs {
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
+    /// What done means; repeat for each criterion. Stored on the Work.
+    #[arg(long = "accept", value_name = "CRITERION")]
+    pub acceptance: Vec<String>,
+    /// A command tend runs in the Work's directory to verify a result;
+    /// repeat for each. Stored on the Work.
+    #[arg(long = "check", value_name = "COMMAND")]
+    pub checks: Vec<String>,
     /// The planned Work's directory, used where the current directory
     /// would be: a route's `cwd` or worktree still wins, and it is never
     /// treated as an explicit `--cwd`.
@@ -1831,6 +1838,8 @@ mod tests {
             no_ticket: true,
             refresh: false,
             json: false,
+            acceptance: Vec::new(),
+            checks: Vec::new(),
         }
     }
 

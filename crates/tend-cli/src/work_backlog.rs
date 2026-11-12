@@ -10,6 +10,7 @@ use tend::work::{WorkEdit, WorkIdentity, WorkRecord, WorkStage, WORK_BACKLOG_CAP
 use time::OffsetDateTime;
 
 #[derive(Debug, clap::Args)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags
 pub struct PlanArgs {
     /// Work id, or WORKSPACE/WORK.
     pub work: String,
@@ -46,8 +47,103 @@ pub struct PlanArgs {
     /// Remove the priority.
     #[arg(long)]
     pub no_priority: bool,
+    /// What done means; repeat for each criterion. Replaces the Work's list.
+    #[arg(
+        long = "accept",
+        value_name = "CRITERION",
+        conflicts_with = "no_acceptance"
+    )]
+    pub acceptance: Vec<String>,
+    /// Remove every acceptance criterion.
+    #[arg(long)]
+    pub no_acceptance: bool,
+    /// A command tend runs in the Work's directory to verify a result;
+    /// repeat for each. Replaces the Work's list.
+    #[arg(long = "check", value_name = "COMMAND", conflicts_with = "no_checks")]
+    pub checks: Vec<String>,
+    /// Remove every declared check.
+    #[arg(long)]
+    pub no_checks: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+/// The acceptance/check part of a [`WorkEdit`] from CLI flags: `None`
+/// leaves the Work's list alone.
+pub(crate) fn verify_edit(
+    acceptance: Vec<String>,
+    no_acceptance: bool,
+    checks: Vec<String>,
+    no_checks: bool,
+) -> (
+    Option<Vec<String>>,
+    Option<Vec<tend::work_verify::WorkCheck>>,
+) {
+    let acceptance = (no_acceptance || !acceptance.is_empty()).then_some(acceptance);
+    let checks = (no_checks || !checks.is_empty()).then(|| {
+        checks
+            .into_iter()
+            .map(tend::work_verify::WorkCheck::new)
+            .collect()
+    });
+    (acceptance, checks)
+}
+
+/// Record the acceptance criteria and checks given to `tend work up` /
+/// `tend_start_work` on the Work it started. A Work with no directory yet
+/// gets the run's, which is where its checks run.
+pub(crate) async fn declare_verification(
+    client: &Client,
+    identity: &WorkIdentity,
+    acceptance: Option<Vec<String>>,
+    checks: Option<Vec<tend::work_verify::WorkCheck>>,
+    run_cwd: &Path,
+) -> Result<()> {
+    if acceptance.is_none() && checks.is_none() {
+        return Ok(());
+    }
+    let existing = client
+        .work_backlog(None)
+        .await?
+        .into_iter()
+        .find(|record| record.identity == *identity);
+    let has_cwd = existing
+        .as_ref()
+        .and_then(|record| record.plan.as_ref())
+        .is_some_and(|plan| plan.cwd.is_some());
+    let edit = WorkEdit {
+        acceptance,
+        checks,
+        cwd: (!has_cwd).then(|| run_cwd.to_string_lossy().into_owned()),
+        // A record made here belongs to a Work that is running now.
+        stage: existing.is_none().then_some(WorkStage::InProgress),
+        ..WorkEdit::default()
+    };
+    client
+        .work_edit(identity, &edit)
+        .await
+        .context("recording the Work's acceptance criteria and checks")?;
+    Ok(())
+}
+
+/// Refuse to send acceptance criteria or checks to a daemon that would
+/// drop them.
+pub(crate) async fn require_verify(client: &Client) -> Result<()> {
+    let hello = client
+        .hello(std::time::Duration::from_secs(3))
+        .await
+        .context("asking tendd what it supports")?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|c| c == tend::work::WORK_VERIFY_CAPABILITY)
+    {
+        bail!(
+            "this tendd does not store acceptance criteria or checks ({}); restart it with the same tend build",
+            tend::work::WORK_VERIFY_CAPABILITY
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_stage(raw: &str) -> Result<WorkStage, String> {
@@ -122,7 +218,18 @@ pub async fn run_plan(args: PlanArgs, client: &Client) -> Result<()> {
         None if !exists => Some(here),
         None => None,
     };
+    let (acceptance, checks) = verify_edit(
+        args.acceptance,
+        args.no_acceptance,
+        args.checks,
+        args.no_checks,
+    );
+    if acceptance.is_some() || checks.is_some() {
+        require_verify(client).await?;
+    }
     let edit = WorkEdit {
+        acceptance,
+        checks,
         title: args.title,
         goal: args.goal,
         next_action: args.next_action,
@@ -241,6 +348,12 @@ pub(crate) fn render_show(show: &WorkShow, now: OffsetDateTime) -> String {
             }
             if let Some(priority) = plan.priority {
                 let _ = writeln!(out, "priority:   {priority}");
+            }
+            for criterion in &plan.acceptance {
+                let _ = writeln!(out, "accept:     {criterion}");
+            }
+            for check in &plan.checks {
+                let _ = writeln!(out, "check:      {}", check.command);
             }
         }
         for item in &record.external_items {
@@ -424,6 +537,7 @@ mod tests {
             prompt: Some("fix the login redirect".into()),
             external: None,
             priority: Some(1),
+            ..WorkPlan::default()
         };
         let records = vec![
             record("web", "ENG-1", Some(plan)),
@@ -604,5 +718,56 @@ mod tests {
             out.contains("rv_1    1h  @impl Redirect fixed  [accepted — ship it]"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn plan_flags_replace_or_clear_acceptance_and_checks() {
+        #[derive(clap::Parser)]
+        struct Plan {
+            #[command(flatten)]
+            args: super::PlanArgs,
+        }
+        assert_eq!(
+            super::verify_edit(Vec::new(), false, Vec::new(), false),
+            (None, None)
+        );
+        let (acceptance, checks) = super::verify_edit(
+            vec!["tests pass".into()],
+            false,
+            vec!["cargo test".into()],
+            false,
+        );
+        assert_eq!(acceptance.as_deref(), Some(&["tests pass".to_string()][..]));
+        assert_eq!(
+            checks,
+            Some(vec![tend::work_verify::WorkCheck::new("cargo test")])
+        );
+        assert_eq!(
+            super::verify_edit(Vec::new(), true, Vec::new(), true),
+            (Some(Vec::new()), Some(Vec::new()))
+        );
+        let parsed = <Plan as clap::Parser>::try_parse_from([
+            "plan",
+            "ENG-1",
+            "--title",
+            "x",
+            "--accept",
+            "a",
+            "--accept",
+            "b",
+            "--check",
+            "make test",
+        ])
+        .unwrap();
+        assert_eq!(parsed.args.acceptance, ["a", "b"]);
+        assert_eq!(parsed.args.checks, ["make test"]);
+        assert!(<Plan as clap::Parser>::try_parse_from([
+            "plan",
+            "ENG-1",
+            "--check",
+            "x",
+            "--no-checks"
+        ])
+        .is_err());
     }
 }

@@ -265,6 +265,9 @@ pub struct WorkRecord {
 pub const WORK_BACKLOG_CAPABILITY: &str = "work_backlog_v1";
 /// Daemons that honor `newest` on `work_record_show`.
 pub const WORK_RECENT_RESULTS_CAPABILITY: &str = "work_recent_results_v1";
+/// Daemons that store acceptance criteria and declared checks on a Work
+/// (`WorkPlan::acceptance`, `WorkPlan::checks`).
+pub const WORK_VERIFY_CAPABILITY: &str = "work_verify_v1";
 /// Daemons that store client-refreshed external references
 /// (`work_external_upsert`).
 pub const WORK_EXTERNAL_CAPABILITY: &str = "work_external_v1";
@@ -288,6 +291,15 @@ pub struct WorkPlan {
     /// Backlog order: lower first; unset sorts after every set value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
+    /// What done means, one criterion per entry, as the person or the
+    /// requesting agent wrote it (`work_verify_v1`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+    /// Commands tend runs in `cwd` to verify a result before anyone looks
+    /// at it (`work_verify_v1`). Declared here by the person or the
+    /// requesting agent, never read from the repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::work_verify::WorkCheck>,
 }
 
 impl WorkPlan {
@@ -324,6 +336,12 @@ pub struct WorkEdit {
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clear_priority: bool,
+    /// Replace the acceptance criteria; an empty list clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<Vec<String>>,
+    /// Replace the declared checks; an empty list clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<crate::work_verify::WorkCheck>>,
 }
 
 /// One edited text field: `None` keeps the old value, an empty string
@@ -402,6 +420,15 @@ impl WorkEdit {
         }
         if let Some(priority) = self.priority {
             plan.priority = Some(priority);
+        }
+        if let Some(acceptance) = self.acceptance {
+            plan.acceptance = crate::work_verify::validate_acceptance(acceptance)?;
+        }
+        if let Some(checks) = self.checks {
+            plan.checks = crate::work_verify::validate_checks(checks)?;
+        }
+        if !plan.checks.is_empty() && plan.cwd.is_none() {
+            return Err("checks need a directory to run in: give the Work a cwd".into());
         }
         record.plan = (!plan.is_empty()).then_some(plan);
         if created
@@ -1347,5 +1374,54 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_work_carries_acceptance_and_checks_that_need_a_directory() {
+        let identity = WorkIdentity::new("tend", "ENG-1");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let checks = vec![crate::work_verify::WorkCheck::new("cargo test")];
+        let refused = WorkEdit {
+            title: Some("x".into()),
+            checks: Some(checks.clone()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, None, now);
+        assert!(refused.unwrap_err().contains("directory"));
+
+        let record = WorkEdit {
+            title: Some("x".into()),
+            cwd: Some("/src/tend".into()),
+            acceptance: Some(vec![" tests pass ".into()]),
+            checks: Some(checks),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, None, now)
+        .unwrap();
+        let plan = record.plan.as_ref().unwrap();
+        assert_eq!(plan.acceptance, ["tests pass"]);
+        assert_eq!(plan.checks[0].command, "cargo test");
+
+        // An edit that names neither keeps them; an empty list clears.
+        let kept = WorkEdit {
+            title: Some("y".into()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, Some(record.clone()), now)
+        .unwrap();
+        assert_eq!(kept.plan.as_ref().unwrap().checks.len(), 1);
+        let cleared = WorkEdit {
+            checks: Some(Vec::new()),
+            acceptance: Some(Vec::new()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, Some(record), now)
+        .unwrap();
+        let plan = cleared.plan.unwrap();
+        assert!(plan.checks.is_empty() && plan.acceptance.is_empty());
+
+        // Older records and requests without the fields still parse.
+        let old: WorkPlan = serde_json::from_str(r#"{"cwd":"/x"}"#).unwrap();
+        assert!(old.checks.is_empty());
     }
 }

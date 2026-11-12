@@ -34,6 +34,15 @@ pub async fn run(
     let json = args.json;
     let dry_run = args.dry_run;
     let show_prompts = args.show_prompts;
+    let (acceptance, checks) = crate::work_backlog::verify_edit(
+        std::mem::take(&mut args.acceptance),
+        false,
+        std::mem::take(&mut args.checks),
+        false,
+    );
+    if let (Some(client), true) = (client, acceptance.is_some() || checks.is_some()) {
+        crate::work_backlog::require_verify(client).await?;
+    }
     let resolved = resolve_or_onboard(&args, config, config_path, client).await?;
     if show_prompts {
         print_prompts(&resolved.desired);
@@ -45,6 +54,14 @@ pub async fn run(
             anyhow::anyhow!("tend work up requires tendd for durable pipeline state")
         })?;
         let result = apply_durable(resolved, client).await?;
+        crate::work_backlog::declare_verification(
+            client,
+            &tend::work::WorkIdentity::new(result.workspace.clone(), result.work.clone()),
+            acceptance,
+            checks,
+            &result.cwd,
+        )
+        .await?;
         if let Some(record) = planned
             .as_ref()
             .filter(|record| record.metadata.stage == tend::work::WorkStage::Queued)

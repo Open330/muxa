@@ -1062,6 +1062,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::decision::HUMAN_DECISION_CAPABILITY,
     crate::decision_queue::DECISION_QUEUE_CAPABILITY,
     crate::work::WORK_BACKLOG_CAPABILITY,
+    crate::work::WORK_VERIFY_CAPABILITY,
     crate::work::WORK_RECENT_RESULTS_CAPABILITY,
     crate::work::WORK_EXTERNAL_CAPABILITY,
     "pipeline_subscribe",

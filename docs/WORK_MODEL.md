@@ -61,6 +61,26 @@ dashboard's editor, which keeps the plan when it saves metadata) and are
 served over IPC as `work_backlog`, `work_edit` and `work_record_show`
 (`work_backlog_v1`).
 
+### Acceptance and checks
+
+A Work can say what done means and how tend checks it:
+
+```sh
+tend work plan web/ENG-1 --title "Fix login" \
+  --accept "login lands on /home" --accept "no new warnings" \
+  --check "cargo test -p web" --check "cargo clippy -- -D warnings"
+tend work up ENG-2 --check "npm test"        # recorded on the Work it starts
+```
+
+`--accept` adds a criterion and `--check` a shell command; repeating a flag
+gives the whole list, which replaces the Work's (`--no-acceptance`,
+`--no-checks` clear them). `tend_start_work` takes the same lists as
+`acceptance` and `checks`. Checks need a directory to run in: the plan's
+`cwd`, or, from `work up`, the directory the Work started in. The commands
+come only from this declaration by the person or the agent that started the
+Work, never from repository content. They are stored on the plan
+(`work_verify_v1`) and shown by `tend work show`.
+
 ### External issues
 
 ```sh
