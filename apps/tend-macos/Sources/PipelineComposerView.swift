@@ -251,7 +251,7 @@ struct PipelineComposerView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("Refinement", text: $session.refinement, prompt: Text("Refine: for example make the reviewer use gemini"))
+                TextField("Refinement", text: $session.refinement, prompt: Text("Refine: for example make the reviewer use codex"))
                     .labelsHidden()
                     .onSubmit { session.refine() }
                     .disabled(session.isDrafting)

@@ -1705,6 +1705,13 @@ impl Config {
                     .as_deref()
                     .filter(|agent| crate::agent_control::is_retired_agent_program(agent))
                     .map(|_| "mcp.guide.agent".to_string()),
+            )
+            .chain(
+                self.automation
+                    .rule
+                    .iter()
+                    .filter(|rule| rule.agent.iter().any(|spec| spec.0.is_none()))
+                    .map(|rule| format!("automation.rule[{}].agent", rule.name)),
             );
         for path in retired {
             tracing::warn!(

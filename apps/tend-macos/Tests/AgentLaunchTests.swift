@@ -49,6 +49,14 @@ private func guide(program: String? = nil, placement: String? = nil, direction: 
     let saved = TendAgentLaunchDefaults(program: .codex, placement: .newWindow, options: ["--model", "o3"])
     saved.save(to: defaults)
     #expect(TendAgentLaunchDefaults.load(from: defaults) == saved)
+
+    // A default saved for the retired Gemini CLI keeps its placement but
+    // not its program or its Gemini-specific options.
+    defaults.set(
+        Data(#"{"program":"gemini","placement":"newWindow","options":["--model","gemini-2.5-pro"]}"#.utf8),
+        forKey: TendAgentLaunchDefaults.storageKey
+    )
+    #expect(TendAgentLaunchDefaults.load(from: defaults) == TendAgentLaunchDefaults(placement: .newWindow))
 }
 
 @Test func placementFollowsRememberedThenGuideAndDegrades() {

@@ -154,14 +154,16 @@ struct TendAgentLaunchDefaults: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey { case program, placement, options }
 
     /// A remembered provider this build no longer offers (the retired
-    /// Gemini CLI) reads as "none chosen" instead of discarding the
-    /// placement and options saved beside it.
+    /// Gemini CLI) reads as "none chosen" and keeps the saved placement.
+    /// Its options are dropped with it: they were that CLI's flags
+    /// (`--model gemini-…`) and must not reach whichever CLI runs instead.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        program = (try? container.decodeIfPresent(String.self, forKey: .program))
-            .flatMap { $0.flatMap(TendAgentProgram.init(rawValue:)) }
+        let stored = try? container.decodeIfPresent(String.self, forKey: .program)
+        program = stored.flatMap { $0.flatMap(TendAgentProgram.init(rawValue:)) }
         placement = try container.decodeIfPresent(TendAgentPlacementKind.self, forKey: .placement)
-        options = try container.decodeIfPresent([String].self, forKey: .options)
+        let retired = stored.flatMap { $0 } != nil && program == nil
+        options = retired ? nil : try container.decodeIfPresent([String].self, forKey: .options)
     }
 
     static func load(from defaults: UserDefaults = .standard) -> TendAgentLaunchDefaults {

@@ -29,11 +29,14 @@ pub fn has_tend_hooks(settings_text: &str) -> bool {
         .values()
         .filter_map(Value::as_array)
         .flatten()
-        .any(entry_owned_by_us)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(handler_is_ours)
 }
 
-/// Strip every tend-owned hook entry, dropping event arrays (and the `hooks`
-/// key) that end up empty.
+/// Strip every tend-owned handler. An entry keeps whatever other handlers it
+/// holds and is dropped only once none remain; event arrays (and the `hooks`
+/// key) that end up empty go too.
 pub fn remove(original: &str) -> Result<(String, Outcome)> {
     if original.trim().is_empty() {
         return Ok((original.to_string(), Outcome::AlreadyAbsent));
@@ -50,9 +53,20 @@ pub fn remove(original: &str) -> Result<(String, Outcome)> {
             let Some(Value::Array(arr)) = hooks.get_mut(&ev) else {
                 continue;
             };
-            let before = arr.len();
-            arr.retain(|entry| !entry_owned_by_us(entry));
-            if arr.len() != before {
+            let mut touched = false;
+            arr.retain_mut(|entry| {
+                let Some(Value::Array(handlers)) = entry.get_mut("hooks") else {
+                    return true;
+                };
+                let before = handlers.len();
+                handlers.retain(|h| !handler_is_ours(h));
+                if handlers.len() == before {
+                    return true;
+                }
+                touched = true;
+                !handlers.is_empty()
+            });
+            if touched {
                 changed = true;
                 if arr.is_empty() {
                     hooks.remove(&ev);
@@ -71,15 +85,15 @@ pub fn remove(original: &str) -> Result<(String, Outcome)> {
     Ok((new_text, Outcome::Removed))
 }
 
-fn entry_owned_by_us(entry: &Value) -> bool {
-    let Some(arr) = entry.get("hooks").and_then(Value::as_array) else {
-        return false;
-    };
-    arr.iter().any(|h| {
-        h.get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|c| c.trim_start().starts_with(HOOK_CMD_PREFIX))
-    })
+/// `tend hook gemini` itself, or followed by its arguments — not a longer
+/// command that merely starts with the same letters (`tend hook geminix`).
+fn handler_is_ours(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim_start)
+        .and_then(|c| c.strip_prefix(HOOK_CMD_PREFIX))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 #[cfg(test)]
@@ -124,6 +138,28 @@ mod tests {
         assert_eq!(remove("").unwrap().1, Outcome::AlreadyAbsent);
         assert!(remove("{ not json").is_err());
         assert!(!has_tend_hooks("{ not json"));
+    }
+
+    /// One entry may group a user's handler with ours; only ours goes.
+    #[test]
+    fn a_mixed_entry_keeps_the_users_handler() {
+        let mixed = r#"{"theme":"dark","hooks":{"BeforeAgent":[{"hooks":[
+            {"type":"command","command":"echo user"},
+            {"type":"command","command":"tend hook gemini --event before_agent"}]}]}}"#;
+        let (after, o) = remove(mixed).unwrap();
+        assert_eq!(o, Outcome::Removed);
+        let v: Value = serde_json::from_str(&after).unwrap();
+        let handlers = v["hooks"]["BeforeAgent"][0]["hooks"].as_array().unwrap();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0]["command"], "echo user");
+        assert_eq!(v["theme"], "dark");
+    }
+
+    #[test]
+    fn a_command_that_only_shares_the_prefix_is_not_ours() {
+        let other = r#"{"hooks":{"BeforeAgent":[{"hooks":[{"type":"command","command":"tend hook geminix"}]}]}}"#;
+        assert!(!has_tend_hooks(other));
+        assert_eq!(remove(other).unwrap().1, Outcome::AlreadyAbsent);
     }
 
     #[test]

@@ -3875,11 +3875,6 @@ fn peer_spawn_program(
         .map(crate::agent_launch::AgentProgram::parse)
         .transpose()?;
     let targeted = provider_kind(target).map(agent_program_for_kind);
-    let configured = guide
-        .agent
-        .as_deref()
-        .map(crate::agent_launch::AgentProgram::parse)
-        .transpose()?;
     if let (Some(requested), Some(targeted)) = (requested, targeted) {
         if requested != targeted {
             return Err(format!(
@@ -3899,7 +3894,18 @@ fn peer_spawn_program(
             crate::agent_launch::AgentProgram::Codex
         }
     };
-    Ok(requested.or(targeted).or(configured).unwrap_or(fallback))
+    if let Some(chosen) = requested.or(targeted) {
+        return Ok(chosen);
+    }
+    // The configured default is consulted only when the call names no
+    // provider, so a stale one (a retired `gemini`) never blocks an explicit
+    // choice.
+    let configured = guide
+        .agent
+        .as_deref()
+        .map(crate::agent_launch::AgentProgram::parse)
+        .transpose()?;
+    Ok(configured.unwrap_or(fallback))
 }
 
 fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram {
@@ -8258,6 +8264,21 @@ mod tests {
         };
         let error = peer_spawn_program(&json!({}), &codex, "auto", &retired).unwrap_err();
         assert!(error.contains("no longer supported"), "{error}");
+        // An explicit provider still wins over the stale default.
+        assert_eq!(
+            peer_spawn_program(
+                &json!({ "spawn_agent": "claude" }),
+                &codex,
+                "auto",
+                &retired
+            )
+            .unwrap(),
+            crate::agent_launch::AgentProgram::Claude
+        );
+        assert_eq!(
+            peer_spawn_program(&json!({}), &codex, "@codex", &retired).unwrap(),
+            crate::agent_launch::AgentProgram::Codex
+        );
     }
 
     #[test]
