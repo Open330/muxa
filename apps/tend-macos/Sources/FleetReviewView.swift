@@ -4,6 +4,11 @@ import SwiftUI
 
 struct FleetReviewView: View {
     @ObservedObject var model: AppModel
+    /// The daemon's decision queue, shared with Home.
+    @ObservedObject var feed: FleetDecisionFeed
+    /// The decisions as Home filters them, and a card for one.
+    let decisions: () -> [FleetDecision]
+    let decisionCard: (FleetDecision, @escaping (FleetRevisionTarget) -> Void) -> FleetDecisionCard
     /// The board as it is now; the queue is worked out from it.
     let works: () -> [FleetWork]
     @Binding var marks: FleetReviewMarks
@@ -33,7 +38,12 @@ struct FleetReviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            FleetReviewRequests(model: model)
+            FleetReviewRequests(
+                feed: feed,
+                decisions: decisions(),
+                card: decisionCard,
+                reload: { await feed.load(model.client) }
+            )
             let queue = queue
             Group {
                 if queue.isEmpty {
@@ -926,79 +936,26 @@ private struct FleetCombinedReplySheet: View {
 }
 
 
-/// One open review request with Accept, Return (with a note) and Withdraw.
-struct FleetReviewRequestRow: View {
-    let item: TendReviewItem
-    let busy: Bool
-    @Binding var returning: Bool
-    @Binding var note: String
-    let decide: (TendReviewDisposition, String?) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(verbatim: item.summary)
-                    .font(TendType.body.weight(.medium))
-                    .lineLimit(2)
-                Spacer(minLength: 8)
-                Button("Accept") { decide(.accepted, nil) }
-                    .buttonStyle(.tendSecondary)
-                Button("Return…") { returning = true }
-                    .buttonStyle(.tendGhost)
-                Button("Withdraw") { decide(.withdrawn, nil) }
-                    .buttonStyle(.tendGhost)
-            }
-            .disabled(busy)
-            Text(verbatim: [item.askedBy, item.target.text, item.anchor].compactMap { $0 }.joined(separator: " · "))
-                .font(TendType.meta)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            if returning {
-                HStack {
-                    TextField("What is missing", text: $note)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { decide(.returned, note) }
-                    Button("Return") { decide(.returned, note) }
-                        .buttonStyle(.tendPrimary)
-                        .disabled(note.trimmingCharacters(in: .whitespaces).isEmpty)
-                    Button("Cancel") { returning = false }
-                        .buttonStyle(.tendGhost)
-                }
-            }
-        }
-        .padding(8)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-/// Explicit requests for review (`tend review request`, from agents or
-/// people), above the results Home gathered on its own, oldest first. Each
-/// stays until someone accepts, returns or withdraws it, here or elsewhere:
-/// the list refreshes every few seconds while the sheet is open. Hidden
-/// when there are none or the daemon has no review items.
+/// What waits on the person's decision, from the daemon's queue: questions
+/// agents asked them and explicit requests for review, oldest first, above
+/// the results Home gathered on its own. Each stays until someone answers
+/// or decides it, here or elsewhere; Home refreshes the queue every few
+/// seconds while it is open. Hidden when there are none.
 struct FleetReviewRequests: View {
-    @ObservedObject var model: AppModel
-    @State private var items: [TendReviewItem] = []
-    @State private var hasMore = false
-    /// How many items the list shows: one page, more after Load More.
-    @State private var shown = Self.page
-    @State private var returning: String?
-    @State private var note = ""
-    @State private var busy: String?
-    @State private var problem: String?
-
-    private static let page = 50
-    private static let refreshEvery: Duration = .seconds(5)
+    @ObservedObject var feed: FleetDecisionFeed
+    let decisions: [FleetDecision]
+    let card: (FleetDecision, @escaping (FleetRevisionTarget) -> Void) -> FleetDecisionCard
+    let reload: () async -> Void
+    @State private var revisionTarget: FleetRevisionTarget?
 
     var body: some View {
         Group {
-            if !items.isEmpty || problem != nil {
+            if !decisions.isEmpty || feed.problem != nil {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Asked for review")
+                        Text("Decisions")
                             .font(.system(size: 13, weight: .semibold))
-                        Text(verbatim: hasMore ? "\(items.count)+" : "\(items.count)")
+                        Text(verbatim: feed.queue?.truncated == true ? "\(decisions.count)+" : "\(decisions.count)")
                             .font(.system(size: 12, weight: .semibold))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
@@ -1007,97 +964,35 @@ struct FleetReviewRequests: View {
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button {
-                            Task { await load() }
+                            Task { await reload() }
                         } label: {
                             Image(systemName: "arrow.clockwise")
                         }
                         .buttonStyle(.tendGhost)
                         .help("Check again")
                     }
-                    if let problem {
+                    if let problem = feed.problem {
                         Label(problem, systemImage: "exclamationmark.circle")
                             .font(TendType.meta)
                             .foregroundStyle(.orange)
                     }
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(items) { item in
-                                FleetReviewRequestRow(
-                                    item: item,
-                                    busy: busy != nil,
-                                    returning: Binding(
-                                        get: { returning == item.id },
-                                        set: { on in
-                                            returning = on ? item.id : nil
-                                            if on { note = "" }
-                                        }
-                                    ),
-                                    note: $note,
-                                    decide: { disposition, note in
-                                        Task { await decide(item, disposition, note: note) }
-                                    }
-                                )
-                            }
-                            if hasMore {
-                                Button("Load More") {
-                                    shown += Self.page
-                                    Task { await load() }
-                                }
-                                .buttonStyle(.tendGhost)
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(decisions) { decision in
+                                card(decision) { revisionTarget = $0 }
                             }
                         }
                     }
-                    .frame(maxHeight: 180)
+                    .frame(maxHeight: 280)
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 10)
                 Divider()
             }
         }
-        .task {
-            // Requests made or decided elsewhere (the CLI, an agent, another
-            // window) show up while the sheet stays open.
-            while !Task.isCancelled {
-                await load()
-                try? await Task.sleep(for: Self.refreshEvery)
-            }
+        .sheet(item: $revisionTarget) { target in
+            ChangesRevisionView(repo: target.repo, revision: target.revision)
         }
-    }
-
-    /// Reads the first `shown` items, oldest first, a page at a time.
-    private func load() async {
-        do {
-            var loaded: [TendReviewItem] = []
-            var more = true
-            while more && loaded.count < shown {
-                let page = try await model.client.reviewItems(offset: loaded.count, limit: Self.page)
-                loaded += page.items
-                more = page.hasMore && !page.items.isEmpty
-            }
-            items = loaded
-            hasMore = more
-            problem = nil
-        } catch {
-            problem = String(localized: "Could not read review requests: \(error.localizedDescription)")
-        }
-    }
-
-    private func decide(_ item: TendReviewItem, _ disposition: TendReviewDisposition, note: String?) async {
-        busy = item.id
-        problem = nil
-        defer { busy = nil }
-        do {
-            try await model.client.decideReview(id: item.id, disposition: disposition, note: note)
-            returning = nil
-        } catch {
-            problem = error.localizedDescription
-        }
-        // Either way, show where it stands now: decided here, or already
-        // decided elsewhere.
-        let failure = problem
-        await load()
-        // Keep the decision's error visible over the refresh's success.
-        if failure != nil { problem = failure }
     }
 }
 

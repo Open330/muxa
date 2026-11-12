@@ -18,6 +18,10 @@ struct FleetHomeView: View {
     @State private var quickLook: FleetQuickLookTarget?
     @State private var showsReview = false
     @State private var showsLeftovers = false
+    /// The daemon's decision queue, read while Home is on screen.
+    @StateObject private var decisionFeed = FleetDecisionFeed()
+    /// A commit or range from a decision's evidence, open in Changes.
+    @State private var revisionTarget: FleetRevisionTarget?
     @AppStorage("home.review.scope") private var reviewScope: FleetReviewScope = .day
     @AppStorage(TendPreferences.homeAnimatesMovesKey) private var animatesMoves = true
     @Namespace private var cardSpace
@@ -59,9 +63,23 @@ struct FleetHomeView: View {
         .sheet(item: $approvalSeed) { seed in
             FleetApprovalRuleSheet(model: model, seed: seed)
         }
+        .sheet(item: $revisionTarget) { target in
+            ChangesRevisionView(repo: target.repo, revision: target.revision)
+        }
+        .task {
+            // Decisions made elsewhere (the CLI, an agent, another window)
+            // leave the queue while Home stays open.
+            while !Task.isCancelled {
+                await decisionFeed.load(model.client)
+                try? await Task.sleep(for: FleetDecisionFeed.refreshEvery)
+            }
+        }
         .sheet(isPresented: $showsReview) {
             FleetReviewView(
                 model: model,
+                feed: decisionFeed,
+                decisions: { decisions },
+                decisionCard: { decisionCard($0, openRevision: $1) },
                 works: { allWorks },
                 marks: $reviewed,
                 draft: draftBinding,
@@ -214,8 +232,35 @@ struct FleetHomeView: View {
 
     // MARK: - Board
 
+    /// The decisions Home shows under the same host and project filters as
+    /// the cards.
+    private var decisions: [FleetDecision] {
+        decisionFeed.decisions(model).filter { decision in
+            (hostFilter == nil || decision.host.alias == hostFilter)
+                && (projectFilter == nil || decision.repo == projectFilter)
+        }
+    }
+
+    /// A decision card wired to the feed. `openRevision` is the sheet the
+    /// card's host view presents Changes in.
+    func decisionCard(_ decision: FleetDecision, openRevision: @escaping (FleetRevisionTarget) -> Void) -> FleetDecisionCard {
+        let feed = decisionFeed
+        let model = model
+        let asker = decision.askerAgentID.flatMap { id in model.hostedAgents.first { $0.id == id } }
+        return FleetDecisionCard(
+            decision: decision,
+            busy: feed.busy.contains(decision.id),
+            failure: feed.failures[decision.id],
+            openRevision: openRevision,
+            answer: { text in await feed.answer(decision, text: text, model: model) },
+            decide: { disposition, note in await feed.decide(decision, disposition, note: note, model: model) },
+            openAsker: asker.map { hosted in { open(hosted) } }
+        )
+    }
+
     private var board: some View {
         let all = FleetBoard.filter(allWorks, host: hostFilter, project: projectFilter)
+        let decisions = decisions
         let works = all.filter { showsReviewed || !reviewed.hides($0) }
         let hiddenCount = all.filter { reviewed.hides($0) }.count
         let selected = all.first { $0.id == selectedID }
@@ -225,7 +270,7 @@ struct FleetHomeView: View {
             let floats = geometry.size.width < 1040
             ZStack(alignment: .trailing) {
                 HStack(spacing: 0) {
-                    lanes(works, reviewedCount: hiddenCount)
+                    lanes(works, decisions: decisions, reviewedCount: hiddenCount)
                     if let selected, !floats {
                         Divider()
                         inspector(selected)
@@ -338,9 +383,9 @@ struct FleetHomeView: View {
     }
 
     @ViewBuilder
-    private func lanes(_ works: [FleetWork], reviewedCount: Int) -> some View {
+    private func lanes(_ works: [FleetWork], decisions: [FleetDecision], reviewedCount: Int) -> some View {
         Group {
-            if FleetBoard.showsEmptyBoard(visible: works.count, reviewed: reviewedCount) {
+            if FleetBoard.showsEmptyBoard(visible: works.count + decisions.count, reviewed: reviewedCount) {
                 FleetEmptyBoard(
                     isConnected: model.isConnected,
                     newAgent: { model.presentNewAgent() },
@@ -352,6 +397,8 @@ struct FleetHomeView: View {
                         FleetLaneColumn(
                             lane: lane,
                             works: works.filter { $0.lane == lane },
+                            decisions: lane == .needsYou ? decisions : [],
+                            decisionCard: { decisionCard($0) { revisionTarget = $0 } },
                             selectedID: selectedID,
                             select: { id in selectedID = selectedID == id ? nil : id },
                             open: peek,
@@ -400,6 +447,9 @@ struct FleetHomeView: View {
 private struct FleetLaneColumn: View {
     let lane: FleetLane
     let works: [FleetWork]
+    /// The daemon's decisions, in Your turn only, above the Work cards.
+    var decisions: [FleetDecision] = []
+    var decisionCard: ((FleetDecision) -> FleetDecisionCard)?
     let selectedID: String?
     let select: (String) -> Void
     let open: (TendHostedAgent) -> Void
@@ -463,8 +513,8 @@ private struct FleetLaneColumn: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(title)
                     .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(lane == .needsYou && !works.isEmpty ? Color.orange : Color.primary)
-                Text("\(works.count)")
+                    .foregroundStyle(lane == .needsYou && works.count + decisions.count > 0 ? Color.orange : Color.primary)
+                Text("\(works.count + decisions.count)")
                     .font(.system(size: 12, weight: .semibold))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -479,7 +529,12 @@ private struct FleetLaneColumn: View {
             .padding(.bottom, 8)
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    if works.isEmpty {
+                    if let decisionCard {
+                        ForEach(decisions) { decision in
+                            decisionCard(decision)
+                        }
+                    }
+                    if works.isEmpty && decisions.isEmpty {
                         Text(empty)
                             .font(TendType.detail)
                             .foregroundStyle(.tertiary)

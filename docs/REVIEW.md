@@ -130,6 +130,13 @@ operator-console read, as for any listing past one's own mailbox: the CLI
 asks as the console and the read is written to the collaboration audit
 ledger; an agent's origin gets reviews and waiting agents only.
 
+Tend for Mac draws this queue in Home's **Your turn** and at the top of the
+Review sheet; see [MACOS](MACOS.md#workspace-information-architecture). It
+opens commit and range evidence in a read-only Changes view on the person's
+click, with the same read-only git settings as the rest of Changes
+(`--no-ext-diff`, `--no-textconv`, `core.fsmonitor=false`, no optional locks,
+no lazy fetch from a promisor remote).
+
 ## Status line
 
 `tend status-line --needs-attention` appends open review items after the

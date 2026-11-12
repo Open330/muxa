@@ -9,9 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+- Session-activity sampling lists tmux sessions and clients in one `tmux`
+  call instead of two, every 5 seconds.
+
 - `tend work dispatch-status` (and `tend_dispatch_status`) includes the
   result records filed on the dispatched Work: summary, decision asked for,
   evidence, and the person's disposition and note, refreshed on every read.
+- Tend for Mac: Home's **Your turn** lane and the Review sheet show the
+  daemon's decision queue. Questions agents asked you and requests for review
+  are cards with the decision needed, the asker's options as buttons, their
+  recommendation, and evidence chips. Answers and dispositions are recorded
+  by tendd (a human-request reply, `review_dispose`). A commit or range opens
+  a read-only Changes view of that revision in one click; a pull request opens
+  in the browser. Older daemons fall back to the review list and the console
+  mailbox.
 
 ### Fixed
 
@@ -32,7 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`collaboration_execute_overlap_v1`).
 - Session-activity sampling lists tmux sessions and clients in one `tmux`
   call instead of two, every 5 seconds.
-
 ## [0.10.14] - 2026-11-12
 
 ### Added

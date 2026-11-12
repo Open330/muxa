@@ -86,6 +86,9 @@ struct GitRunner: Sendable {
             environment.removeValue(forKey: key)
         }
         environment["GIT_OPTIONAL_LOCKS"] = "0"
+        // A partial clone must not reach out to its promisor remote to fill
+        // in an object a diff asks for: reading stays local.
+        environment["GIT_NO_LAZY_FETCH"] = "1"
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["GIT_PAGER"] = "cat"
         environment["LC_ALL"] = "C"
