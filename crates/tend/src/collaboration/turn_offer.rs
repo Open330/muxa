@@ -43,6 +43,10 @@ pub enum TurnBoundaryEvent {
     Stop,
     /// The user submitted a prompt; an offer rides along with it.
     PromptSubmit,
+    /// A session started, resumed or (Claude Code) compacted: it is told
+    /// what it owes and awaits (`obligations.rs`). Nothing is offered or
+    /// recorded.
+    SessionStart,
 }
 
 /// Offer attempts for one request, kept on the request for audit and
@@ -116,6 +120,7 @@ impl TurnOffer {
             // A turn the user started may surface work a lost Stop offer
             // missed; only its own recent offer holds it back.
             TurnBoundaryEvent::PromptSubmit => !recent(self.last_prompt_offer_at),
+            TurnBoundaryEvent::SessionStart => false,
         }
     }
 
@@ -129,6 +134,7 @@ impl TurnOffer {
                 self.prompt_offers += 1;
                 self.last_prompt_offer_at = Some(now);
             }
+            TurnBoundaryEvent::SessionStart => {}
         }
     }
 }
@@ -156,6 +162,9 @@ impl CollaborationStore {
         max_bytes: Option<usize>,
     ) -> Result<Vec<Value>, CollaborationError> {
         self.ensure_enabled()?;
+        if event == TurnBoundaryEvent::SessionStart {
+            return Ok(self.obligations(caller).await.into_iter().collect());
+        }
         if event == TurnBoundaryEvent::Stop && !self.turn_continuation.load(Ordering::SeqCst) {
             return Ok(Vec::new());
         }
