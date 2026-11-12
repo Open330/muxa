@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`work_verify_v1`) with who declared them, run where the Work last started,
   and shown by `tend work show`. An agent cannot change acceptance or checks
   the person or another agent declared.
+- A daemon swap registers its follow-up with the store before typing it,
+  like every guarded prompt delivery, so the hook is attributed to tend
+  (`origin: tend`), and reports whether the prompt hook that came back was
+  that registered prompt (`follow_up.receipt`, "tend's receipt" in
+  `tend swap --status`).
 
 ### Changed
 

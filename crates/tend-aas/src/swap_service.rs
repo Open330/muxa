@@ -151,6 +151,16 @@ pub struct PromptReceipts {
     /// The store's own count of accepted prompt hooks: the cursor.
     source: Arc<std::sync::atomic::AtomicU64>,
     seen: Mutex<std::collections::VecDeque<Receipt>>,
+    /// The daemon's expected-prompt registry, when it lends one.
+    registry: Option<Arc<dyn PromptRegistry>>,
+}
+
+/// The daemon's expected-prompt registry (`Store::expect_prompt`): the
+/// guarded prompt path registers each prompt before typing it, so the hook
+/// that reports it is attributed to tend.
+pub trait PromptRegistry: Send + Sync {
+    fn expect(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64>;
+    fn forget(&self, token: u64);
 }
 
 struct Receipt {
@@ -158,6 +168,8 @@ struct Receipt {
     kind: AgentKind,
     conversation: String,
     endpoint: String,
+    /// The hook matched a prompt tend registered before typing it.
+    tend: bool,
 }
 
 /// More than enough for every pane's hooks within one follow-up's wait.
@@ -189,7 +201,34 @@ impl PromptReceipts {
         Self {
             source,
             seen: Mutex::new(std::collections::VecDeque::new()),
+            registry: None,
         }
+    }
+
+    /// The same, registering follow-ups with the daemon's `registry`.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<dyn PromptRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    fn any_after(
+        &self,
+        cursor: u64,
+        kind: AgentKind,
+        conversation: &str,
+        endpoint: &str,
+        tend_only: bool,
+    ) -> bool {
+        self.seen.lock().is_ok_and(|seen| {
+            seen.iter().any(|receipt| {
+                receipt.seq > cursor
+                    && receipt.kind == kind
+                    && receipt.conversation == conversation
+                    && receipt.endpoint == endpoint
+                    && (!tend_only || receipt.tend)
+            })
+        })
     }
 
     /// Note one prompt hook, by who sent it and from where, under the number
@@ -205,6 +244,7 @@ impl PromptReceipts {
             endpoint: record.id.pane.as_deref().map_or_else(String::new, |pane| {
                 account_swap::endpoint_key(pane, record.id.tmux_socket.as_deref())
             }),
+            tend: record.origin == tend::state::PromptOrigin::Tend,
         };
         seen.push_back(receipt);
         while seen.len() > RECEIPTS_KEPT {
@@ -225,14 +265,27 @@ impl account_swap::TurnProbe for PromptReceipts {
         conversation: &str,
         endpoint: &str,
     ) -> bool {
-        self.seen.lock().is_ok_and(|seen| {
-            seen.iter().any(|receipt| {
-                receipt.seq > cursor
-                    && receipt.kind == kind
-                    && receipt.conversation == conversation
-                    && receipt.endpoint == endpoint
-            })
-        })
+        self.any_after(cursor, kind, conversation, endpoint, false)
+    }
+
+    fn expect_prompt(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64> {
+        self.registry.as_ref()?.expect(pane, socket, text)
+    }
+
+    fn forget_prompt(&self, token: u64) {
+        if let Some(registry) = &self.registry {
+            registry.forget(token);
+        }
+    }
+
+    fn registered_prompt_after(
+        &self,
+        cursor: u64,
+        kind: AgentKind,
+        conversation: &str,
+        endpoint: &str,
+    ) -> bool {
+        self.any_after(cursor, kind, conversation, endpoint, true)
     }
 }
 

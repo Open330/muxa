@@ -812,6 +812,7 @@ fn a_follow_up_is_read_back_from_the_journal() {
             &Observation::FollowUpEvidence {
                 kept: false,
                 evidence: TurnEvidence::PromptHook,
+                receipt: None,
             },
         )
         .unwrap();
@@ -836,6 +837,7 @@ fn a_follow_up_takes_only_evidence_of_its_own_kind() {
     let kept_evidence = serde_json::to_string(&Observation::FollowUpEvidence {
         kept: true,
         evidence: TurnEvidence::PromptHook,
+        receipt: None,
     })
     .unwrap();
     let report = follow_up_status(Some(sent), Some(kept_evidence)).unwrap();

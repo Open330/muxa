@@ -1593,6 +1593,46 @@ fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
     assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
 }
 
+/// A receipt counts as tend's own only when the store attributed the hook
+/// to a registration (`PromptOrigin::Tend`); the registry is the daemon's.
+#[test]
+fn a_registered_prompt_receipt_is_told_apart() {
+    use crate::account_swap::TurnProbe as _;
+    struct Registry(std::sync::Mutex<Vec<String>>);
+    impl PromptRegistry for Registry {
+        fn expect(&self, pane: &str, _socket: Option<&str>, text: &str) -> Option<u64> {
+            self.0.lock().unwrap().push(format!("expect {pane} {text}"));
+            Some(9)
+        }
+        fn forget(&self, token: u64) {
+            self.0.lock().unwrap().push(format!("forget {token}"));
+        }
+    }
+    let registry = Arc::new(Registry(std::sync::Mutex::default()));
+    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let receipts = PromptReceipts::new(Arc::clone(&accepted)).with_registry(registry.clone());
+    let endpoint = endpoint_key("%1", Some("/tmp/tmux-1/default"));
+    assert_eq!(receipts.expect_prompt("%1", None, "continue"), Some(9));
+    receipts.forget_prompt(9);
+    assert_eq!(
+        registry.0.lock().unwrap().as_slice(),
+        ["expect %1 continue", "forget 9"]
+    );
+    let cursor = receipts.cursor();
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 1));
+    assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    assert!(!receipts.registered_prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    let mut ours = prompt(AgentKind::ClaudeCode, "c", "%1", 2);
+    ours.origin = tend::state::PromptOrigin::Tend;
+    receipts.record(&ours);
+    assert!(receipts.registered_prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    // Without a registry nothing is registered.
+    assert_eq!(
+        PromptReceipts::new(Arc::default()).expect_prompt("%1", None, "x"),
+        None
+    );
+}
+
 // --- cancel ------------------------------------------------------------------
 
 fn gated(pane: &str, gate: &Arc<Gate>) -> EngineStep<FakeTarget> {

@@ -372,6 +372,17 @@ shows them after a restart, and `follow_up` in `--json` carries them. A swap
 run in this process (`--local`, a directly-run pane) has no hooks to read and
 reports the screen only.
 
+In the daemon the follow-up goes the way every guarded delivery does: the
+pane's input guard is held for the whole target (a worker drain refuses it),
+and the prompt is registered with the store as tend's own before it is typed,
+forgotten again if its Enter did not land. The hook that reports it is then
+attributed to tend (`origin: tend` in the prompt history), and the report
+says whether the prompt hook that came back was that registered prompt
+(`receipt: true`, "tend's receipt") or another one of the conversation
+(`receipt: false`; it still counts as `prompt_hook`). `receipt` is absent
+when nothing could be registered: no daemon, or not exactly one agent row on
+the pane.
+
 Each planned follow-up names why the agent is due one — `rate_limited`, then
 `cut_off`, then `always`, the first that applies — in the dry-run note and as
 `continue_reason` in `--json`. It records eligibility when the plan is made,

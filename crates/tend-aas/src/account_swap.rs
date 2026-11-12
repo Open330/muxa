@@ -1400,6 +1400,29 @@ pub trait TurnProbe: Send + Sync {
         conversation: &str,
         endpoint: &str,
     ) -> bool;
+    /// Register `text` as the prompt tend is about to type into `pane`, the
+    /// way every guarded delivery does, so its hook is attributed to tend.
+    /// `None`: nothing could be registered (not exactly one row there).
+    fn expect_prompt(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64> {
+        let _ = (pane, socket, text);
+        None
+    }
+    /// Drop a registration whose prompt was not submitted.
+    fn forget_prompt(&self, token: u64) {
+        let _ = token;
+    }
+    /// Whether a prompt hook attributed to tend's own registration arrived
+    /// after `cursor`, from that conversation on that endpoint.
+    fn registered_prompt_after(
+        &self,
+        cursor: u64,
+        kind: AgentKind,
+        conversation: &str,
+        endpoint: &str,
+    ) -> bool {
+        let _ = (cursor, kind, conversation, endpoint);
+        false
+    }
 }
 
 /// One entry of a prepared swap, in report order: an outcome already
@@ -2049,11 +2072,15 @@ fn follow_up_report(observations: &[Observation]) -> Option<FollowUpReport> {
                     kept: *kept,
                     submission: submission.to_string(),
                     evidence: None,
+                    receipt: None,
                 });
             }
-            Observation::FollowUpEvidence { evidence, .. } => {
+            Observation::FollowUpEvidence {
+                evidence, receipt, ..
+            } => {
                 if let Some(report) = &mut report {
                     report.evidence = Some(evidence.to_string());
+                    report.receipt = *receipt;
                 }
             }
             _ => {}
@@ -3359,19 +3386,31 @@ fn follow_up_with_evidence(
 ) -> Option<(Submission, TurnEvidence)> {
     let io = runner.io;
     let cursor = io.prompt_cursor();
+    // Registered before typing, like every guarded delivery: the hook that
+    // reports this prompt is then tend's own receipt for it.
+    let token = io.expect_prompt(text);
     let group = runner.group();
     let _ = runner.send_prompt(group, purpose, text) && {
         io.sleep(io.submit_grace());
         runner.send_text(group, purpose, "\r")
     };
     let submission = submission_of(&runner.log(), group);
+    if let Some(token) = token.filter(|_| submission != Submission::Delivered) {
+        io.forget_prompt(token);
+    }
+    let registered = token.is_some() && submission == Submission::Delivered;
+    let mut receipt = registered.then_some(false);
     if !runner.observe(Observation::FollowUpSent { kept, submission }) {
         return None;
     }
     let started = io.now();
     let mut screen_since = None;
     let evidence = loop {
-        if cursor.is_some_and(|cursor| io.prompt_seen_after(cursor)) {
+        if let Some(cursor) = cursor.filter(|cursor| io.prompt_seen_after(*cursor)) {
+            // The same hook says whether it was the registered prompt.
+            if registered {
+                receipt = Some(io.registered_prompt_seen_after(cursor));
+            }
             break TurnEvidence::PromptHook;
         }
         let now = io.now();
@@ -3389,7 +3428,11 @@ fn follow_up_with_evidence(
         }
         io.sleep(Duration::from_millis(400));
     };
-    if !runner.observe(Observation::FollowUpEvidence { kept, evidence }) {
+    if !runner.observe(Observation::FollowUpEvidence {
+        kept,
+        evidence,
+        receipt,
+    }) {
         return None;
     }
     Some((submission, evidence))

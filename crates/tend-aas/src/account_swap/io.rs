@@ -49,6 +49,20 @@ pub(super) trait SwapIo: Clock {
     fn prompt_cursor(&self) -> Option<u64>;
     /// Whether this target's own prompt hook arrived after `cursor`.
     fn prompt_seen_after(&self, cursor: u64) -> bool;
+    /// Register the follow-up `text` with the daemon before typing it.
+    fn expect_prompt(&self, text: &str) -> Option<u64> {
+        let _ = text;
+        None
+    }
+    /// Drop a registration whose prompt was not submitted.
+    fn forget_prompt(&self, token: u64) {
+        let _ = token;
+    }
+    /// Whether the hook for the registered prompt arrived after `cursor`.
+    fn registered_prompt_seen_after(&self, cursor: u64) -> bool {
+        let _ = cursor;
+        false
+    }
     /// What is at `path` now, symlinks followed. Read-only, and never
     /// blocks: only a regular file's contents are read, and boundedly.
     fn path_facts(&self, path: &str) -> PathFacts;
@@ -313,6 +327,28 @@ impl SwapIo for LiveIo<'_> {
 
     fn prompt_cursor(&self) -> Option<u64> {
         self.probe.map(super::TurnProbe::cursor)
+    }
+
+    fn expect_prompt(&self, text: &str) -> Option<u64> {
+        self.probe?
+            .expect_prompt(&self.target.pane, self.target.socket.as_deref(), text)
+    }
+
+    fn forget_prompt(&self, token: u64) {
+        if let Some(probe) = self.probe {
+            probe.forget_prompt(token);
+        }
+    }
+
+    fn registered_prompt_seen_after(&self, cursor: u64) -> bool {
+        self.probe.is_some_and(|probe| {
+            probe.registered_prompt_after(
+                cursor,
+                self.target.kind,
+                &self.target.session_id,
+                &super::endpoint_key(&self.target.pane, self.target.socket.as_deref()),
+            )
+        })
     }
 
     fn prompt_seen_after(&self, cursor: u64) -> bool {
