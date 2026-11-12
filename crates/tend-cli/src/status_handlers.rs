@@ -512,8 +512,8 @@ pub(super) fn pane_inventory_lines(all: &[tend::tmux::PaneInfo]) -> Vec<String> 
 
 /// The empty-state diagnostic for a host that reported no panes. Two ways
 /// to get here: the host really has no panes, or the backend's `caps()`
-/// says metadata is plugin-only and not pushed yet — the zellij branch
-/// differentiates so a misconfigured plugin is diagnosable.
+/// has no pane inventory at all — the zellij branch says so rather than
+/// suggesting the server is down.
 pub(super) fn empty_pane_hint(backend: &dyn tend::PaneBackend) -> &'static str {
     match backend.kind() {
         tend::HostKind::Tmux => "(no tmux panes — server may be down)",
@@ -522,12 +522,10 @@ pub(super) fn empty_pane_hint(backend: &dyn tend::PaneBackend) -> &'static str {
         }
         tend::HostKind::Rmux => "(no rmux panes — server may be down or endpoint unreachable)",
         tend::HostKind::Zellij if !backend.caps().current_command => {
-            "(zellij CLI baseline: pane inventory is plugin-only — install the tend zellij plugin to populate)"
+            "(zellij CLI baseline: no pane inventory — only hooked agent panes are visible)"
         }
         tend::HostKind::Zellij => "(no zellij panes)",
-        tend::HostKind::Herdr => {
-            "(no herdr panes — server may be down or socket unreachable)"
-        }
+        tend::HostKind::Herdr => "(no herdr panes — server may be down or socket unreachable)",
     }
 }
 

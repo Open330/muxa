@@ -383,7 +383,7 @@ pub enum HostKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendCaps {
     /// Whether `list_panes()`'s `PaneInfo.current_command` is populated.
-    /// Zellij CLI returns the field empty until the WASM plugin lands;
+    /// The zellij CLI baseline has no pane inventory, so it is empty there;
     /// discovery falls back to "trust the stdin hook" when this is
     /// false instead of trying to classify panes by command.
     pub current_command: bool,
@@ -609,10 +609,9 @@ pub trait PaneBackend: Send + Sync + 'static {
     }
 
     /// Ingest a wholesale pane snapshot pushed by an out-of-process
-    /// source — today the zellij WASM plugin, which forwards zellij
-    /// `PaneUpdate` events to the daemon over the `BackendPaneSnapshot`
-    /// IPC command (see [`docs/proposals/ZELLIJ.md`](../../../../docs/proposals/ZELLIJ.md)
-    /// Step 2). Default no-op: backends that enumerate panes themselves
+    /// source over the `BackendPaneSnapshot` IPC command. Designed for a
+    /// zellij WASM plugin that never shipped (the stub crate was removed);
+    /// no in-tree sender exists today. Default no-op: backends that enumerate panes themselves
     /// (tmux) ignore external pushes; the zellij backend overrides this
     /// to replace its cached snapshot.
     fn ingest_pane_snapshot(&self, _panes: Vec<PaneInfo>) {}
