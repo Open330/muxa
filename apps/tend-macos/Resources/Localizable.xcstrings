@@ -23562,6 +23562,36 @@
           }
         }
       }
+    },
+    "Could not read the decision history: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정 기록을 읽지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "The history could not be read. Check again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록을 읽지 못했습니다. 다시 확인하세요."
+          }
+        }
+      }
+    },
+    "Reading the history…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록을 읽는 중…"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

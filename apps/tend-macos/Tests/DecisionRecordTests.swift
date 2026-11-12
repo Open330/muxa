@@ -19,6 +19,7 @@ private final class RecordingDaemon: @unchecked Sendable {
     var capabilities = ["session_bytes_v1", "session_attachment_identity_v1", "work_control_v1",
                         "review_items_v1", "review_record_v1", "decision_queue_v1"]
     var refuseRecords = false
+    var failHistory = false
     /// Older records already in the store, oldest first.
     var preloaded: [(key: String, at: String)] = []
     private(set) var pagesRead = 0
@@ -58,6 +59,8 @@ private final class RecordingDaemon: @unchecked Sendable {
             ])
         case "decision_queue":
             return try JSONSerialization.data(withJSONObject: ["ok": true, "decision_queue": ["items": []]])
+        case "decision_history" where failHistory:
+            return try JSONSerialization.data(withJSONObject: ["ok": false, "error": "history store locked"])
         case "decision_history":
             let items: [[String: Any]] = recorded.enumerated().map { index, request in
                 let review = request["review"] as? [String: Any] ?? [:]
@@ -146,6 +149,29 @@ private final class RecordingDaemon: @unchecked Sendable {
         #expect(rows[3].said == "Needs a test")
         #expect(rows[3].context?.contains("impl") == true)
         #expect(rows.allSatisfy { $0.at != nil })
+    }
+
+    @MainActor
+    @Test func aFailedHistoryReadSaysSoAndAnOlderDaemonHasNone() async throws {
+        let daemon = RecordingDaemon()
+        daemon.failHistory = true
+        let client = daemon.client()
+        try await client.hello()
+        let feed = FleetDecisionFeed()
+        await feed.loadHistory(client, force: true)
+        #expect(feed.history == nil && !feed.historyUnsupported)
+        #expect(feed.historyError?.contains("history store locked") == true)
+        daemon.failHistory = false
+        await feed.loadHistory(client, force: true)
+        #expect(feed.history != nil && feed.historyError == nil)
+
+        let older = RecordingDaemon()
+        older.capabilities.removeAll { $0 == "decision_queue_v1" }
+        let oldClient = older.client()
+        try await oldClient.hello()
+        let oldFeed = FleetDecisionFeed()
+        await oldFeed.loadHistory(oldClient, force: true)
+        #expect(oldFeed.historyUnsupported)
     }
 
     @Test func recordedKeysDecideWhatHomeHides() throws {

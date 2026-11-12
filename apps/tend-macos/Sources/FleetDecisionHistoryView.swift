@@ -99,27 +99,40 @@ struct FleetDecisionHistoryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let history = feed.history {
-                HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                if feed.history != nil {
                     TextField("Filter", text: $filter)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 260)
-                    if history.truncated {
-                        Text("Showing the latest \(history.items.count)")
-                            .font(TendType.meta)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        Task { await reload() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.tendGhost)
-                    .help("Check again")
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 10)
+                if let history = feed.history, history.truncated {
+                    Text("Showing the latest \(history.items.count)")
+                        .font(TendType.meta)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if feed.historyLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button {
+                    Task { await reload() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.tendGhost)
+                .disabled(feed.historyLoading)
+                .help("Check again")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            if let error = feed.historyError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(TendType.meta)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 6)
+            }
+            if let history = feed.history {
                 if !history.unavailable.isEmpty {
                     Label(String(localized: "Some decisions could not be read: \(history.unavailable.joined(separator: "; "))"),
                           systemImage: "exclamationmark.circle")
@@ -141,8 +154,12 @@ struct FleetDecisionHistoryView: View {
                         .padding(.vertical, 4)
                     }
                 }
-            } else {
+            } else if feed.historyUnsupported {
                 empty(String(localized: "This tendd keeps no decision history. Update tend to record decisions."))
+            } else if feed.historyError != nil {
+                empty(String(localized: "The history could not be read. Check again."))
+            } else {
+                empty(String(localized: "Reading the history…"))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
