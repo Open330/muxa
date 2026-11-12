@@ -216,6 +216,26 @@ private final class RecordingDaemon: @unchecked Sendable {
         #expect(daemon.pagesRead == 3)
     }
 
+    /// More newer records than one read takes: nothing is unhidden, and the
+    /// next read goes on where this one stopped until it finds the review.
+    @MainActor
+    @Test func aReadThatRunsOutOfPagesGoesOnNextTime() async throws {
+        let daemon = RecordingDaemon()
+        let work = try finished("a", at: "2026-11-08T01:00:00Z")
+        daemon.preloaded = [(FleetBoard.reviewKey(work), "2026-11-08T02:00:00Z")]
+            + (0..<5_001).map { ("home:other\($0)", "2026-11-10T00:00:00Z") }
+        let client = daemon.client()
+        try await client.hello()
+        let feed = FleetDecisionFeed()
+        await feed.loadReviewed(client, works: [work], force: true)
+        #expect(!feed.reviewedIsComplete)
+        #expect(daemon.pagesRead == FleetDecisionRecord.maxReviewPages)
+        await feed.loadReviewed(client, works: [work], force: true)
+        #expect(feed.reviewedIsComplete)
+        #expect(feed.reviewedKeys?.contains(FleetBoard.reviewKey(work)) == true)
+        #expect(feed.reviewedKeys?.contains("home:other0") == true, "what the first read found is kept")
+    }
+
     @MainActor
     @Test func aMigrationTheDaemonDidNotRecordIsNotDone() async throws {
         let daemon = RecordingDaemon()

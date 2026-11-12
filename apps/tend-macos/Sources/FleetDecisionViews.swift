@@ -35,6 +35,9 @@ final class FleetDecisionFeed: ObservableObject {
     /// Bumped by every read of the review records and every record, so a
     /// read that started earlier never overwrites a later answer.
     var reviewedGeneration = 0
+    /// Where an unfinished read of the review records stopped, and what it
+    /// found so far.
+    private var scan: (offset: Int, keys: Set<String>)?
     static let historyEvery: TimeInterval = 30
     private var loading = false
 
@@ -96,16 +99,20 @@ final class FleetDecisionFeed: ObservableObject {
         reviewedGeneration += 1
         let generation = reviewedGeneration
         let cutoff = FleetDecisionRecord.cutoff(for: works)
-        var recorded = Set<String>()
-        var offset = 0
+        // A scan that ran out of pages last time goes on where it stopped:
+        // newer records only push older ones further down, so nothing is
+        // skipped, at worst read twice.
+        var recorded = scan?.keys ?? []
+        var offset = scan?.offset ?? 0
+        var complete = false
         do {
             for _ in 0..<FleetDecisionRecord.maxReviewPages {
                 let page = try await client.reviewPage(offset: offset, limit: FleetDecisionRecord.reviewPageSize)
                 recorded.formUnion(FleetDecisionRecord.reviewedKeys(in: page.items))
                 offset += page.items.count
                 let oldest = page.items.last?.requestedAt.flatMap(TendUsageTimestamp.parse)
-                if !page.hasMore || page.items.isEmpty { break }
-                if let cutoff, let oldest, oldest < cutoff { break }
+                if !page.hasMore || page.items.isEmpty { complete = true; break }
+                if let cutoff, let oldest, oldest < cutoff { complete = true; break }
             }
         } catch {
             TendLog.app.warning("reading review records failed: \(error.localizedDescription, privacy: .public)")
@@ -113,9 +120,24 @@ final class FleetDecisionFeed: ObservableObject {
         }
         guard generation == reviewedGeneration else { return }
         pendingKeys.subtract(recorded)
-        let keys = recorded.union(pendingKeys)
+        let keys: Set<String>
+        if complete {
+            scan = nil
+            keys = recorded.union(pendingKeys)
+        } else {
+            // Unread records may still hold a review: what is known stays
+            // hidden, and nothing is unhidden until the scan completes.
+            scan = (offset, recorded)
+            // Go on at the next refresh (seconds away), not in 30 s.
+            lastReviewedLoad = .distantPast
+            keys = recorded.union(pendingKeys).union(reviewedKeys ?? [])
+        }
         if reviewedKeys != keys { reviewedKeys = keys }
     }
+
+    /// Whether the last read of the review records reached every one that
+    /// could matter.
+    var reviewedIsComplete: Bool { scan == nil }
 
     /// Looks Good, recorded by tendd. Hidden at once; shown again with the
     /// reason if the record fails.
