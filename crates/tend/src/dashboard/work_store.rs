@@ -373,6 +373,28 @@ mod tests {
             .upsert_external_item(id.clone(), pane.clone())
             .await
             .unwrap();
+        // The tracker agrees with the pane: the answer is still recorded as
+        // a tracker read, and a stale pane copy cannot replace it.
+        let same = ExternalItemRef {
+            fetched_at: Some(now),
+            ..pane.clone()
+        };
+        let record = store
+            .upsert_external_item(id.clone(), same.clone())
+            .await
+            .unwrap();
+        assert_eq!(record.external_items[0].fetched_at, Some(now));
+        let record = store
+            .upsert_external_item(
+                id.clone(),
+                ExternalItemRef {
+                    title: Some("stale title from another pane".into()),
+                    ..pane.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.external_items, vec![same]);
         let fetched = ExternalItemRef {
             scope: Some("open330/TEND".into()),
             title: Some("new title".into()),
