@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.8] - 2026-11-12
+
 ### Fixed
 
 - A Claude turn's last response is the text the `Stop` hook carries, not the
@@ -16,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still asking, with that sentence as the question. The transcript still
   decides a rate limit and fills in for Claude Code builds that don't send
   the text.
+- tend builds on Windows again. It had not compiled there for several releases
+  (the IPC client, the listener scan and Linux-only helpers). On Windows,
+  `tend servers` reports listening servers as unavailable for now.
 
 ## [0.10.7] - 2026-11-11
 
