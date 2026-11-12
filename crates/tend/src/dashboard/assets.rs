@@ -94,10 +94,15 @@ pub(super) fn serve_page(path: &str) -> Response {
     };
     let html = String::from_utf8_lossy(&file.data)
         .replace("/static/", &format!("/static/v/{}/", asset_build_id()));
+    // Every page holds controls (prompts, decisions), so none may be framed
+    // by another site: a frame could trick a signed-in operator into a
+    // click that carries the page's own Origin and header.
     (
         [
             (header::CONTENT_TYPE, mime_for(path)),
             (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         html,
     )

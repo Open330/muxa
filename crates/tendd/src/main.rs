@@ -582,6 +582,8 @@ async fn run() -> Result<()> {
             work_store_path: paths::default_dashboard_work_file(),
             work_store: Some(work_store.clone()),
             reviews: Some(reviews.clone()),
+            decision_audit_path: paths::data_dir()
+                .map(|dir| dir.join("tend").join("dashboard-decisions.jsonl")),
             stats_config: dashboard_stats_config,
             fleet: Some(fleet_runtime.clone()),
         };

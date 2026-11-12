@@ -1888,6 +1888,8 @@ async fn rule_viewer_reads_cannot_write_and_is_revoked_with_its_rule() {
         ("POST", "/api/terminal-sessions/x/input"),
         ("GET", "/api/decisions"),
         ("GET", "/api/decisions/history"),
+        ("POST", "/api/decisions/reviews/rv_x"),
+        ("POST", "/api/decisions/requests/rq_x"),
     ] {
         for proof in [false, true] {
             let response = call(
@@ -2327,4 +2329,252 @@ async fn collaboration_details_accept_operator_sessions_but_redact_for_viewers()
             assert_eq!(body["details_included"], expected);
         }
     }
+}
+
+/// A review item and a human request to decide, on stores shared with the
+/// dashboard state.
+async fn decision_state() -> (AppState, String, String, String) {
+    use crate::collaboration::{
+        CollaborationOptions, CollaborationStore, HumanAction, NewRequest, Participant,
+    };
+    use crate::review::{ActorKind, NewReview, ReviewActor, ReviewStore, ReviewTarget};
+    let reviews = ReviewStore::in_memory();
+    let item = reviews
+        .create(NewReview {
+            target: ReviewTarget::Session {
+                provider: None,
+                session_id: "s".into(),
+            },
+            summary: "check the migration".into(),
+            anchor: None,
+            idempotency_key: None,
+            requested_by: ReviewActor {
+                kind: ActorKind::Agent,
+                label: None,
+            },
+            decision: Some(crate::decision::Decision {
+                options: vec!["ship".into(), "hold".into()],
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+    let agent: Participant = serde_json::from_value(json!({
+        "agent_kind": "codex", "agent_session_id": "agent", "pane": "%1",
+        "room": {"host": "tmux", "socket": "default", "window_id": "@1"},
+        "state": "idle", "launch_purpose": "worker"
+    }))
+    .unwrap();
+    let peer: Participant = serde_json::from_value(json!({
+        "agent_kind": "codex", "agent_session_id": "peer", "pane": "%2",
+        "room": {"host": "tmux", "socket": "default", "window_id": "@1"},
+        "state": "idle", "launch_purpose": "worker"
+    }))
+    .unwrap();
+    let question = collaboration
+        .create(
+            agent.clone(),
+            Participant::console(agent.room.clone()),
+            NewRequest {
+                body: "Merge?".into(),
+                human_action: Some(HumanAction::Choice),
+                ..NewRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let between_agents = collaboration
+        .create(
+            agent,
+            peer,
+            NewRequest {
+                body: "review this".into(),
+                ..NewRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let state = state("https://issuer.example.com")
+        .with_reviews(reviews)
+        .with_collaboration(collaboration);
+    (state, item.id, question.id, between_agents.id)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // every refused and accepted credential shape on one fixture
+async fn deciding_from_the_web_needs_an_operator_and_csrf_proof() {
+    let (state, review, question, _) = decision_state().await;
+    let review_uri = format!("/api/decisions/reviews/{review}");
+    let answer_uri = format!("/api/decisions/requests/{question}");
+    let accept = || json!({ "disposition": "accepted" });
+    let answer = || json!({ "answer": "yes" });
+    // Anonymous: 401. A viewer, with or without the proof: 403.
+    for (uri, body) in [(&review_uri, accept()), (&answer_uri, answer())] {
+        let response = call(
+            &state,
+            "POST",
+            uri,
+            Req {
+                body: Some(body.clone()),
+                ..Req::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let owner = session(&state);
+    // An operator cookie without the full CSRF proof is refused: a
+    // cross-site form can attach the cookie but not both headers.
+    for (origin, operator_header) in [
+        (None, true),
+        (Some(PUBLIC), false),
+        (Some("https://evil.example.com"), true),
+    ] {
+        for (uri, body) in [(&review_uri, accept()), (&answer_uri, answer())] {
+            let response = call(
+                &state,
+                "POST",
+                uri,
+                Req {
+                    cookie: Some(&owner),
+                    origin,
+                    operator_header,
+                    body: Some(body.clone()),
+                    ..Req::default()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri} {origin:?}");
+        }
+    }
+    // Nothing changed so far.
+    assert!(state.reviews.get(review.clone()).await.unwrap().is_open());
+    // The operator with the proof decides; the record names them.
+    let response = call(
+        &state,
+        "POST",
+        &review_uri,
+        Req {
+            body: Some(json!({"disposition": "accepted", "option": "ship"})),
+            ..csrf_req(&owner)
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let decided = state.reviews.get(review.clone()).await.unwrap();
+    let disposition = decided.disposition.unwrap();
+    assert_eq!(
+        disposition.by.label.as_deref(),
+        Some("web:owner@example.com")
+    );
+    assert_eq!(disposition.note.as_deref(), Some("chose: ship"));
+    // A replay of the same decision changes nothing; another is refused.
+    let replay = call(
+        &state,
+        "POST",
+        &review_uri,
+        Req {
+            body: Some(json!({"disposition": "accepted", "option": "ship"})),
+            ..csrf_req(&owner)
+        },
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let other = call(
+        &state,
+        "POST",
+        &review_uri,
+        Req {
+            body: Some(json!({"disposition": "returned", "note": "no"})),
+            ..bearer_req()
+        },
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::CONFLICT);
+    let response = call(
+        &state,
+        "POST",
+        &answer_uri,
+        Req {
+            body: Some(answer()),
+            ..bearer_req()
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let again = call(
+        &state,
+        "POST",
+        &answer_uri,
+        Req {
+            body: Some(json!({"answer": "no"})),
+            ..bearer_req()
+        },
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn the_web_answers_only_the_console_and_offered_options() {
+    let (state, review, _, between_agents) = decision_state().await;
+    // A request between two agents is not the operator's to answer.
+    let response = call(
+        &state,
+        "POST",
+        &format!("/api/decisions/requests/{between_agents}"),
+        Req {
+            body: Some(json!({"answer": "approved"})),
+            ..bearer_req()
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // An option the item did not offer, an unknown field, an unknown id.
+    let uri = format!("/api/decisions/reviews/{review}");
+    for body in [
+        json!({"disposition": "accepted", "option": "ship it anyway"}),
+        json!({"disposition": "accepted", "by": "someone else"}),
+    ] {
+        let status = call(
+            &state,
+            "POST",
+            &uri,
+            Req {
+                body: Some(body.clone()),
+                ..bearer_req()
+            },
+        )
+        .await
+        .status();
+        assert!(status.is_client_error(), "{body}: {status}");
+    }
+    assert!(state.reviews.get(review).await.unwrap().is_open());
+    let missing = call(
+        &state,
+        "POST",
+        "/api/decisions/reviews/rv_missing",
+        Req {
+            body: Some(json!({"disposition": "accepted"})),
+            ..bearer_req()
+        },
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    // A viewer cannot decide, whatever it sends.
+    let response = call(
+        &state,
+        "POST",
+        "/api/decisions/requests/x",
+        Req {
+            cookie: Some("__Host-tend-op=not-a-session"),
+            origin: Some(PUBLIC),
+            operator_header: true,
+            body: Some(json!({"answer": "x"})),
+            ..Req::default()
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

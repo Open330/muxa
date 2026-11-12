@@ -30,3 +30,10 @@ main { padding: 0 1rem 2rem; max-width: 46rem; margin: 0 auto; }
 .status, #status { color: var(--muted); }
 .login { display: inline-block; margin: 1rem 0; color: var(--accent); }
 .covers { color: var(--muted); font-size: .85rem; margin-top: 1rem; }
+.actions { display: grid; gap: .5rem; margin-top: .75rem; }
+.actions .choices { display: flex; flex-wrap: wrap; gap: .4rem; }
+.actions button { padding: .6rem .8rem; border-radius: .5rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; min-height: 2.75rem; }
+.actions button.primary { border-color: var(--accent); }
+.actions button:disabled { opacity: .5; }
+.actions .note { width: 100%; padding: .5rem; border-radius: .5rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; }
+.actions .result { margin: 0; color: var(--muted); }

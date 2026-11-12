@@ -22,6 +22,20 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+/// A state change: the operator's credential plus the header the server
+/// requires before a session cookie may change anything.
+async function write(path, body) {
+  const resp = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Tend-Operator": "1", ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  const payload = await resp.json().catch(() => null);
+  if (!resp.ok) throw new Error(payload?.error || `${resp.status}`);
+  return payload;
+}
+
 async function read(path) {
   const resp = await fetch(path, { credentials: "same-origin", headers: authHeaders() });
   if (resp.status === 401 || resp.status === 403) {
@@ -78,7 +92,85 @@ function renderCard(card) {
     li.append(link);
   }
   if (card.outcome) li.append(el("p", "outcome", card.outcome));
+  if (state.tab === "queue") li.append(actions(card));
   return li;
+}
+
+function button(label, onClick, className) {
+  const node = el("button", className || null, label);
+  node.type = "button";
+  node.addEventListener("click", onClick);
+  return node;
+}
+
+/// What the person can do from the card: answer a question (an option
+/// fills the answer), or accept / send back / withdraw a result.
+function actions(card) {
+  const box = el("form", "actions");
+  box.addEventListener("submit", (event) => event.preventDefault());
+  const note = el("textarea", "note");
+  note.rows = 2;
+  note.maxLength = card.kind === "ask" ? 16384 : 1024;
+  const message = el("p", "result");
+  message.setAttribute("role", "status");
+  const busy = (on) => box.querySelectorAll("button").forEach((b) => (b.disabled = on));
+  const send = async (path, body, done) => {
+    busy(true);
+    message.textContent = "Sending…";
+    try {
+      await write(path, body);
+      message.textContent = done;
+      setTimeout(refresh, 800);
+    } catch (error) {
+      message.textContent = `Not recorded: ${error.message}`;
+      busy(false);
+    }
+  };
+  if (card.kind === "ask") {
+    note.placeholder = "Your answer";
+    const options = el("div", "choices");
+    for (const option of card.options) options.append(button(option, () => (note.value = option)));
+    if (card.options.length) box.append(options);
+    box.append(note);
+    const path = `/api/decisions/requests/${encodeURIComponent(card.id)}`;
+    box.append(
+      button("Send answer", () => {
+        if (!note.value.trim()) return (message.textContent = "Write an answer first.");
+        send(path, { answer: note.value }, "Answered.");
+      }, "primary"),
+      button("Decline", () => {
+        if (!note.value.trim()) return (message.textContent = "Say why you decline.");
+        send(path, { answer: note.value, declined: true }, "Declined.");
+      }),
+    );
+  } else if (card.kind === "review") {
+    note.placeholder = "Note (needed to send back)";
+    const path = `/api/decisions/reviews/${encodeURIComponent(card.id)}`;
+    const decide = (disposition, option, done) => {
+      const body = { disposition };
+      if (note.value.trim()) body.note = note.value;
+      if (option) body.option = option;
+      send(path, body, done);
+    };
+    const options = el("div", "choices");
+    for (const option of card.options) {
+      options.append(button(option, () => decide("accepted", option, `Accepted: ${option}.`)));
+    }
+    if (card.options.length) box.append(options);
+    box.append(
+      note,
+      button("Looks good", () => decide("accepted", null, "Accepted."), "primary"),
+      button("Send back", () => {
+        if (!note.value.trim()) return (message.textContent = "Say what to change.");
+        decide("returned", null, "Sent back.");
+      }),
+      button("Withdraw", () => decide("withdrawn", null, "Withdrawn.")),
+    );
+  } else {
+    return el("span");
+  }
+  box.append(message);
+  return box;
 }
 
 function renderList(list, cards, empty) {
@@ -150,9 +242,15 @@ function select(tab) {
 $("tab-queue").addEventListener("click", () => select("queue"));
 $("tab-history").addEventListener("click", () => select("history"));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
+  if (!document.hidden && !composing()) refresh();
 });
+/// A refresh rebuilds the cards; never under a half-written answer.
+function composing() {
+  return Boolean(document.activeElement?.closest?.(".actions"))
+    || [...document.querySelectorAll(".actions .note")].some((note) => note.value.trim());
+}
+
 state.timer = setInterval(() => {
-  if (!document.hidden) refresh();
+  if (!document.hidden && !composing()) refresh();
 }, REFRESH_MS);
 refresh();
