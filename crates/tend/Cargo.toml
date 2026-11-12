@@ -21,6 +21,9 @@ dashboard = [
 ]
 
 [dependencies]
+# `O_NONBLOCK`/`O_NOFOLLOW` for reading a file another process holds open
+# without waiting on a FIFO at its name (constants only; no unsafe code).
+libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
