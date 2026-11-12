@@ -159,8 +159,14 @@ fn lock_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Hold the spool's exclusive lock until the returned file is dropped.
-fn lock(path: &Path) -> std::io::Result<std::fs::File> {
+/// How long a hook waits for the spool lock before giving the event up. The
+/// hook runs on the agent's critical path; a drain or another hook holds the
+/// lock for milliseconds, so contention past this means something is stuck.
+pub const APPEND_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Hold the spool's exclusive lock until the returned file is dropped,
+/// waiting at most `budget` (`None`: as long as it takes).
+fn lock(path: &Path, budget: Option<std::time::Duration>) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
@@ -172,15 +178,34 @@ fn lock(path: &Path) -> std::io::Result<std::fs::File> {
         options.mode(0o600);
     }
     let file = options.open(lock_path(path))?;
-    file.lock()?;
-    Ok(file)
+    let Some(budget) = budget else {
+        file.lock()?;
+        return Ok(file);
+    };
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "hook spool is locked",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
 }
 
 /// Append one entry. Best-effort by contract: the caller is a hook on the
 /// agent's critical path, so every failure is swallowed into the return
 /// value and never surfaced to the agent.
+/// Waits at most [`APPEND_LOCK_BUDGET`] for the lock.
 pub fn append(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
-    let _lock = lock(path)?;
+    let _lock = lock(path, Some(APPEND_LOCK_BUDGET))?;
     if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= MAX_SPOOL_BYTES) {
         let previous = rotated_path(path);
         #[cfg(windows)]
@@ -223,7 +248,7 @@ pub fn read_all(path: &Path) -> (Vec<SpoolEntry>, usize) {
 /// append in between and lose its line.
 #[must_use]
 pub fn take(path: &Path) -> (Vec<SpoolEntry>, usize) {
-    let Ok(_lock) = lock(path) else {
+    let Ok(_lock) = lock(path, None) else {
         // Without the lock a hook could write into a file being removed;
         // leave the spool for the next start.
         return (Vec::new(), 0);
@@ -414,6 +439,28 @@ mod tests {
         let (entries, unreadable) = take(&path);
         assert_eq!((entries.len(), unreadable), (32, 0));
         assert!(!path.exists() && !rotated_path(&path).exists());
+    }
+
+    #[test]
+    fn a_held_lock_bounds_the_hook_append_instead_of_stalling_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SPOOL_FILENAME);
+        let held = lock(&path, None).unwrap();
+        let started = std::time::Instant::now();
+        let error = append(
+            &path,
+            &entry("a", OffsetDateTime::now_utc(), IngestFailure::Timeout),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < APPEND_LOCK_BUDGET * 4);
+        drop(held);
+        append(
+            &path,
+            &entry("a", OffsetDateTime::now_utc(), IngestFailure::Timeout),
+        )
+        .unwrap();
+        assert_eq!(read_all(&path).0.len(), 1);
     }
 
     #[test]
