@@ -718,9 +718,10 @@ fn health_verdicts(health: &tend::collaboration::CollaborationHealth) -> Vec<Che
     results
 }
 
-/// One informational line per week of agent requests that expected a reply:
-/// how many were answered, expired, or interrupted as `reply_overdue` /
-/// `wake_unsubmitted`. Evidence for delivery defaults, never a failure.
+/// One informational line per rolling week of agent requests that expected a
+/// reply: how they ended, and the latest recorded interruption reason
+/// (`reply_overdue` / `wake_unsubmitted`). A descriptive baseline, never a
+/// failure and not by itself a decision for delivery defaults.
 fn outcome_line(week: &tend::collaboration::WeeklyOutcome) -> CheckResult {
     let share = |count: usize| {
         if week.requests == 0 {
@@ -730,18 +731,23 @@ fn outcome_line(week: &tend::collaboration::WeeklyOutcome) -> CheckResult {
             format!("{}%", (count * 200 + week.requests) / (week.requests * 2))
         }
     };
+    let range = if week.until.is_empty() {
+        format!("since {}", week.since)
+    } else {
+        format!("created {}..{}", week.since, week.until)
+    };
     CheckResult::Ok(format!(
-        "requests since {}: {} sent, {} replied, {} expired ({}), {} reply_overdue ({}), {} wake_unsubmitted ({}), {} still open",
-        week.since,
+        "agent requests {range}: {} sent, {} replied, {} expired ({}), {} cancelled, {} open; latest recorded interruption: {} reply_overdue ({}), {} wake_unsubmitted ({})",
         week.requests,
         week.replied,
         week.expired,
         share(week.expired),
+        week.cancelled,
+        week.open,
         week.reply_overdue,
         share(week.reply_overdue),
         week.wake_unsubmitted,
         share(week.wake_unsubmitted),
-        week.open,
     ))
 }
 
@@ -1943,6 +1949,8 @@ mod tests {
                 replied: 30,
                 expired: 4,
                 open: 6,
+                cancelled: 0,
+                until: String::new(),
                 reply_overdue: 2,
                 wake_unsubmitted: 1,
                 other_interruptions: 0,
@@ -1954,9 +1962,12 @@ mod tests {
         assert!(matches!(line, CheckResult::Ok(_)));
         let text = message(line);
         assert!(
-            text.contains("since 2026-11-05: 40 sent, 30 replied, 4 expired (10%)"),
+            text.contains(
+                "since 2026-11-05: 40 sent, 30 replied, 4 expired (10%), 0 cancelled, 6 open"
+            ),
             "{text}"
         );
+        assert!(text.contains("latest recorded interruption"), "{text}");
         assert!(text.contains("2 reply_overdue (5%)"), "{text}");
         assert!(
             text.contains("1 wake_unsubmitted (2%)") || text.contains("1 wake_unsubmitted (3%)"),

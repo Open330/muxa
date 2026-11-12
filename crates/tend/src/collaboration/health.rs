@@ -75,15 +75,24 @@ pub struct CollaborationHealth {
 /// requests and notices are excluded.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeeklyOutcome {
-    /// First day of the bucket (UTC calendar date).
+    /// First day of the bucket (UTC calendar date). Buckets are rolling
+    /// 7-day spans of creation time ending now, not calendar weeks.
     pub since: String,
+    /// Day the bucket ends (exclusive), for display.
+    #[serde(default)]
+    pub until: String,
     pub requests: usize,
     /// Finished with a reply (any reported status).
     pub replied: usize,
     pub expired: usize,
-    /// Still open or cancelled, not replied.
+    /// Not finished yet.
     pub open: usize,
-    /// The latest recorded interruption reason, by reason.
+    /// Cancelled, superseded or retired without a reply.
+    #[serde(default)]
+    pub cancelled: usize,
+    /// By the latest recorded interruption reason on the request (a
+    /// snapshot, not an incident count: a later episode overwrites it, and a
+    /// request interrupted and then answered still counts).
     pub reply_overdue: usize,
     pub wake_unsubmitted: usize,
     pub other_interruptions: usize,
@@ -101,6 +110,7 @@ fn weekly_outcomes<'a>(
             since: (now - time::Duration::days(7 * (week + 1)))
                 .date()
                 .to_string(),
+            until: (now - time::Duration::days(7 * week)).date().to_string(),
             ..WeeklyOutcome::default()
         })
         .collect();
@@ -108,6 +118,7 @@ fn weekly_outcomes<'a>(
         if !request.expects_reply
             || request.kind == RequestKind::Notice
             || request.to.console
+            || request.from.console
             || request.human_action.is_some()
             || request.from.agent_session_id.starts_with("tend:")
         {
@@ -128,6 +139,8 @@ fn weekly_outcomes<'a>(
             bucket.replied += 1;
         } else if request.status == RequestStatus::Expired {
             bucket.expired += 1;
+        } else if request.status.is_terminal() {
+            bucket.cancelled += 1;
         } else {
             bucket.open += 1;
         }
@@ -417,7 +430,14 @@ mod tests {
     async fn weekly_outcomes_count_agent_requests_by_ending_and_interruption_reason() {
         let store = CollaborationStore::in_memory(CollaborationOptions::default());
         let mut ids = Vec::new();
-        for body in ["replied", "expired", "overdue", "unsubmitted", "old"] {
+        for body in [
+            "replied",
+            "expired",
+            "overdue",
+            "unsubmitted",
+            "old",
+            "cancelled",
+        ] {
             ids.push(
                 store
                     .create(
@@ -471,13 +491,27 @@ mod tests {
             requests.get_mut(&ids[3]).unwrap().interruption =
                 Some(interruption("wake_unsubmitted"));
             requests.get_mut(&ids[4]).unwrap().created_at = now - time::Duration::days(8);
+            requests.get_mut(&ids[5]).unwrap().status = RequestStatus::Cancelled;
         }
+        // A person's console request to an agent is not agent traffic.
+        store
+            .create(
+                Participant::console(participant("a").room.clone()),
+                participant("b"),
+                NewRequest {
+                    body: "from the console".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let health = store.health().await.unwrap();
         let this_week = &health.weekly_outcomes[0];
         assert_eq!(
-            this_week.requests, 4,
-            "the notice and last week's request are elsewhere"
+            this_week.requests, 5,
+            "the notice, the console request and last week's request are elsewhere"
         );
+        assert_eq!(this_week.cancelled, 1);
         assert_eq!(this_week.replied, 1);
         assert_eq!(this_week.expired, 1);
         assert_eq!(this_week.open, 2);

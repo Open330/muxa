@@ -21,15 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into. Every relaunch now exports a fresh `TEND_SWAP_LAUNCH_ID`, reported
   as the outcome's `launch_id`; a relaunched process whose environment names
   another one gets no follow-up or draft.
-- A Claude Code or Codex session that starts, resumes or compacts is told what it owes and awaits in the mailbox: requests it
-  claimed and still owes a reply to, requests queued for it, its own
+- A Claude Code or Codex session that starts, resumes or compacts is told
+  what it owes and awaits in the mailbox: requests it claimed and still owes a reply to, requests queued for it, its own
   requests waiting for replies, questions waiting for you, and replies ready
   to read. A few lines from its `SessionStart` hook; nothing is claimed or
   changed.
-
-- `tend doctor` reports how agent requests that expected a reply ended,
-  per week for the last four weeks: how many were replied to, expired, or
-  interrupted as `reply_overdue` or `wake_unsubmitted`, with shares. The
+- `tend doctor` reports how agent-to-agent requests that expected a reply
+  ended, for each of the last four rolling weeks by creation time: replied,
+  expired, cancelled, still open, and how many carry `reply_overdue` or
+  `wake_unsubmitted` as their latest recorded interruption, with shares. The
   daemon's collaboration health carries it as `weekly_outcomes`.
 
 ### Changed
