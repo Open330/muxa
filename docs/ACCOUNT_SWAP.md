@@ -22,18 +22,24 @@ accounts = true    # or false; leave it out for the automatic choice
 When `accounts` is left out, the module is on exactly when the config
 already uses accounts: an `[agent.<program>].account`, an
 `[[accounts.<provider>]]` entry, a `swap_account` rule, or a `[swap]`
-setting that differs from the default. A fresh install leaves it off, and a
-setup that swapped before the module existed keeps swapping after an
-upgrade without an edit. tendd reads the switch at start, so restart it
-after a change (`tend daemon restart`). `tend doctor` reports whether the
-module is on and why. If this host has swap jobs from before (a
-`swap-jobs.sqlite3`) while the module is off, it names the line to add.
+setting that differs from the default. A fresh install leaves it off. A
+config that already has one of those settings keeps swapping after an
+upgrade, with no edit. The automatic choice looks only at the config, not at
+past use. If you ran `tend swap` by hand with an otherwise default config
+(for example `--to same` restarts), set `accounts = true`. tendd reads the
+switch at start, so restart it after a change (`tend daemon restart`).
+`tend doctor` reports whether the module is on and why. When `accounts` is
+unset, the module is off, and this host has swap jobs from before (a
+`swap-jobs.sqlite3`), `tend doctor` names the line to add. An explicit
+`accounts = false` is reported as off on purpose.
 
 With the module off, `tend swap` and `tend_swap_account` refuse with "the
-account module is not enabled" and send nothing. Reading or cancelling an
-existing job (`--status`, `--cancel`) still works. A launch that asks for
-an account starts bare and reports why, as it does when no account backend
-is found.
+account module is not enabled" and send nothing. `--status` and `--cancel`
+are still sent. A daemon that still runs the job service answers them, but
+a daemon started with the module off never opens the job store and refuses
+them too. To read or cancel older jobs, turn the module on and restart
+tendd. A launch that asks for an account starts bare and reports why, as it
+does when no account backend is found.
 
 Release builds include the module. It is the `aas` cargo feature of
 `tend-cli` and `tendd`, on by default, so `scripts/release-local.sh`, the
