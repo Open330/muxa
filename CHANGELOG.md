@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The web dashboard's HTTP server (axum, the embedded web assets, the
+  router and its handlers) is now behind a `dashboard` cargo feature of the
+  `tend` library, which only `tendd` enables. `cargo build -p tend-cli` and
+  `cargo install --path crates/tend-cli` no longer compile axum, rust-embed
+  or the server. The dashboard itself is unchanged.
+
 ### Added
 
 - Review items and human requests can carry a structured decision: what

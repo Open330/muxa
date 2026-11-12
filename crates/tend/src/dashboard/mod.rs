@@ -20,10 +20,20 @@
 //! - [`auth`] — header-level bearer-token check (framework-agnostic).
 //! - [`server`] — the `axum::Router`, handlers, and [`serve`] entrypoint.
 
+// The HTTP server (`assets`, `auth`, `server`, `pane_stream`) is compiled
+// only with the `dashboard` cargo feature, which `tendd` enables. The `tend`
+// CLI builds without it: it needs the config schema, the Work records and
+// the pane inventory, not axum and the embedded web assets.
+
+#[cfg(feature = "dashboard")]
 pub mod assets;
+#[cfg(feature = "dashboard")]
 pub mod auth;
 pub mod config;
+pub mod pane_scan;
+#[cfg(feature = "dashboard")]
 mod pane_stream;
+#[cfg(feature = "dashboard")]
 pub mod server;
 /// Durable operator annotations for work items. Public so read-only
 /// consumers (the CLI's `work list`/`work show`) can show the stage the
@@ -31,7 +41,9 @@ pub mod server;
 pub mod work_store;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
-pub use server::{multi_host_pane_scan, router, serve, AppState, DashboardRuntimeConfig};
+pub use pane_scan::multi_host_pane_scan;
+#[cfg(feature = "dashboard")]
+pub use server::{router, serve, AppState, DashboardRuntimeConfig};
 
 /// Read the durable Work records without constructing the HTTP dashboard.
 /// CLI surfaces use this together with [`crate::work::build_snapshot`] so the
