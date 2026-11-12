@@ -155,7 +155,7 @@ pub(crate) fn route(name: &str, args: Value) -> Result<Routed, String> {
         "tend_status" => route_status(args),
         "tend_send_prompt" if remote_host(&args).is_some() => route_fleet_prompt(&args),
         "tend_start_work" if args.get("commit").is_some() => route_dispatch(&args),
-        "tend_call_peer" => Ok(route_call_peer(args)),
+        "tend_call_peer" => route_call_peer(args),
         "tend_inbox" => route_inbox(args),
         "tend_update_request" => route_update(args),
         "tend_agent_search" if args.get("event_id").is_some() => Ok(routed(
@@ -328,34 +328,58 @@ fn route_status(mut args: Value) -> Result<Routed, String> {
 /// - otherwise the colleague route that selects or creates a worker.
 ///
 /// It no longer waits by default: the reply arrives as a wake.
-fn route_call_peer(mut args: Value) -> Routed {
-    let object = args.as_object_mut().expect("tool arguments are an object");
-    object.entry("wait").or_insert(json!(false));
+fn route_call_peer(mut args: Value) -> Result<Routed, String> {
+    if !args.is_object() {
+        return Err("tend_call_peer arguments must be an object".into());
+    }
+    for key in ["exact", "wait", "execute", "expects_reply", "notify"] {
+        if args.get(key).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("`{key}` must be a boolean"));
+        }
+    }
+    let flag = |key: &str| args.get(key).and_then(Value::as_bool);
+    let intent = args
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("review");
+    let notice = intent == "notice";
+    let exact = flag("exact").unwrap_or(false) || notice;
+    // The same request contract on every route.
+    if flag("execute") == Some(true) && intent != "task" {
+        return Err("execute=true needs intent=task; nothing was sent".into());
+    }
     if remote_host(&args).is_some() {
+        if exact {
+            return Err("exact delivery and notices go to a local target; a Fleet host takes one exact pane with review, question or task".into());
+        }
+        if flag("expects_reply") == Some(false) {
+            return Err("expects_reply=false needs exact=true or intent=notice (local)".into());
+        }
         if args.get("pane").is_none() {
             if let Some(target) = args.get("target").cloned() {
                 args["pane"] = target;
             }
         }
-        if let Some(object) = args.as_object_mut() {
-            object.remove("target");
-            object.remove("exact");
-        }
-        return Routed {
+        let object = args.as_object_mut().expect("checked above");
+        object.remove("target");
+        object.remove("exact");
+        object.entry("wait").or_insert(json!(false));
+        return Ok(Routed {
             name: "tend_fleet_call_peer".into(),
             args,
             replaced_by: None,
-        };
+        });
     }
-    let notice = args.get("intent").and_then(Value::as_str) == Some("notice");
-    let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
-    if notice || exact {
+    if exact {
+        if flag("wait") == Some(true) {
+            return Err("wait=true is not supported with exact delivery; wait with tend_wait(id) after sending".into());
+        }
         let mut out = args.as_object().cloned().unwrap_or_default();
         out.remove("exact");
         out.remove("wait");
         out.remove("timeout_secs");
-        let kind = out.remove("intent").unwrap_or(json!("review"));
-        out.insert("kind".into(), kind);
+        out.remove("intent");
+        out.insert("kind".into(), json!(intent));
         let execute = out
             .remove("execute")
             .and_then(|value| value.as_bool())
@@ -365,8 +389,6 @@ fn route_call_peer(mut args: Value) -> Routed {
             json!(if execute { "execute" } else { "read_only" }),
         );
         for spawn_only in [
-            "skill",
-            "context",
             "spawn_if_missing",
             "context_bound",
             "spawn_agent",
@@ -374,21 +396,31 @@ fn route_call_peer(mut args: Value) -> Routed {
         ] {
             out.remove(spawn_only);
         }
-        return Routed {
+        // skill/body/context are composed exactly as tend_call_peer does
+        // (it needs the configured message skills; see `call_tool`).
+        out.insert(COMPOSE.into(), json!(true));
+        return Ok(Routed {
             name: "tend_send_message".into(),
             args: Value::Object(out),
             replaced_by: None,
-        };
+        });
     }
-    if let Some(object) = args.as_object_mut() {
-        object.remove("exact");
+    if flag("expects_reply") == Some(false) {
+        return Err("expects_reply=false needs exact=true or intent=notice".into());
     }
-    Routed {
+    let object = args.as_object_mut().expect("checked above");
+    object.remove("exact");
+    object.entry("wait").or_insert(json!(false));
+    Ok(Routed {
         name: "tend_call_peer".into(),
         args,
         replaced_by: None,
-    }
+    })
 }
+
+/// Internal marker: compose `skill`/`body`/`context` into `body` before the
+/// exact-delivery handler runs.
+pub(crate) const COMPOSE: &str = "__compose_body";
 
 /// `tend_inbox`: claim incoming work (default), or read history without
 /// claiming (`view=incoming|sent|all`), or the newest peer reply
@@ -461,6 +493,9 @@ fn route_update(mut args: Value) -> Result<Routed, String> {
                 replaced_by: None,
             })
         }
+        action @ ("cancel" | "withdraw_wake") if remote_or_remembered(&args) => Err(format!(
+            "{action} on a Fleet request is not supported yet; nothing was changed (host=local acts on this daemon)"
+        )),
         "cancel" => Ok(routed("tend_cancel_message", copy(&args, &["request_id"]))),
         "withdraw_wake" => {
             let mut out = copy(&args, &["request_ids"]);
@@ -475,6 +510,27 @@ fn route_update(mut args: Value) -> Result<Routed, String> {
             "unknown update action {other:?}; use update (default), cancel or withdraw_wake"
         )),
     }
+}
+
+/// The request lives on a Fleet host: named by `host`, or remembered from a
+/// send by this process when `host` is omitted.
+fn remote_or_remembered(args: &Value) -> bool {
+    if remote_host(args).is_some() {
+        return true;
+    }
+    if args.get("host").is_some() {
+        return false;
+    }
+    let ids = args
+        .get("request_ids")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    args.get("request_id")
+        .and_then(Value::as_str)
+        .into_iter()
+        .chain(ids)
+        .any(|id| fleet_handle(id).is_some())
 }
 
 /// Ids the daemon stamps from the caller's pane. Still accepted, not
@@ -513,13 +569,13 @@ fn schema_extension(name: &str) -> Option<(Value, &'static str)> {
         json!({
             "intent": {"type": "string", "enum": ["review", "question", "task", "notice"], "description": "Default review. notice is one-way, delivered exactly to target."},
             "exact": {"type": "boolean", "description": "Deliver to exactly target (queued on a protected primary) instead of selecting or creating a worker."},
-            "notify": {"type": "boolean" },
-            "expects_reply": {"type": "boolean" },
+            "notify": {"type": "boolean", "description": "exact/notice: notices are quiet by default; true only for blockers, decisions, handoffs."},
+            "expects_reply": {"type": "boolean", "description": "exact/notice only; independent of notify."},
             "host": {"type": "string", "description": "Control-mode Fleet host: one exact pane (pane or target); never auto-selects remotely."},
             "pane": {"type": "string" },
             "dispatch_id": {"type": "string", "description": "host: UUID, reuse on retry."}
         }),
-        " Returns at once by default (wait=false); the reply arrives as a wake, read it with tend_inbox(request_id) or tend_wait(id).",
+        " Returns at once (wait=false); the reply arrives as a wake: tend_inbox(view=report, request_id) or tend_wait(id).",
     ),
     "tend_inbox" => (
         json!({
@@ -870,7 +926,7 @@ mod tests {
         assert_eq!(notice.name, "tend_send_message");
         assert_eq!(
             notice.args,
-            json!({"target": "%2", "kind": "notice", "body": "fyi", "work_mode": "read_only"})
+            json!({"target": "%2", "kind": "notice", "body": "fyi", "work_mode": "read_only", COMPOSE: true})
         );
         let exact = route_ok(
             "tend_call_peer",
@@ -879,7 +935,24 @@ mod tests {
         assert_eq!(exact.name, "tend_send_message");
         assert_eq!(exact.args["kind"], "task");
         assert_eq!(exact.args["work_mode"], "execute");
-        assert!(exact.args.get("skill").is_none());
+        // Kept for composition, exactly as the colleague route expands it.
+        assert_eq!(exact.args["skill"], "s");
+        assert_eq!(exact.args[COMPOSE], true);
+        // The same contract on every route, and no silently ignored option.
+        for refused in [
+            json!({"target": "%2", "exact": true, "intent": "review", "execute": true, "body": "x"}),
+            json!({"target": "%2", "intent": "notice", "execute": true, "body": "x"}),
+            json!({"target": "%2", "exact": true, "wait": true, "body": "x"}),
+            json!({"body": "x", "expects_reply": false}),
+            json!({"host": "mini", "pane": "%4", "intent": "notice", "body": "x"}),
+            json!({"body": "x", "exact": "yes"}),
+        ] {
+            assert!(
+                route("tend_call_peer", refused.clone()).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(route("tend_call_peer", json!(null)).is_err());
         let fleet = route_ok(
             "tend_call_peer",
             json!({"host": "mini", "target": "%4", "body": "r"}),
@@ -932,6 +1005,24 @@ mod tests {
         );
         assert_eq!(remote.name, "tend_fleet_update_request");
         assert_eq!(remote.args["pane_key"], json!({"pane": "%7"}));
+        // No remote cancel/withdraw yet: refused, never retargeted locally.
+        for action in ["cancel", "withdraw_wake"] {
+            assert!(route(
+                "tend_update_request",
+                json!({"request_id": "req_remote", "action": action})
+            )
+            .is_err());
+            assert!(route(
+                "tend_update_request",
+                json!({"request_id": "req_x", "action": action, "host": "mini"})
+            )
+            .is_err());
+        }
+        let local = route_ok(
+            "tend_update_request",
+            json!({"request_id": "req_remote", "action": "cancel", "host": "local"}),
+        );
+        assert_eq!(local.name, "tend_cancel_message");
     }
 
     #[test]

@@ -36,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wake). `tend_inbox` reads history and peer replies with `view`;
   `tend_update_request` also cancels and withdraws reply wakes (`action`).
   Ids the daemon stamps from your pane (`thread_id`, `workspace_id`,
-  `work_id`, `run_id`) are no longer advertised. 16 tools, 26,267 bytes,
-  half of the 52,864 this stream started from.
+  `work_id`, `run_id`) are no longer advertised. 16 tools, 26,607 bytes,
+  about half of the 52,864 this stream started from.
 
 ### Fixed
 

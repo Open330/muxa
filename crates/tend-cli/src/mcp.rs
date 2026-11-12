@@ -585,7 +585,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         json!(["agent"])
     };
     let start_description = format!(
-        "Start one allowlisted coding agent in a new tmux pane, window or session (or a managed Work window) and return its pane id. {}",
+        "Start one allowlisted coding agent in a new tmux pane, window or session (or a managed Work window) and return its pane id. The codex profile runs codex --yolo. {}",
         launch_guide_summary(config)
     );
     let mut tools = vec![
@@ -1156,7 +1156,22 @@ async fn call_tool(
             }));
     let result = match &routed {
         Some((_, routed)) => {
-            let params = json!({"name": routed.name, "arguments": routed.args});
+            let mut args = routed.args.clone();
+            // Exact delivery from tend_call_peer composes skill/body/context
+            // the same way the colleague route does.
+            if let Some(object) = args.as_object_mut() {
+                if object.remove(crate::mcp_surface::COMPOSE).is_some() {
+                    match peer_call_body(&Value::Object(object.clone()), &config.message.skills) {
+                        Ok((body, _skill)) => {
+                            object.remove("skill");
+                            object.remove("context");
+                            object.insert("body".into(), json!(body));
+                        }
+                        Err(error) => return Ok(error_result(&error)),
+                    }
+                }
+            }
+            let params = json!({"name": routed.name, "arguments": args});
             call_tool_inner(client, Some(&params), config).await
         }
         None => call_tool_inner(client, params, config).await,
