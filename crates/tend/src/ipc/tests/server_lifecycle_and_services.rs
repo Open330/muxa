@@ -2657,6 +2657,7 @@ async fn a_planned_work_round_trips_over_ipc_with_its_result_records() {
     // A fetched issue reference is stored as given, and refused when it
     // would print a terminal escape.
     let item = crate::work::ExternalItemRef {
+        fetched_at: None,
         source: "github".into(),
         scope: Some("o/r".into()),
         stable_id: None,

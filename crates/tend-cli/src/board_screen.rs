@@ -1075,6 +1075,7 @@ mod tests {
     fn filtering_matches_ids_titles_and_issue_keys_and_keeps_the_cursor_inside() {
         let mut tagged = work("ENG-9", BoardStage::Queued, Vec::new(), 1);
         tagged.external_items = vec![tend::work::ExternalItemRef {
+            fetched_at: None,
             source: "linear".into(),
             scope: None,
             stable_id: None,

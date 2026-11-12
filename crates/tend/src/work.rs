@@ -63,6 +63,15 @@ pub struct ExternalItemRef {
     pub item_type: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub synced_at: OffsetDateTime,
+    /// Set when this snapshot was read from the tracker itself
+    /// (`tend work refresh`), not copied from a pane's launch marks. A
+    /// pane rediscovery never overwrites such a snapshot.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub fetched_at: Option<OffsetDateTime>,
 }
 
 impl ExternalItemRef {
@@ -770,6 +779,7 @@ pub fn external_item_for_pane(
     Some((
         identity,
         ExternalItemRef {
+            fetched_at: None,
             source: source.to_string(),
             scope: pane.tend.external_scope.clone(),
             stable_id: pane.tend.external_stable_id.clone(),

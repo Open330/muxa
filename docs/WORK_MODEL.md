@@ -74,7 +74,10 @@ the title and state of every linked GitHub or Linear issue. Both are
 read-only toward the tracker and spend no agent turn: GitHub through
 `gh api` (your `gh` login), Linear through its GraphQL API with
 `LINEAR_API_KEY`. The tracker's state is shown (`tend work show`, the
-dashboard) but never moves the Work's own stage. tendd stores what the CLI
+dashboard) but never moves the Work's own stage. A snapshot read from the
+tracker is not overwritten by the older title and state a pane was launched
+with, and GitHub owner/repo spellings that differ only in case are one item.
+`gh` is pinned to github.com, whatever `GH_HOST` says. tendd stores what the CLI
 fetched (`work_external_upsert`, `work_external_v1`) after checking it for
 control characters and size.
 

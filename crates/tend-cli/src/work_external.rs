@@ -136,7 +136,14 @@ async fn fetch_github(repo: &str, number: u64) -> Result<ExternalItemRef> {
     // The issues endpoint answers for pull requests too.
     let mut command = tokio::process::Command::new("gh");
     command
-        .args(["api", &format!("repos/{repo}/issues/{number}")])
+        // Pinned to github.com: the reference names it, and GH_HOST would
+        // otherwise read the same number from another host.
+        .args([
+            "api",
+            "--hostname",
+            "github.com",
+            &format!("repos/{repo}/issues/{number}"),
+        ])
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -163,9 +170,17 @@ fn github_item(repo: &str, number: u64, value: &Value, now: OffsetDateTime) -> E
     let pull = value.get("pull_request").filter(|p| !p.is_null());
     let state = value["state"].as_str().map(printable);
     let merged = pull.is_some_and(|p| p["merged_at"].is_string());
+    // GitHub's own spelling of owner/repo, so case variants of one link
+    // are one item.
+    let scope = value["repository_url"]
+        .as_str()
+        .and_then(|url| url.rsplit_once("/repos/").map(|(_, repo)| printable(repo)))
+        .filter(|canonical| canonical.eq_ignore_ascii_case(repo))
+        .unwrap_or_else(|| repo.to_owned());
     ExternalItemRef {
+        fetched_at: Some(now),
         source: "github".into(),
-        scope: Some(repo.to_owned()),
+        scope: Some(scope),
         stable_id: value["node_id"].as_str().map(printable),
         display_key: format!("#{number}"),
         title: value["title"].as_str().map(printable),
@@ -218,13 +233,17 @@ fn linear_item(key: &str, issue: &Value, now: OffsetDateTime) -> Result<External
     if issue.is_null() {
         bail!("Linear has no issue {key}");
     }
+    // The identifier Linear returns, which follows an issue that moved
+    // teams, rather than the key it was asked for.
+    let display_key = issue["identifier"]
+        .as_str()
+        .map_or_else(|| key.to_owned(), printable);
     Ok(ExternalItemRef {
+        fetched_at: Some(now),
         source: "linear".into(),
-        scope: key.split_once('-').map(|(team, _)| team.to_owned()),
+        scope: display_key.split_once('-').map(|(team, _)| team.to_owned()),
         stable_id: issue["id"].as_str().map(printable),
-        display_key: issue["identifier"]
-            .as_str()
-            .map_or_else(|| key.to_owned(), printable),
+        display_key,
         title: issue["title"].as_str().map(printable),
         url: issue["url"].as_str().map(printable),
         status: issue["state"]["name"].as_str().map(printable),
@@ -248,12 +267,29 @@ async fn require_external(client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// Split `WORKSPACE/WORK` and `--workspace` into the Work id and the
+/// workspace to look in, refusing two that disagree.
+fn target(work: &str, workspace: Option<&str>) -> Result<(String, Option<String>)> {
+    match work.split_once('/') {
+        Some((prefix, id)) => {
+            if workspace.is_some_and(|w| !w.eq_ignore_ascii_case(prefix)) {
+                bail!("--workspace disagrees with {prefix:?}/");
+            }
+            Ok((id.to_owned(), Some(prefix.to_owned())))
+        }
+        None => Ok((work.to_owned(), workspace.map(str::to_owned))),
+    }
+}
+
 async fn resolve(client: &Client, work: &str, workspace: Option<&str>) -> Result<WorkIdentity> {
     let records = client.work_backlog(None).await?;
-    if let Some(record) = crate::work_backlog::find_record(&records, work, workspace, false)? {
+    let (id, workspace) = target(work, workspace)?;
+    if let Some(record) =
+        crate::work_backlog::find_record(&records, &id, workspace.as_deref(), false)?
+    {
         return Ok(record.identity.clone());
     }
-    crate::work_backlog::identity(work, workspace, &std::env::current_dir()?)
+    crate::work_backlog::identity(&id, workspace.as_deref(), &std::env::current_dir()?)
 }
 
 pub async fn run_link(args: LinkArgs, client: &Client) -> Result<()> {
@@ -272,20 +308,7 @@ pub async fn run_link(args: LinkArgs, client: &Client) -> Result<()> {
 pub async fn run_refresh(args: RefreshArgs, client: &Client) -> Result<()> {
     require_external(client).await?;
     let records = client.work_backlog(None).await?;
-    let targets: Vec<WorkRecord> = if args.all {
-        records
-            .into_iter()
-            .filter(|record| !record.external_items.is_empty())
-            .collect()
-    } else {
-        let work = args.work.as_deref().unwrap_or_default();
-        let Some(record) =
-            crate::work_backlog::find_record(&records, work, args.workspace.as_deref(), false)?
-        else {
-            bail!("no Work record for {work}; link an issue with `tend work link`");
-        };
-        vec![record.clone()]
-    };
+    let targets = select_targets(records, &args)?;
     let mut report = Vec::new();
     for record in targets {
         for item in &record.external_items {
@@ -323,6 +346,36 @@ pub async fn run_refresh(args: RefreshArgs, client: &Client) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The records `tend work refresh` reads: one named Work (either id form),
+/// or with `--all` every record with a reference, in `--workspace` only
+/// when one is given.
+fn select_targets(records: Vec<WorkRecord>, args: &RefreshArgs) -> Result<Vec<WorkRecord>> {
+    if args.all {
+        let workspace = args
+            .workspace
+            .as_deref()
+            .map(crate::tmux_work::normalize_workspace_id)
+            .transpose()?;
+        return Ok(records
+            .into_iter()
+            .filter(|record| {
+                !record.external_items.is_empty()
+                    && workspace
+                        .as_ref()
+                        .is_none_or(|w| &record.identity.workspace_id == w)
+            })
+            .collect());
+    }
+    let work = args.work.as_deref().unwrap_or_default();
+    let (id, workspace) = target(work, args.workspace.as_deref())?;
+    let Some(record) =
+        crate::work_backlog::find_record(&records, &id, workspace.as_deref(), false)?
+    else {
+        bail!("no Work record for {work}; link an issue with `tend work link`");
+    };
+    Ok(vec![record.clone()])
 }
 
 fn describe(identity: &WorkIdentity, item: &ExternalItemRef) -> String {
@@ -383,6 +436,60 @@ mod tests {
     }
 
     #[test]
+    fn refresh_targets_take_both_id_forms_and_the_workspace_filter() {
+        let record = |workspace: &str, work: &str, linked: bool| WorkRecord {
+            identity: WorkIdentity::new(workspace, work),
+            metadata: tend::work::WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                stage: tend::work::WorkStage::Queued,
+                updated_at: datetime!(2026-11-12 10:00 UTC),
+            },
+            external_items: if linked {
+                vec![linear_item(
+                    "ENG-1",
+                    &serde_json::json!({"identifier": "ENG-1"}),
+                    datetime!(2026-11-12 10:00 UTC),
+                )
+                .unwrap()]
+            } else {
+                Vec::new()
+            },
+            legacy_binding: None,
+            plan: None,
+            created_at: datetime!(2026-11-12 10:00 UTC),
+        };
+        let records = vec![
+            record("web", "ENG-1", true),
+            record("api", "ENG-1", true),
+            record("api", "ENG-2", false),
+        ];
+        let args = |work: Option<&str>, workspace: Option<&str>, all: bool| RefreshArgs {
+            work: work.map(Into::into),
+            workspace: workspace.map(Into::into),
+            all,
+            json: false,
+        };
+        let one = select_targets(records.clone(), &args(Some("web/ENG-1"), None, false)).unwrap();
+        assert_eq!(one[0].identity, WorkIdentity::new("web", "ENG-1"));
+        assert!(select_targets(records.clone(), &args(Some("ENG-1"), None, false)).is_err());
+        assert!(select_targets(
+            records.clone(),
+            &args(Some("web/ENG-1"), Some("api"), false)
+        )
+        .is_err());
+        let api = select_targets(records.clone(), &args(None, Some("api"), true)).unwrap();
+        assert_eq!(api.len(), 1, "only api, and only linked records");
+        assert_eq!(
+            select_targets(records, &args(None, None, true))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn tracker_replies_become_validated_references() {
         let now = datetime!(2026-11-12 12:00 UTC);
         let pr = github_item(
@@ -390,6 +497,7 @@ mod tests {
             483,
             &serde_json::json!({
                 "title": "feat(work): a backlog\u{1b}[2J", "state": "closed", "node_id": "PR_1",
+                "repository_url": "https://api.github.com/repos/Open330/tend",
                 "html_url": "https://github.com/Open330/tend/pull/483",
                 "pull_request": {"merged_at": "2026-11-12T10:30:00Z"}
             }),
@@ -398,6 +506,18 @@ mod tests {
         assert_eq!(pr.status.as_deref(), Some("merged"));
         assert_eq!(pr.item_type.as_deref(), Some("pull_request"));
         assert_eq!(pr.title.as_deref(), Some("feat(work): a backlog[2J"));
+        assert!(pr.fetched_at.is_some());
+        let lower = github_item(
+            "open330/tend",
+            483,
+            &serde_json::json!({"repository_url": "https://api.github.com/repos/Open330/tend"}),
+            now,
+        );
+        assert_eq!(
+            lower.scope.as_deref(),
+            Some("Open330/tend"),
+            "GitHub's spelling"
+        );
         pr.validate().unwrap();
         assert_eq!(
             Source::of(&pr),

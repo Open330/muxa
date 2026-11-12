@@ -184,20 +184,18 @@ impl WorkStore {
             legacy_binding: None,
             created_at: now,
         });
-        let same_identity = |candidate: &ExternalItemRef| {
-            candidate.source == item.source
-                && candidate.scope == item.scope
-                && match (&candidate.stable_id, &item.stable_id) {
-                    (Some(left), Some(right)) => left == right,
-                    _ => candidate.display_key == item.display_key,
-                }
-        };
+        let same_identity = |candidate: &ExternalItemRef| same_external_item(candidate, &item);
         if let Some(existing) = record
             .external_items
             .iter_mut()
             .find(|row| same_identity(row))
         {
             if same_external_snapshot(existing, &item) {
+                return Ok(record);
+            }
+            // A snapshot read from the tracker outranks one copied from a
+            // pane's launch marks, however recent the pane scan.
+            if existing.fetched_at.is_some() && item.fetched_at.is_none() {
                 return Ok(record);
             }
             *existing = item;
@@ -226,6 +224,22 @@ impl WorkStore {
         }
         Ok(record)
     }
+}
+
+/// One tracker item: the same provider id, else the same key in the same
+/// scope. GitHub owner/repo names are case-insensitive.
+fn same_external_item(left: &ExternalItemRef, right: &ExternalItemRef) -> bool {
+    if left.source != right.source {
+        return false;
+    }
+    if let (Some(a), Some(b)) = (&left.stable_id, &right.stable_id) {
+        return a == b;
+    }
+    let same_scope = match (&left.scope, &right.scope) {
+        (Some(a), Some(b)) if left.source == "github" => a.eq_ignore_ascii_case(b),
+        (a, b) => a == b,
+    };
+    same_scope && left.display_key == right.display_key
 }
 
 fn same_external_snapshot(left: &ExternalItemRef, right: &ExternalItemRef) -> bool {
@@ -337,6 +351,57 @@ mod tests {
     use crate::work::WorkStage;
 
     #[tokio::test]
+    async fn a_tracker_snapshot_outranks_pane_rediscovery_and_github_case() {
+        let mut store = WorkStore::memory();
+        let id = WorkIdentity::new("web", "ENG-1");
+        let now = OffsetDateTime::now_utc();
+        let pane = ExternalItemRef {
+            source: "github".into(),
+            scope: Some("Open330/tend".into()),
+            stable_id: None,
+            display_key: "#7".into(),
+            title: Some("old title".into()),
+            url: None,
+            status: Some("open".into()),
+            item_type: Some("issue".into()),
+            synced_at: now,
+            fetched_at: None,
+        };
+        store
+            .upsert_external_item(id.clone(), pane.clone())
+            .await
+            .unwrap();
+        let fetched = ExternalItemRef {
+            scope: Some("open330/TEND".into()),
+            title: Some("new title".into()),
+            status: Some("closed".into()),
+            fetched_at: Some(now),
+            ..pane.clone()
+        };
+        let record = store
+            .upsert_external_item(id.clone(), fetched.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            record.external_items,
+            vec![fetched.clone()],
+            "one item, case-insensitive"
+        );
+        // The next dashboard read copies the pane's stale marks again.
+        let record = store
+            .upsert_external_item(
+                id.clone(),
+                ExternalItemRef {
+                    synced_at: now + time::Duration::seconds(5),
+                    ..pane
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.external_items, vec![fetched]);
+    }
+
+    #[tokio::test]
     async fn a_planned_work_survives_a_web_metadata_save_and_a_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dashboard-work.json");
@@ -440,6 +505,7 @@ mod tests {
         let mut store = WorkStore::memory();
         let now = OffsetDateTime::now_utc();
         let item = ExternalItemRef {
+            fetched_at: None,
             source: "linear".into(),
             scope: Some("ENG".into()),
             stable_id: Some("uuid-1".into()),
