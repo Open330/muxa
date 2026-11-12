@@ -21,7 +21,7 @@ standalone entry point.
 
 | Layer | Promise | Surfaces |
 | --- | --- | --- |
-| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, Tend for Mac menu bar, `review` |
+| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, Tend for Mac menu bar, the BarShelf widget, `review` |
 | **Runtime** | Agents are launched, organized, coordinated, and recovered as Work, not as loose panes. | Work/Run model, `work`/`workspace`/`agent`, tendd-owned PTYs and Tend for Mac, collaboration mailbox and `@peer`, workers, Fleet, snapshot/restore, usage-limit recovery, MCP |
 
 Rules that keep the layers honest:
@@ -122,11 +122,11 @@ evidence (from `tend stats` or issues) that it is used outside a single
 workflow. A feature with no use over a release cycle is a removal candidate;
 the Work board replacing the card dashboard is the model. Removals are
 recorded in CHANGELOG.md under **Removed** with the reason. The 2026-11-12
-pass removed `tend graph`, the BarShelf widget and the zellij plugin stub,
-and moved analytics and the 16-step onboarding tour to frozen Labs. It also
-removed the dashboard's OIDC sign-in and sharing, which a published
-dashboard was using; it was restored after 0.10.13. Check every
-host's config before calling a feature unused.
+pass removed `tend graph` and the zellij plugin stub, and moved analytics
+and the 16-step onboarding tour to frozen Labs. It also removed the
+dashboard's OIDC sign-in and sharing and the BarShelf widget, both of which
+were in use; both were restored after 0.10.13. Check every host's config and
+installed integrations before calling a feature unused.
 
 Frozen means: bug fixes and keeping it compiling with the rest of tend, but
 no new screens, options or data. Work there is better spent on Core, and a

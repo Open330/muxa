@@ -119,6 +119,7 @@ Tend는 두 층으로 되어 있습니다. **Attention** 층은 이미 돌리는
 | `tend stats activity` | stats/report에 들어간 raw duration ledger 조회. |
 | Tend for Mac | Home(Work 단위를 Your turn·In progress·Finished lane으로 표시)에서 시작해 Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 앱, libghostty 터미널과 알림. 네이티브 PTY는 `tendd`가 소유. |
 | Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph와 [OIDC 로그인 기반 pane/window 공유](docs/DASHBOARD.md#invite-someone-to-a-pane)(조회/프롬프트 권한)를 지원. |
+| BarShelf widget (macOS) | active/working/waiting/error agent를 host별(로컬 또는 SSH)로 메뉴바 popover에서 요약. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
 ## 다른 설치 방법

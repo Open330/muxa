@@ -510,6 +510,28 @@ watch에서 `Enter`로 이동할 때는 대상 window를 `<session_id>:<window_i
 tmux set-option -t <session> @no_auto_view 1
 ```
 
+## macOS 메뉴바 (BarShelf)
+
+[BarShelf](https://github.com/Open330/barshelf)용 `tend Watch` widget을 사용하면
+같은 agent 상태를 메뉴바 popover에서 compact하게 확인할 수 있습니다. agent마다
+상태 점, 마지막 활동, 하고 있는 일을 두 줄로 보여 줍니다. 확인이 필요한 agent가
+먼저 오고 나머지는 최근 활동 순이며, host마다 기본 5줄입니다(설정으로 1~10).
+host마다 카드를 하나씩 추가하며 로컬이나 SSH를 고를 수 있습니다. popover가 열려
+있을 때 5초마다 갱신하고 background에서는 polling하지 않습니다.
+
+BarShelf gallery에서 설치하거나 다음 명령을 사용하세요.
+
+```bash
+barshelf install https://github.com/Open330/tend/tree/main/widgets/tend-watch
+```
+
+Deno와 versioned snapshot command를 지원하는 `tend`가 필요합니다. 기본 설치
+경로/소켓이 아닌 경우 `TEND_BIN` 또는 widget의 custom socket setting을 지정하세요.
+
+```bash
+tend status --json
+```
+
 ## Columns
 
 `[watch]`에서 설정합니다:
