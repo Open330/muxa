@@ -625,9 +625,9 @@ final class AppModel: ObservableObject {
                 let epoch = daemonIdentityEpoch
                 let updates = try await client.fleetUpdates(onReady: { [weak self] hello in
                     Task { @MainActor [weak self] in
-                        guard let self, connectionGeneration == generation,
-                              daemonIdentityEpoch == epoch else { return }
-                        adoptDaemonHello(hello)
+                        guard let self, self.connectionGeneration == generation,
+                              self.daemonIdentityEpoch == epoch else { return }
+                        self.adoptDaemonHello(hello)
                     }
                 })
                 for try await update in updates {
