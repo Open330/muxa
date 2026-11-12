@@ -407,6 +407,33 @@ fn default_state_entered_at() -> OffsetDateTime {
 
 use crate::pid_liveness::pid_alive;
 
+/// One row's pid liveness, read with no registry lock held.
+#[derive(Debug, Clone, Copy)]
+struct PidProbe {
+    pid: u32,
+    /// The row's incarnation. Every registration builds a fresh row stamped
+    /// with the current time, so a row re-registered after the probe, even
+    /// under the same key with a reused pid, no longer matches.
+    started_at: OffsetDateTime,
+    alive: bool,
+}
+
+impl PidProbe {
+    /// Whether `agent` is still the row incarnation this probe checked.
+    fn describes(&self, agent: &Agent) -> bool {
+        agent.pid == Some(self.pid) && agent.started_at == self.started_at
+    }
+}
+
+/// A native PTY row with no pane: its surface lookup owns its liveness.
+fn is_native_surface_row(agent: &Agent) -> bool {
+    agent
+        .surface
+        .as_ref()
+        .is_some_and(|surface| surface.kind == crate::event::SurfaceKind::Pty)
+        && agent.pane.is_none()
+}
+
 impl Agent {
     /// Prefer a captured response over sparse compaction/resume metadata.
     /// Prompt fallback and notification priority belong to each view.
@@ -2159,42 +2186,31 @@ impl Store {
     /// `None` means the surface no longer exists; `Some(false)` means its
     /// process exited but output is still available. A failed lookup is a no-op.
     /// Lookups run under the registry lock, so a new hook cannot race cleanup.
-    /// Pid liveness is read before the lock is taken; a row whose pid changed
-    /// in between is left for the next pass.
+    /// Pid liveness is read before the lock is taken; a row re-registered or
+    /// re-pidded in between is left for the next pass.
     pub async fn reconcile_native_surfaces<F>(&self, lookup: F) -> usize
     where
         F: Fn(&str) -> Result<Option<bool>, crate::session::SessionError> + Send,
     {
-        let native = |agent: &Agent| {
-            agent
-                .surface
-                .as_ref()
-                .is_some_and(|surface| surface.kind == crate::event::SurfaceKind::Pty)
-                && agent.pane.is_none()
-        };
-        let pids: Vec<(String, u32)> = self
-            .agents
-            .read()
-            .await
-            .iter()
-            .filter(|(_, agent)| native(agent))
-            .filter_map(|(key, agent)| agent.pid.map(|pid| (key.clone(), pid)))
-            .collect();
-        let live: HashMap<String, (u32, bool)> = pids
-            .into_iter()
-            .map(|(key, pid)| (key, (pid, pid_alive(pid))))
-            .collect();
+        let probes = self.probe_pids(is_native_surface_row).await;
+        self.apply_native_surfaces(&probes, lookup).await
+    }
+
+    async fn apply_native_surfaces<F>(&self, probes: &HashMap<String, PidProbe>, lookup: F) -> usize
+    where
+        F: Fn(&str) -> Result<Option<bool>, crate::session::SessionError> + Send,
+    {
         let mut agents = self.agents.write().await;
         let mut changed = 0;
         for (key, agent) in agents.iter_mut() {
-            if !native(agent) {
+            if !is_native_surface_row(agent) {
                 continue;
             }
             let pid_live = match agent.pid {
                 None => false,
-                Some(pid) => match live.get(key) {
-                    Some(&(checked, alive)) if checked == pid => alive,
-                    // Registered or re-pidded since the check: next pass.
+                Some(_) => match probes.get(key) {
+                    Some(probe) if probe.describes(agent) => probe.alive,
+                    // Registered or re-pidded since the probe: next pass.
                     _ => continue,
                 },
             };
@@ -2457,35 +2473,59 @@ impl Store {
         stopped
     }
 
+    /// Probe the pid of every row `select` picks. The registry is read, then
+    /// released before any liveness check runs.
+    async fn probe_pids(&self, select: impl Fn(&Agent) -> bool) -> HashMap<String, PidProbe> {
+        let tracked: Vec<(String, u32, OffsetDateTime)> = self
+            .agents
+            .read()
+            .await
+            .iter()
+            .filter(|(_, agent)| select(agent))
+            .filter_map(|(key, agent)| agent.pid.map(|pid| (key.clone(), pid, agent.started_at)))
+            .collect();
+        tracked
+            .into_iter()
+            .map(|(key, pid, started_at)| {
+                let alive = pid_alive(pid);
+                (
+                    key,
+                    PidProbe {
+                        pid,
+                        started_at,
+                        alive,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Flip pid-tracked rows (`AgentKind::Task`) whose process has exited to
     /// `Stopped`. Run every reconciler tick. Conservative by design: it only
     /// changes state, never deletes — the regular GC reaps `Stopped` rows
     /// after their inactivity TTL. Returns the number of rows flipped.
     pub async fn reap_dead_pids(&self) -> usize {
-        // Liveness is checked with no registry lock held. A row is flipped
-        // only if it still tracks the pid that was found dead.
-        let tracked: Vec<(String, u32)> = self
-            .agents
-            .read()
-            .await
-            .iter()
-            .filter(|(_, agent)| agent.state != AgentState::Stopped)
-            .filter_map(|(key, agent)| agent.pid.map(|pid| (key.clone(), pid)))
-            .collect();
-        let dead: Vec<(String, u32)> = tracked
-            .into_iter()
-            .filter(|(_, pid)| !pid_alive(*pid))
-            .collect();
-        if dead.is_empty() {
+        // Liveness is checked with no registry lock held.
+        let probes = self
+            .probe_pids(|agent| agent.state != AgentState::Stopped)
+            .await;
+        self.apply_dead_pids(&probes).await
+    }
+
+    /// Flip the rows whose probe found the pid dead, but only the row
+    /// incarnation that was probed: a task re-registered meanwhile under the
+    /// same key, even with a reused pid, is a new process and is left alone.
+    async fn apply_dead_pids(&self, probes: &HashMap<String, PidProbe>) -> usize {
+        if probes.values().all(|probe| probe.alive) {
             return 0;
         }
         let mut agents = self.agents.write().await;
         let mut flipped = 0_usize;
-        for (key, pid) in dead {
-            let Some(agent) = agents.get_mut(&key) else {
+        for (key, probe) in probes.iter().filter(|(_, probe)| !probe.alive) {
+            let Some(agent) = agents.get_mut(key) else {
                 continue;
             };
-            if agent.pid != Some(pid) || agent.state == AgentState::Stopped {
+            if !probe.describes(agent) || agent.state == AgentState::Stopped {
                 continue;
             }
             let prev = agent.state;
@@ -4263,6 +4303,59 @@ mod tests {
         assert_eq!(row.state, AgentState::Idle);
         assert!(row.surface.is_none());
         assert_eq!(store.prune_orphans(OffsetDateTime::now_utc()).await, 0);
+    }
+
+    /// Replace `key`'s row with a new incarnation on the same pid, as a
+    /// re-registration after the OS reused the pid would.
+    async fn reregister_same_pid(store: &Store, key: &str) {
+        let mut agents = store.agents.write().await;
+        let mut row = agents.get(key).unwrap().clone();
+        row.started_at += time::Duration::seconds(1);
+        row.state = AgentState::Working;
+        agents.insert(key.into(), row);
+    }
+
+    #[tokio::test]
+    async fn reaping_skips_a_row_re_registered_on_a_reused_pid_after_the_probe() {
+        let store = Store::shared();
+        store
+            .register_task("task".into(), Some(u32::MAX), None, None, None)
+            .await
+            .unwrap();
+        let probes = store
+            .probe_pids(|agent| agent.state != AgentState::Stopped)
+            .await;
+        assert!(!probes["task"].alive);
+        // Between probe and apply, a new process takes the pid and the key.
+        reregister_same_pid(&store, "task").await;
+        assert_eq!(store.apply_dead_pids(&probes).await, 0);
+        assert_eq!(
+            store.by_session("task").await.unwrap().state,
+            AgentState::Working
+        );
+        // Its own probe still reaps it once its pid is gone.
+        assert_eq!(store.reap_dead_pids().await, 1);
+    }
+
+    #[tokio::test]
+    async fn native_reconciliation_skips_a_row_re_registered_on_a_reused_pid() {
+        let store = Store::shared();
+        let mut row = stored_agent("pty-task", AgentKind::Task, AgentState::Idle, None);
+        row.pane = None;
+        row.pid = Some(u32::MAX);
+        row.surface = Some(SurfaceRef {
+            kind: crate::event::SurfaceKind::Pty,
+            id: "pty:gone".into(),
+            workspace: None,
+        });
+        store.hydrate(vec![row]).await;
+        let probes = store.probe_pids(is_native_surface_row).await;
+        assert!(!probes["pty-task"].alive);
+        reregister_same_pid(&store, "pty-task").await;
+        assert_eq!(store.apply_native_surfaces(&probes, |_| Ok(None)).await, 0);
+        let row = store.by_session("pty-task").await.unwrap();
+        assert_eq!(row.state, AgentState::Working);
+        assert!(row.surface.is_some());
     }
 
     #[tokio::test]
