@@ -231,7 +231,6 @@ mod tests {
                 RequestStatus::Completed,
                 "real peer result".into(),
                 vec![],
-                vec![],
             )
             .await
             .unwrap();
@@ -253,7 +252,6 @@ mod tests {
                 RequestStatus::Completed,
                 "late real report".into(),
                 vec![],
-                vec![],
             )
             .await
             .unwrap();
@@ -267,7 +265,6 @@ mod tests {
                 &second.id,
                 RequestStatus::Completed,
                 "late real report".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -386,7 +383,6 @@ mod tests {
                 RequestStatus::Completed,
                 "wait and recheck".into(),
                 vec![],
-                vec![],
             )
             .await
             .unwrap();
@@ -428,7 +424,6 @@ mod tests {
                 &parent.id,
                 RequestStatus::Blocked,
                 "later evidence".into(),
-                vec![],
                 vec![],
             )
             .await

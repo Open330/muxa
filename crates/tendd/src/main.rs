@@ -3315,17 +3315,10 @@ fn mailbox_collaboration_request_prompt(request: &CollaborationRequest) -> Strin
 
 fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     let paths = serde_json::to_string(&request.paths).unwrap_or_else(|_| "[]".into());
-    let mut air_artifacts = if request.air_artifacts.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nair_artifacts: {}",
-            serde_json::to_string(&request.air_artifacts).unwrap_or_else(|_| "[]".into())
-        )
-    };
+    let mut contract_lines = String::new();
     if let Some(contract) = &request.task_contract {
         use std::fmt::Write as _;
-        let _=write!(air_artifacts,"\ntask_contract: {}\nattempt: {}\nFor completed work, provide a typed report with the attempt id, basis_revision, every criterion and evidence. These remain recipient-reported claims.",serde_json::to_string(contract).unwrap_or_default(),serde_json::to_string(&request.attempt).unwrap_or_default());
+        let _=write!(contract_lines,"\ntask_contract: {}\nattempt: {}\nFor completed work, provide a typed report with the attempt id, basis_revision, every criterion and evidence. These remain recipient-reported claims.",serde_json::to_string(contract).unwrap_or_default(),serde_json::to_string(&request.attempt).unwrap_or_default());
     }
     let reply = collaboration_reply_instruction(request);
     format!(
@@ -3336,7 +3329,7 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
         collaboration_request_kind(request.kind),
         collaboration_work_mode(request.work_mode),
         paths,
-        air_artifacts,
+        contract_lines,
         request.expects_reply,
         reply,
         request.body.len(),
@@ -5430,7 +5423,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -5669,7 +5661,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -5770,7 +5761,6 @@ mod tests {
                     paths: vec!["src/auth.rs".into()],
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -5836,7 +5826,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -5908,7 +5897,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -6001,7 +5989,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -6088,7 +6075,6 @@ mod tests {
                         paths: Vec::new(),
                         artifacts: Vec::new(),
                         links: Vec::new(),
-                        air_artifacts: Vec::new(),
                         withdraw_reply_wakes: Vec::new(),
                         recipient_slot: None,
                     },
@@ -6241,7 +6227,6 @@ mod tests {
                         paths: Vec::new(),
                         artifacts: Vec::new(),
                         links: Vec::new(),
-                        air_artifacts: Vec::new(),
                         withdraw_reply_wakes: Vec::new(),
                         recipient_slot: None,
                     },
@@ -6322,7 +6307,6 @@ mod tests {
                     RequestStatus::Completed,
                     "done".into(),
                     Vec::new(),
-                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -6391,7 +6375,6 @@ mod tests {
                     &request.id,
                     RequestStatus::Completed,
                     "done".into(),
-                    Vec::new(),
                     Vec::new(),
                 )
                 .await
@@ -6500,7 +6483,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -6670,7 +6652,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -6717,7 +6698,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "secret reply body".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -6806,7 +6786,6 @@ mod tests {
                     paths: Vec::new(),
                     artifacts: Vec::new(),
                     links: Vec::new(),
-                    air_artifacts: Vec::new(),
                     withdraw_reply_wakes: Vec::new(),
                     recipient_slot: None,
                 },
@@ -6834,7 +6813,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -7385,7 +7363,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "Findings".into(),
-                vec![],
                 vec![],
             )
             .await

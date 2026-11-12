@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- AIR support. Nothing was using it, so it is gone from every layer:
+  the `air_artifacts` field on collaboration requests and replies, the
+  `--air-ref` flag on `tend msg send` and `tend msg reply`, the matching MCP
+  arguments, the `AIR PLAN`/`AIR TRACE` badges in watch and the dashboard, the
+  `air_handoff` guide entry, and the macOS AIR module (workflow export and
+  import, run-evidence export, and the AIR Workbench launcher). Stored requests
+  that still carry `air_artifacts` load normally; the field is ignored. A peer
+  on an older version can keep sending it, and this version ignores it.
+
 ### Fixed
 
 - The daemon removes terminal launch archives after 30 days, retaining live

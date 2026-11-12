@@ -63,7 +63,6 @@ async fn finish(
             RequestStatus::Completed,
             "Findings and evidence".into(),
             vec![],
-            vec![],
             value,
         )
         .await
@@ -118,7 +117,6 @@ async fn blockers_do_not_need_to_fabricate_completed_checks() {
             &request.id,
             RequestStatus::Blocked,
             "No checkout available".into(),
-            vec![],
             vec![],
         )
         .await
@@ -208,7 +206,6 @@ async fn superseding_a_claimed_review_retains_late_evidence_without_completing_t
             RequestStatus::Completed,
             "Wrong attempt".into(),
             vec![],
-            vec![],
             Some(report(&old))
         )
         .await
@@ -219,7 +216,6 @@ async fn superseding_a_claimed_review_retains_late_evidence_without_completing_t
             &new.id,
             RequestStatus::Completed,
             "Current findings".into(),
-            vec![],
             vec![],
             Some(report(&new)),
         )
@@ -416,7 +412,6 @@ async fn moving_sender_preserves_reply_ownership_and_wakes_the_new_endpoint() {
             RequestStatus::Completed,
             "done".into(),
             vec![],
-            vec![],
         )
         .await
         .unwrap();
@@ -478,7 +473,6 @@ async fn legacy_requests_remain_uncontracted_and_reply_without_new_fields() {
             &request.id,
             RequestStatus::Completed,
             "done".into(),
-            vec![],
             vec![],
         )
         .await

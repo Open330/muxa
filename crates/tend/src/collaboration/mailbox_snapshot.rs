@@ -256,7 +256,6 @@ mod tests {
                 RequestStatus::Completed,
                 "wait, not approval".into(),
                 vec![],
-                vec![],
             )
             .await
             .unwrap();

@@ -78,9 +78,6 @@ pub fn inbox_instruction(request: &CollaborationRequest) -> Value {
             value[key] = json!(items);
         }
     }
-    if !request.air_artifacts.is_empty() {
-        value["air_artifacts"] = json!(request.air_artifacts);
-    }
     if !request.updates.is_empty() {
         value["updates"]=json!(request.updates.iter().map(|update| json!({"sequence":update.sequence,"author":instruction_author(&update.author),"body":update.body})).collect::<Vec<_>>());
         value["next_after_update"] = json!(request.updates.last().unwrap().sequence);
@@ -133,7 +130,6 @@ pub fn short_inline_prompt(request: &CollaborationRequest) -> Option<String> {
         || !request.updates.is_empty()
         || !request.artifacts.is_empty()
         || !request.links.is_empty()
-        || !request.air_artifacts.is_empty()
         || !request.late_replies.is_empty()
         || matches!(request.to.agent_kind, AgentKind::Unknown | AgentKind::Task)
     {

@@ -179,7 +179,6 @@ fn reply_output_preserves_json_escapes_and_direct_body() {
         status: RequestStatus::Failed,
         body: body.into(),
         artifacts: vec![],
-        air_artifacts: vec![],
         at: time::OffsetDateTime::UNIX_EPOCH,
     });
     let output = render_reply_output(&request, false, false).unwrap();
@@ -911,7 +910,6 @@ fn collaboration_request(
         paths: Vec::new(),
         artifacts: Vec::new(),
         links: Vec::new(),
-        air_artifacts: Vec::new(),
         status,
         created_at: at,
         claimed_at: None,

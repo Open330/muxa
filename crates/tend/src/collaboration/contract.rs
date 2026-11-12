@@ -406,7 +406,6 @@ pub(super) fn supersession_notice(
     notice.paths.clear();
     notice.artifacts.clear();
     notice.links.clear();
-    notice.air_artifacts.clear();
     notice.task_contract = None;
     notice.attempt = None;
     notice.supersedes_request_id = None;

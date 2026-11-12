@@ -1125,14 +1125,7 @@ fn redact_collaboration_details(request: &mut serde_json::Value) {
     let Some(request) = request.as_object_mut() else {
         return;
     };
-    for field in [
-        "body",
-        "provenance",
-        "paths",
-        "artifacts",
-        "links",
-        "air_artifacts",
-    ] {
+    for field in ["body", "provenance", "paths", "artifacts", "links"] {
         request.remove(field);
     }
     if let Some(updates) = request
@@ -1156,7 +1149,7 @@ fn redact_collaboration_details(request: &mut serde_json::Value) {
         .get_mut("reply")
         .and_then(serde_json::Value::as_object_mut)
     {
-        for field in ["body", "artifacts", "air_artifacts"] {
+        for field in ["body", "artifacts"] {
             reply.remove(field);
         }
     }
@@ -3233,7 +3226,6 @@ mod tests {
                             paths: vec!["/private/review.patch".to_string()],
                             artifacts: vec!["artifact-request-secret".to_string()],
                             links: vec!["https://private.invalid/review".to_string()],
-                            air_artifacts: Vec::new(),
                             withdraw_reply_wakes: Vec::new(),
                             recipient_slot: None,
                         },
@@ -3269,7 +3261,6 @@ mod tests {
                         paths: Vec::new(),
                         artifacts: Vec::new(),
                         links: Vec::new(),
-                        air_artifacts: Vec::new(),
                         withdraw_reply_wakes: Vec::new(),
                         recipient_slot: None,
                     },
@@ -4055,7 +4046,6 @@ mod tests {
                 RequestStatus::Completed,
                 "approved".to_string(),
                 vec!["artifact-secret".to_string()],
-                Vec::new(),
             )
             .await
             .unwrap();

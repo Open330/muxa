@@ -49,9 +49,8 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tend::collaboration::{
-    AirArtifactProfile, AirArtifactReference, CollaborationOrigin, CollaborationRequest,
-    MailboxScope, NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, RoomContext,
-    WorkMode,
+    CollaborationOrigin, CollaborationRequest, MailboxScope, NewRequest, Participant, RequestKind,
+    RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use tend::config::{
     IconSet, WatchCollaborationMode, WatchConfig, WatchLayout, WatchScreen, WatchSortKey,

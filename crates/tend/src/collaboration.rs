@@ -70,9 +70,6 @@ const COLLABORATION_DATABASE_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_QUERY_LIMIT: usize = 100;
 const MAX_QUERY_LIMIT: usize = 500;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-const MAX_AIR_ARTIFACT_REFERENCES: usize = 8;
-const MAX_AIR_REFERENCE_LABEL_BYTES: usize = 256;
-const MAX_AIR_LOCATOR_DISPLAY_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct CollaborationOptions {
@@ -234,7 +231,6 @@ fn dispatch_matches(
         && existing.paths == input.paths
         && existing.artifacts == input.artifacts
         && existing.links == input.links
-        && existing.air_artifacts == input.air_artifacts
         && existing.user_authorized == input.user_authorized
         && existing.withdrew_reply_wakes == normalize_withdrawals(&input.withdraw_reply_wakes)
 }
@@ -614,69 +610,6 @@ pub enum WorkMode {
     Execute,
 }
 
-/// AIR 1 profiles that may be referenced by a collaboration request or
-/// reply. A reference does not make tend an AIR producer or validator; the
-/// artifact itself remains subject to AIR Workbench's schema and runtime
-/// conformance checks.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AirArtifactProfile {
-    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/workflow-skill")]
-    WorkflowSkill,
-    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/plan-native-cli")]
-    PlanNativeCli,
-    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/trace-native-run")]
-    TraceNativeRun,
-    #[serde(rename = "https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot")]
-    TraceSessionSnapshot,
-}
-
-impl AirArtifactProfile {
-    pub fn kind(self) -> &'static str {
-        match self {
-            Self::WorkflowSkill => "workflow",
-            Self::PlanNativeCli => "plan",
-            Self::TraceNativeRun | Self::TraceSessionSnapshot => "trace",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::WorkflowSkill => "AIR WORKFLOW",
-            Self::PlanNativeCli => "AIR PLAN",
-            Self::TraceNativeRun => "AIR TRACE",
-            Self::TraceSessionSnapshot => "AIR SESSION",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum AirLocatorDisclosure {
-    LocalOnly,
-    Redacted,
-}
-
-/// Display-only locator following AIR 1's locator vocabulary. It is never
-/// treated as authority or opened automatically by tend.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AirArtifactLocator {
-    pub display: String,
-    pub disclosure: AirLocatorDisclosure,
-}
-
-/// A typed reference to an AIR 1 artifact envelope. Only the stable content
-/// identity/profile and optional display metadata travel through tend; the
-/// source-bearing artifact stays in AIR Workbench or another AIR consumer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AirArtifactReference {
-    pub artifact_id: String,
-    pub profile: AirArtifactProfile,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locator: Option<AirArtifactLocator>,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
@@ -812,8 +745,6 @@ pub struct CollaborationReply {
     pub report: Option<TaskReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub air_artifacts: Vec<AirArtifactReference>,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -895,15 +826,12 @@ pub struct CollaborationRequest {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
-    /// Generic artifact identifiers or locators. AIR artifacts retain their
-    /// typed representation in `air_artifacts`.
+    /// Generic artifact identifiers or locators.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
     /// Generic relationship/URL locators associated with the request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub air_artifacts: Vec<AirArtifactReference>,
     /// Earlier requests by the same sender whose reply wake was withdrawn
     /// when this one was sent. Informational: it does not mark them replaced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1153,8 +1081,6 @@ pub struct NewRequest {
     pub artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
-    #[serde(default)]
-    pub air_artifacts: Vec<AirArtifactReference>,
     /// The sender's own earlier requests whose reply wake this request
     /// replaces. Withdrawn in the same transaction that stores this request;
     /// the earlier work and its reply are untouched.
@@ -1199,7 +1125,6 @@ impl Default for NewRequest {
             paths: Vec::new(),
             artifacts: Vec::new(),
             links: Vec::new(),
-            air_artifacts: Vec::new(),
             withdraw_reply_wakes: Vec::new(),
             recipient_slot: None,
             task_contract: None,
@@ -1500,12 +1425,10 @@ impl CollaborationRequest {
                 report.evidence.clear();
             }
             late.artifacts.clear();
-            late.air_artifacts.clear();
         }
         self.paths.clear();
         self.artifacts.clear();
         self.links.clear();
-        self.air_artifacts.clear();
         if let Some(reply) = &mut self.reply {
             reply.body.clear();
             if let Some(report) = &mut reply.report {
@@ -1513,7 +1436,6 @@ impl CollaborationRequest {
                 report.evidence.clear();
             }
             reply.artifacts.clear();
-            reply.air_artifacts.clear();
         }
         if let Some(mut last) = self.updates.pop() {
             last.body.clear();
@@ -1629,8 +1551,6 @@ pub enum CollaborationError {
     EmptyMessage,
     #[error("message exceeds the configured {0}-byte limit")]
     MessageTooLarge(usize),
-    #[error("invalid AIR artifact reference: {0}")]
-    InvalidAirArtifactReference(String),
     #[error("request not found: {0}")]
     NotFound(String),
     #[error("parent collaboration request not found: {0}")]
@@ -3196,7 +3116,6 @@ impl CollaborationStore {
                 "supersession requires a task contract".into(),
             ));
         }
-        validate_air_artifact_references(&input.air_artifacts)?;
         reject_blank_withdrawals(&input.withdraw_reply_wakes)?;
         let _transaction = self.transaction_lock.lock().await;
         let now = OffsetDateTime::now_utc();
@@ -3308,7 +3227,6 @@ impl CollaborationStore {
             paths: input.paths,
             artifacts: input.artifacts,
             links: input.links,
-            air_artifacts: input.air_artifacts,
             withdrew_reply_wakes: withdrawals,
             to_slot: input.recipient_slot,
             rebound_from: Vec::new(),
@@ -3721,18 +3639,9 @@ impl CollaborationStore {
         status: RequestStatus,
         body: String,
         artifacts: Vec<String>,
-        air_artifacts: Vec<AirArtifactReference>,
     ) -> Result<CollaborationRequest, CollaborationError> {
-        self.reply_with_report(
-            caller,
-            request_id,
-            status,
-            body,
-            artifacts,
-            air_artifacts,
-            None,
-        )
-        .await
+        self.reply_with_report(caller, request_id, status, body, artifacts, None)
+            .await
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Reply and retired notices share one atomic persistence/rollback boundary.
@@ -3743,7 +3652,6 @@ impl CollaborationStore {
         status: RequestStatus,
         body: String,
         artifacts: Vec<String>,
-        air_artifacts: Vec<AirArtifactReference>,
         report: Option<TaskReport>,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
@@ -3774,7 +3682,6 @@ impl CollaborationStore {
                 self.opts.max_message_bytes,
             ));
         }
-        validate_air_artifact_references(&air_artifacts)?;
         let _transaction = self.transaction_lock.lock().await;
         let mut staged = self.stage_request_rows(&[request_id]).await;
         if staged
@@ -3806,7 +3713,6 @@ impl CollaborationStore {
                 previous.status == status
                     && previous.body == body
                     && previous.artifacts == artifacts
-                    && previous.air_artifacts == air_artifacts
                     && previous.report == report
             };
             if request.reply.as_ref().is_some_and(identical) {
@@ -3843,7 +3749,6 @@ impl CollaborationStore {
                 status,
                 body,
                 artifacts,
-                air_artifacts,
                 at: OffsetDateTime::now_utc(),
             };
             if late {
@@ -5349,57 +5254,6 @@ fn next_request_id(now: OffsetDateTime) -> String {
     format!("req_{nanos:x}_{counter:x}")
 }
 
-fn validate_air_artifact_references(
-    references: &[AirArtifactReference],
-) -> Result<(), CollaborationError> {
-    if references.len() > MAX_AIR_ARTIFACT_REFERENCES {
-        return Err(CollaborationError::InvalidAirArtifactReference(format!(
-            "at most {MAX_AIR_ARTIFACT_REFERENCES} references are allowed"
-        )));
-    }
-    for (index, reference) in references.iter().enumerate() {
-        let digest = reference
-            .artifact_id
-            .strip_prefix("urn:air:sha256:")
-            .filter(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            });
-        if digest.is_none() {
-            return Err(CollaborationError::InvalidAirArtifactReference(
-                "artifact_id must be urn:air:sha256 followed by 64 lowercase hex characters".into(),
-            ));
-        }
-        if references[..index]
-            .iter()
-            .any(|prior| prior.artifact_id == reference.artifact_id)
-        {
-            return Err(CollaborationError::InvalidAirArtifactReference(format!(
-                "duplicate artifact_id {}",
-                reference.artifact_id
-            )));
-        }
-        if reference.label.as_ref().is_some_and(|label| {
-            label.trim().is_empty() || label.len() > MAX_AIR_REFERENCE_LABEL_BYTES
-        }) {
-            return Err(CollaborationError::InvalidAirArtifactReference(format!(
-                "label must be non-empty and at most {MAX_AIR_REFERENCE_LABEL_BYTES} bytes"
-            )));
-        }
-        if reference.locator.as_ref().is_some_and(|locator| {
-            locator.display.trim().is_empty()
-                || locator.display.len() > MAX_AIR_LOCATOR_DISPLAY_BYTES
-        }) {
-            return Err(CollaborationError::InvalidAirArtifactReference(format!(
-                "locator display must be non-empty and at most {MAX_AIR_LOCATOR_DISPLAY_BYTES} bytes"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// `claude`, then `claude2`, `claude3`… — the first name in the family the
 /// room is not already using.
 ///
@@ -5522,7 +5376,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Blocked,
                 "SECRET REPLY BODY".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -5811,7 +5664,6 @@ mod tests {
                     RequestStatus::Completed,
                     "reply needle".into(),
                     vec![],
-                    vec![],
                 )
                 .await
                 .unwrap();
@@ -6014,7 +5866,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "spoof".into(),
-                vec![],
                 vec![]
             )
             .await
@@ -6025,7 +5876,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "A".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -6112,7 +5962,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -6210,7 +6059,6 @@ mod tests {
                     &request.id,
                     RequestStatus::Completed,
                     "done".into(),
-                    vec![],
                     vec![],
                 )
                 .await
@@ -6390,18 +6238,6 @@ mod tests {
             current_path: "/repo".into(),
             pane_pid: 0,
             socket: Some("default".into()),
-        }
-    }
-
-    fn air_reference(profile: AirArtifactProfile) -> AirArtifactReference {
-        AirArtifactReference {
-            artifact_id: format!("urn:air:sha256:{}", "a".repeat(64)),
-            profile,
-            label: Some("review plan".into()),
-            locator: Some(AirArtifactLocator {
-                display: "plans/review.air.json".into(),
-                disclosure: AirLocatorDisclosure::LocalOnly,
-            }),
         }
     }
 
@@ -6694,7 +6530,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -6731,7 +6566,6 @@ mod tests {
                 RequestStatus::Completed,
                 "looks good".into(),
                 Vec::new(),
-                Vec::new(),
             )
             .await
             .unwrap();
@@ -6758,7 +6592,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -6829,7 +6662,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -6844,7 +6676,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "green".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -7111,7 +6942,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7126,7 +6956,6 @@ mod tests {
                     &request.id,
                     RequestStatus::Completed,
                     blank.into(),
-                    Vec::new(),
                     Vec::new(),
                 )
                 .await;
@@ -7148,7 +6977,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "  no blockers found  ".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -7183,21 +7011,13 @@ mod tests {
                         expects_reply: true,
                         work_mode: WorkMode::ReadOnly,
                         paths: Vec::new(),
-                        air_artifacts: Vec::new(),
                         ..NewRequest::default()
                     },
                 )
                 .await
                 .unwrap();
             let refused = mailbox
-                .reply(
-                    &recipient,
-                    &request.id,
-                    status,
-                    String::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
+                .reply(&recipient, &request.id, status, String::new(), Vec::new())
                 .await;
             assert!(
                 matches!(refused, Err(CollaborationError::EmptyMessage)),
@@ -7317,7 +7137,6 @@ mod tests {
                         RequestStatus::Completed,
                         "done".into(),
                         Vec::new(),
-                        Vec::new(),
                     )
                     .await
                     .unwrap();
@@ -7352,7 +7171,6 @@ mod tests {
                         &request.id,
                         RequestStatus::Completed,
                         "done".into(),
-                        Vec::new(),
                         Vec::new(),
                     )
                     .await
@@ -7422,7 +7240,6 @@ mod tests {
                         RequestStatus::Completed,
                         "done".into(),
                         Vec::new(),
-                        Vec::new(),
                     )
                     .await
                     .unwrap()
@@ -7442,7 +7259,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -7480,7 +7296,6 @@ mod tests {
                 RequestStatus::Completed,
                 "done".into(),
                 Vec::new(),
-                Vec::new(),
             )
             .await
             .unwrap();
@@ -7491,7 +7306,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -7504,7 +7318,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "changed".into(),
-                Vec::new(),
                 Vec::new()
             )
             .await
@@ -7515,7 +7328,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                Vec::new(),
                 Vec::new()
             )
             .await
@@ -7570,7 +7382,6 @@ mod tests {
                     RequestStatus::Completed,
                     "done".into(),
                     Vec::new(),
-                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -7582,6 +7393,43 @@ mod tests {
             std::fs::write(path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
         }
         eprintln!("{result}");
+    }
+
+    /// AIR references were removed. Rows and peers from earlier versions may
+    /// still carry `air_artifacts`; they must load, with the field dropped.
+    #[tokio::test]
+    async fn legacy_air_artifacts_field_is_ignored() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = mailbox
+            .create(
+                participant("%1", "sender"),
+                participant("%2", "recipient"),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "review auth".into(),
+                    expects_reply: true,
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let legacy = serde_json::json!({
+            "artifact_id": format!("urn:air:sha256:{}", "a".repeat(64)),
+            "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
+        });
+        let mut stored = serde_json::to_value(&request).unwrap();
+        stored["air_artifacts"] = serde_json::json!([legacy]);
+        let loaded: CollaborationRequest = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded, request);
+
+        let mut input = serde_json::to_value(NewRequest {
+            body: "hi".into(),
+            ..NewRequest::default()
+        })
+        .unwrap();
+        input["air_artifacts"] = serde_json::json!([legacy]);
+        let input: NewRequest = serde_json::from_value(input).unwrap();
+        assert_eq!(input.body, "hi");
     }
 
     #[tokio::test]
@@ -7599,13 +7447,11 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: vec!["src/auth.rs".into()],
-                    air_artifacts: vec![air_reference(AirArtifactProfile::PlanNativeCli)],
                     ..NewRequest::default()
                 },
             )
             .await
             .unwrap();
-        assert_eq!(request.air_artifacts[0].profile.kind(), "plan");
         let inbox = mailbox.claim_for(&recipient).await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].status, RequestStatus::Claimed);
@@ -7617,17 +7463,10 @@ mod tests {
                 RequestStatus::Completed,
                 "looks good".into(),
                 Vec::new(),
-                vec![air_reference(AirArtifactProfile::TraceNativeRun)],
             )
             .await
             .unwrap();
         assert_eq!(completed.status, RequestStatus::Completed);
-        assert_eq!(
-            completed.reply.as_ref().unwrap().air_artifacts[0]
-                .profile
-                .label(),
-            "AIR TRACE"
-        );
         assert_eq!(mailbox.unread_reply_count(&sender).await, 1);
         assert_eq!(mailbox.pending_reply_unnotified().await.len(), 1);
         let peeked = mailbox.peek_for(&sender, &request.id).await.unwrap();
@@ -7730,7 +7569,6 @@ mod tests {
                 RequestStatus::Completed,
                 "review complete".into(),
                 Vec::new(),
-                Vec::new(),
             )
             .await
             .unwrap();
@@ -7754,7 +7592,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
                     paths: vec!["src/auth.rs".into()],
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7802,7 +7639,6 @@ mod tests {
                     expects_reply: false,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7842,7 +7678,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7880,7 +7715,6 @@ mod tests {
                     expects_reply: false,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7916,7 +7750,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7950,7 +7783,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -7973,7 +7805,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -8003,7 +7834,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8016,33 +7846,6 @@ mod tests {
             .unwrap();
         assert_eq!(latest.status, RequestStatus::Queued);
         assert_eq!(latest.id, request.id);
-    }
-
-    #[tokio::test]
-    async fn invalid_air_reference_is_rejected_before_persistence() {
-        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
-        let mut invalid = air_reference(AirArtifactProfile::WorkflowSkill);
-        invalid.artifact_id = format!("urn:air:sha256:{}", "A".repeat(64));
-        let result = mailbox
-            .create(
-                participant("%1", "sender"),
-                participant("%2", "recipient"),
-                NewRequest {
-                    kind: RequestKind::Review,
-                    body: "review workflow".into(),
-                    expects_reply: true,
-                    work_mode: WorkMode::ReadOnly,
-                    paths: Vec::new(),
-                    air_artifacts: vec![invalid],
-                    ..NewRequest::default()
-                },
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(CollaborationError::InvalidAirArtifactReference(_))
-        ));
     }
 
     #[tokio::test]
@@ -8122,7 +7925,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8138,7 +7940,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::Execute,
                     paths: vec!["src/**".into()],
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8193,7 +7994,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8277,7 +8077,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8313,7 +8112,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8353,7 +8151,6 @@ mod tests {
                     expects_reply: true,
                     work_mode: WorkMode::ReadOnly,
                     paths: Vec::new(),
-                    air_artifacts: Vec::new(),
                     ..NewRequest::default()
                 },
             )
@@ -8390,7 +8187,6 @@ mod tests {
                     &request.id,
                     RequestStatus::Completed,
                     "reply".into(),
-                    vec![],
                     vec![],
                 )
                 .await
@@ -8879,7 +8675,6 @@ mod tests {
                         expects_reply: true,
                         work_mode: WorkMode::ReadOnly,
                         paths: Vec::new(),
-                        air_artifacts: Vec::new(),
                         ..NewRequest::default()
                     },
                 )
@@ -8941,7 +8736,6 @@ mod tests {
                         expects_reply: true,
                         work_mode: WorkMode::ReadOnly,
                         paths: Vec::new(),
-                        air_artifacts: Vec::new(),
                         ..NewRequest::default()
                     },
                 )
@@ -8957,7 +8751,6 @@ mod tests {
                     id,
                     RequestStatus::Completed,
                     "answered".into(),
-                    Vec::new(),
                     Vec::new(),
                 )
                 .await
@@ -9527,7 +9320,6 @@ mod tests {
                 RequestStatus::Completed,
                 "approved".into(),
                 Vec::new(),
-                Vec::new(),
             )
             .await
             .unwrap();
@@ -10002,7 +9794,6 @@ mod tests {
             status: RequestStatus::Completed,
             body: "not read".into(),
             artifacts: Vec::new(),
-            air_artifacts: Vec::new(),
             at: old,
         });
         std::fs::write(

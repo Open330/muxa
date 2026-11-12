@@ -538,7 +538,6 @@ mod tests {
                 &action.id,
                 RequestStatus::Completed,
                 "spoof".into(),
-                vec![],
                 vec![]
             )
             .await
@@ -549,7 +548,6 @@ mod tests {
                 &action.id,
                 RequestStatus::Completed,
                 "Wait; do not reassign".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -665,7 +663,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "finished".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -974,7 +971,6 @@ mod tests {
                 &request.id,
                 RequestStatus::Completed,
                 "done".into(),
-                vec![],
                 vec![],
             )
             .await

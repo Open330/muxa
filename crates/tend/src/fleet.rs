@@ -71,7 +71,7 @@ pub const LOCAL_MANAGED_LABELS: &[&str] = &[
 pub const FLEET_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const FLEET_MAX_DIAGNOSTIC_BYTES: usize = 1024;
 /// Keep each Fleet mailbox tab comfortably below the relay frame ceiling even
-/// when every request carries maximum-sized text and AIR references.
+/// when every request carries maximum-sized text and artifact lists.
 pub const FLEET_MAILBOX_REQUEST_LIMIT: usize = 32;
 pub const FLEET_MAX_CAPTURE_BYTES: usize = 256 * 1024;
 /// Relay capability: the remote node runs an allowlisted `tend work …` argv
@@ -1863,7 +1863,6 @@ mod tests {
                 paths: Vec::new(),
                 artifacts: Vec::new(),
                 links: Vec::new(),
-                air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             }),

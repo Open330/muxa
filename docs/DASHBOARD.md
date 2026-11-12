@@ -353,7 +353,7 @@ graph uses stable host/socket/agent-session nodes (plus one operator-console
 node) and aggregates directed request edges by peer pair, count, kind, and
 status; replies appear as dashed reverse edges. Selecting an edge or room
 drills the adjacent sequence into chronological request/reply arrows. Selecting
-an event opens its thread/parent, Work/Run, artifact, link, AIR, message, and
+an event opens its thread/parent, Work/Run, artifact, link, message, and
 reply details when the response is authorized. The sequence caps the rendered
 tail at 200 requests, while **load more** extends the retained result used by
 the graph and drill-down.
@@ -378,7 +378,7 @@ it or replace it with an offset. The response contains `generated_at`,
 `400`; a disabled collaboration subsystem returns `503`.
 
 When `details_included` is false, request/reply/update bodies, provenance, paths,
-generic artifacts, links, and AIR references are omitted. Participant, room,
+generic artifacts, and links are omitted. Participant, room,
 thread/parent, Work/Run, kind, status, timestamps, and counts remain available
 for a useful summary graph. In the Sessions panel, use the Collaboration tab
 and select a session or window to filter its history. Unlock details with the

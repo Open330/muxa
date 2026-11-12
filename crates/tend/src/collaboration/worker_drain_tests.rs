@@ -261,7 +261,6 @@ async fn worker_drain_owed_and_reserved_reply_wakes_exclude_retirement() {
             RequestStatus::Completed,
             "done".into(),
             Vec::new(),
-            Vec::new(),
         )
         .await
         .unwrap();

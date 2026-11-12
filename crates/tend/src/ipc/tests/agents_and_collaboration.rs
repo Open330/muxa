@@ -1532,7 +1532,6 @@ async fn request_updates_round_trip_between_fleet_console_and_recipient() {
             RequestStatus::Completed,
             "verified",
             &[],
-            &[],
         )
         .await
         .unwrap();
@@ -1610,7 +1609,6 @@ async fn progress_peek_over_ipc_preserves_unread_reply_and_checks_participation(
             &request.id,
             RequestStatus::Completed,
             "final report",
-            &[],
             &[],
         )
         .await
@@ -1712,7 +1710,6 @@ async fn widening_a_listing_over_ipc_is_console_only() {
                         paths: Vec::new(),
                         artifacts: Vec::new(),
                         links: Vec::new(),
-                        air_artifacts: Vec::new(),
                         withdraw_reply_wakes: Vec::new(),
                         recipient_slot: None,
                     },
@@ -1867,7 +1864,6 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
                 paths: Vec::new(),
                 artifacts: Vec::new(),
                 links: Vec::new(),
-                air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             },
@@ -1901,7 +1897,6 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
                 paths: vec!["src/**".into()],
                 artifacts: Vec::new(),
                 links: Vec::new(),
-                air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             },
@@ -1974,7 +1969,6 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             RequestStatus::Completed,
             "looks good",
             &[],
-            &[],
         )
         .await
         .unwrap();
@@ -2030,7 +2024,6 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
                 paths: Vec::new(),
                 artifacts: Vec::new(),
                 links: Vec::new(),
-                air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             },
@@ -2190,7 +2183,6 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
                 paths: Vec::new(),
                 artifacts: Vec::new(),
                 links: Vec::new(),
-                air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             },

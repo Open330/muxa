@@ -598,14 +598,7 @@ other agent occupies the same stable tmux window.
                "workspace_id": "webapp", "work_id": "ENG-7345",
                "run_id": "tmux:default:@1",
                "artifacts": ["commit:d4bf2aa"],
-               "links": ["https://example.test/review"],
-               "air_artifacts": [{
-                 "artifact_id": "urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                 "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
-                 "label": "auth review plan",
-                 "locator": { "display": ".air/auth-plan.air.json",
-                              "disclosure": "local-only" }
-               }] } }
+               "links": ["https://example.test/review"] } }
 
 { "protocol": 3, "kind": "collaboration_inbox",
   "origin": { "pane": "%18", "socket": "default" } }
@@ -617,7 +610,7 @@ other agent occupies the same stable tmux window.
 { "protocol": 3, "kind": "collaboration_reply",
   "origin": { "pane": "%18", "socket": "default" },
   "request_id": "req_...", "status": "completed", "body": "looks good",
-  "artifacts": [], "air_artifacts": [] }
+  "artifacts": [] }
 
 { "protocol": 3, "kind": "collaboration_get",
   "origin": { "pane": "%12", "socket": "default" },
@@ -677,13 +670,6 @@ mixed-version CLI/watch/MCP compatibility. The CLI's new list filters and
 offset/limit are applied locally to that newest-first snapshot. Indexed
 keyset queries are currently an in-process store contract used by the
 dashboard, not a new local IPC method.
-
-`air_artifacts` is an additive list of typed AIR 1.0 references on both
-requests and replies. The daemon validates the SHA-256 URN, exact supported
-profile URI, label/locator bounds, and duplicates, but does not read the
-locator or assert AIR document conformance. Locators are display-only and have
-`local-only` or `redacted` disclosure. Existing persisted requests without the
-field decode as an empty list.
 
 #### `subscribe`
 

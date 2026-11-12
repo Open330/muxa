@@ -410,11 +410,6 @@ tracked agent를, session은 window index와 pane index가 낮은 순서의 agen
 console이 발신자이므로 일반 shell pane에서 watch를 열어도 협업이 그대로
 동작합니다.
 
-AIR artifact 참조가 첨부된 request는 mailbox에서 profile별 색상 배지로
-표시됩니다. `AIR WORKFLOW`는 파랑, `AIR PLAN`은 자홍, `AIR TRACE`는 청록,
-`AIR SESSION`은 밝은 청록입니다. 선택 상세에는 참조가 작업 입력인지 응답
-출력인지와 짧은 digest, label, 표시용 locator가 함께 나옵니다.
-
 ## Preview
 
 `o` 또는 `Alt-P`를 누르면 선택 pane의 preview가 열립니다. work view에서 선택한 work window에

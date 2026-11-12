@@ -221,7 +221,6 @@ pub(crate) fn message(request: &CollaborationRequest, include_body: bool) -> Val
         value["paths"] = json!(request.paths);
         value["artifacts"] = json!(request.artifacts);
         value["links"] = json!(request.links);
-        value["air_artifacts"] = json!(request.air_artifacts);
         if !request.updates.is_empty() {
             value["updates"] = updates(request, 0);
             value["first_retained_sequence"] = json!(request.updates.first().map(|u| u.sequence));
@@ -371,7 +370,6 @@ mod tests {
                 status,
                 body: "pending is discussed here; this is a final reply".into(),
                 artifacts: vec![],
-                air_artifacts: vec![],
                 at: OffsetDateTime::UNIX_EPOCH,
             });
             let mutation = mutation_receipt(&request);
@@ -450,7 +448,6 @@ mod tests {
         for field in ["body", "kind", "work_mode", "paths", "artifacts", "links"] {
             assert_eq!(inbox[field], json!(request)[field]);
         }
-        assert_eq!(inbox["air_artifacts"], json!(request.air_artifacts));
         assert!(message(&request, false).get("body").is_none());
         assert_eq!(updates(&request, 2)[0]["body"], "update 3");
         assert_eq!(updates(&request, 3), json!([]));
@@ -598,13 +595,7 @@ mod tests {
         let escaped = json!(request.body).to_string().len() - 2;
         let body = request.body.len();
         let mut payload = escaped + json!(request.paths).to_string().len();
-        for key in [
-            "task_contract",
-            "attempt",
-            "artifacts",
-            "links",
-            "air_artifacts",
-        ] {
+        for key in ["task_contract", "attempt", "artifacts", "links"] {
             if let Some(value) = data[0].get(key) {
                 payload += value.to_string().len();
             }
@@ -773,7 +764,6 @@ mod tests {
             status: RequestStatus::Completed,
             body: "reply-body-marker".repeat(512),
             artifacts: vec![],
-            air_artifacts: vec![],
             at: OffsetDateTime::UNIX_EPOCH,
             report: None,
         });

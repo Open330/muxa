@@ -1,10 +1,9 @@
 use super::{
     collab_screen, collaboration_open_hint, collaboration_requests, request_kind_label,
-    selected_collaboration_request, truncate_chars, watch_theme, work_mode_label,
-    AirArtifactProfile, AirArtifactReference, App, Block, Borders, CollaborationMailboxTab,
-    CollaborationRequest, Color, Constraint, Direction, Frame, HashMap, Layout, Line,
-    MailboxDetail, MailboxHistoryScope, Modifier, OffsetDateTime, Paragraph, Participant, Rect,
-    RequestStatus, Span, Style, WatchThemeSpec,
+    selected_collaboration_request, truncate_chars, watch_theme, work_mode_label, App, Block,
+    Borders, CollaborationMailboxTab, CollaborationRequest, Color, Constraint, Direction, Frame,
+    HashMap, Layout, Line, MailboxDetail, MailboxHistoryScope, Modifier, OffsetDateTime, Paragraph,
+    Participant, Rect, RequestStatus, Span, Style, WatchThemeSpec,
 };
 
 pub(super) fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App) {
@@ -38,21 +37,8 @@ pub(super) fn render_collaboration_mailbox(f: &mut Frame, area: Rect, app: &App)
         return;
     }
 
-    let has_air = selected_collaboration_request(app).is_some_and(|request| {
-        !request.air_artifacts.is_empty()
-            || request
-                .reply
-                .as_ref()
-                .is_some_and(|reply| !reply.air_artifacts.is_empty())
-    });
     let detail_height = match app.collaboration_mailbox.detail_expand {
-        MailboxDetail::Compact => {
-            if has_air {
-                8
-            } else {
-                6
-            }
-        }
+        MailboxDetail::Compact => 6,
         MailboxDetail::Half => inner.height / 2,
         // Leave the list three rows: enough to keep selection context
         // without stealing the reading space the user just asked for.
@@ -489,21 +475,11 @@ fn collaboration_request_detail_lines(
         ),
         theme.dim_style(),
     ))];
-    lines.extend(
-        request
-            .air_artifacts
-            .iter()
-            .map(|reference| air_artifact_detail_line("input", reference, width)),
-    );
     // Human-readable content owns the compact view. Stable ids and causal
     // metadata only appear after `|` expands the detail pane.
     let show_technical = height >= 10;
-    let reply_air = request
-        .reply
-        .as_ref()
-        .map_or(0, |reply| reply.air_artifacts.len());
     let remaining = height
-        .saturating_sub(lines.len() + reply_air + usize::from(show_technical))
+        .saturating_sub(lines.len() + usize::from(show_technical))
         .max(2);
     let (body_budget, reply_budget) = if request.reply.is_some() {
         let body = remaining.div_ceil(2);
@@ -523,12 +499,6 @@ fn collaboration_request_detail_lines(
             wrap_detail_text(&prefix, &reply.body, width, reply_budget.max(1))
                 .into_iter()
                 .map(|row| Line::from(Span::styled(row, Style::default().fg(Color::Green)))),
-        );
-        lines.extend(
-            reply
-                .air_artifacts
-                .iter()
-                .map(|reference| air_artifact_detail_line("output", reference, width)),
         );
     }
     if show_technical {
@@ -562,48 +532,6 @@ fn collaboration_request_detail_lines(
         lines.push(Line::from(Span::styled("-", theme.dim_style())));
     }
     lines
-}
-
-fn air_artifact_badge(reference: &AirArtifactReference) -> Span<'static> {
-    let (foreground, background) = match reference.profile {
-        AirArtifactProfile::WorkflowSkill => (Color::White, Color::Blue),
-        AirArtifactProfile::PlanNativeCli => (Color::White, Color::Magenta),
-        AirArtifactProfile::TraceNativeRun => (Color::Black, Color::Cyan),
-        AirArtifactProfile::TraceSessionSnapshot => (Color::Black, Color::LightCyan),
-    };
-    Span::styled(
-        format!(" {} ", reference.profile.label()),
-        Style::default()
-            .fg(foreground)
-            .bg(background)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn air_artifact_detail_line(
-    direction: &str,
-    reference: &AirArtifactReference,
-    width: usize,
-) -> Line<'static> {
-    let short_id = reference
-        .artifact_id
-        .strip_prefix("urn:air:sha256:")
-        .unwrap_or(&reference.artifact_id)
-        .chars()
-        .take(12)
-        .collect::<String>();
-    let label = reference.label.as_deref().unwrap_or("-");
-    let locator = reference
-        .locator
-        .as_ref()
-        .map_or("", |locator| locator.display.as_str());
-    Line::from(vec![
-        air_artifact_badge(reference),
-        Span::raw(truncate_chars(
-            &format!(" {direction} · {short_id} · {label} · {locator}"),
-            width.saturating_sub(reference.profile.label().len() + 2),
-        )),
-    ])
 }
 
 /// Prompt input should feel like a command bar, not a modal dialog: it

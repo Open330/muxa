@@ -1825,7 +1825,6 @@ actor TendIPCClient {
                     "expects_reply": expectsReply,
                     "work_mode": workMode,
                     "paths": [],
-                    "air_artifacts": [],
                 ],
             ]
         )

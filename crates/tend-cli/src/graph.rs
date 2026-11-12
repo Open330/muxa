@@ -1174,7 +1174,6 @@ mod tests {
                 tend::collaboration::RequestStatus::Completed,
                 "response detail".into(),
                 Vec::new(),
-                Vec::new(),
             )
             .await
             .unwrap();

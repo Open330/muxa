@@ -99,7 +99,7 @@ def after():
     sender_before=capture('sender')
     event('sender','turn_stopped',response='Transport fixture waiting for completion.')
     rpc('collaboration_reply',origin=origin('recipient'),request_id=task['id'],status='completed',
-        body='QUIET-AFTER: transport fixture completed',artifacts=[],air_artifacts=[])
+        body='QUIET-AFTER: transport fixture completed',artifacts=[])
     # Reading as recipient does not suppress the sender notification under test.
     wait_for(lambda:get(task,'recipient').get('reply_notified_at'))
     wait_for(lambda:task['id'] in (capture('sender') or ''))

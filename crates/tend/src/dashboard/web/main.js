@@ -4207,7 +4207,7 @@ function renderCollaborationDetail(request) {
   const work = requestWorkId(request);
   const thread = requestThreadId(request);
   const parent = request.parent_request_id || "";
-  const artifacts = [...(request.artifacts || []), ...(request.air_artifacts || []), ...(reply?.artifacts || []), ...(reply?.air_artifacts || [])];
+  const artifacts = [...(request.artifacts || []), ...(reply?.artifacts || [])];
   const links = (request.links || []).map((link) => typeof link === "string" ? { label: link, url: link } : link);
   const detailsIncluded = store.collaboration.details_included;
   dom.collaborationDetail.hidden = false;

@@ -1396,18 +1396,12 @@ fn watch_mailbox_render_contains_request_and_peer() {
     let mut app = collaboration_watch_app();
     app.collaboration_mailbox.tab = CollaborationMailboxTab::Incoming;
     let room = app.collaboration.room.as_ref().unwrap();
-    let mut request = fake_watch_collaboration_request(
+    let request = fake_watch_collaboration_request(
         "req_watch_render_123456",
         room.peers[0].clone(),
         room.current.clone(),
         RequestStatus::Claimed,
     );
-    request.air_artifacts.push(AirArtifactReference {
-        artifact_id: format!("urn:air:sha256:{}", "b".repeat(64)),
-        profile: AirArtifactProfile::PlanNativeCli,
-        label: Some("ENG-6924 execution plan".into()),
-        locator: None,
-    });
     app.collaboration.incoming.push(request);
     app.collaboration_mailbox.open = true;
     let backend = TestBackend::new(100, 30);
@@ -1425,8 +1419,6 @@ fn watch_mailbox_render_contains_request_and_peer() {
     assert!(dump.contains("messages"));
     assert!(dump.contains("reviewer@%2"));
     assert!(dump.contains("in progress"));
-    assert!(dump.contains("AIR PLAN"));
-    assert!(dump.contains("bbbbbbbbbbbb"));
     assert!(dump.contains("review the auth change"));
     assert!(
         !dump.contains("req_watch_render_123456"),
