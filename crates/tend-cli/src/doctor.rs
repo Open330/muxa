@@ -62,6 +62,9 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
             add(&mut report, "tendd", None, result);
         }
     }
+    for result in check_hook_spool(time::OffsetDateTime::now_utc()) {
+        add(&mut report, "tendd", None, result);
+    }
     // Its own check, on any daemon that answered: a failed verdict on
     // something else (a corrupt mailbox) never hides why swaps are down.
     check_accounts(&mut report, config, &socket, responded).await;
@@ -174,6 +177,87 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     };
     println!("└  {summary}");
     Ok(())
+}
+
+/// Hook events that did not reach tendd: those still spooled, and what the
+/// last daemon start replayed. A protocol mismatch means a CLI and a daemon
+/// of different versions are running side by side.
+fn check_hook_spool(now: time::OffsetDateTime) -> Vec<CheckResult> {
+    let pending = tend::hook_spool::default_spool_file()
+        .map(|path| tend::hook_spool::read_all(&path).0)
+        .unwrap_or_default();
+    let drained = tend::hook_spool::default_drain_report_file()
+        .and_then(|path| tend::hook_spool::read_report(&path));
+    hook_spool_verdicts(&pending, drained.as_ref(), now)
+}
+
+fn hook_spool_verdicts(
+    pending: &[tend::hook_spool::SpoolEntry],
+    drained: Option<&tend::hook_spool::DrainReport>,
+    now: time::OffsetDateTime,
+) -> Vec<CheckResult> {
+    use tend::hook_spool::IngestFailure;
+    let mismatch_remedy = "a CLI and a daemon of different versions are running; restart tendd \
+                           (`tend daemon restart`) and the agents' hooks pick up the match";
+    let mut out = Vec::new();
+    if let Some(newest) = pending.iter().max_by_key(|entry| entry.spooled_at) {
+        let mismatches = pending
+            .iter()
+            .filter(|entry| entry.failure == IngestFailure::ProtocolMismatch)
+            .count();
+        let mut message = format!(
+            "hook ingest: {} event(s) did not reach tendd and wait for its next start \
+             (latest: {}, from tend {}: {})",
+            pending.len(),
+            newest.failure.label(),
+            newest.cli_version,
+            newest.error
+        );
+        if mismatches > 0 {
+            use std::fmt::Write as _;
+            let _ = write!(
+                message,
+                "; {mismatches} protocol mismatch — {mismatch_remedy}"
+            );
+        }
+        out.push(CheckResult::Warn(message));
+    }
+    // Only a recent drain is news; an old one was already reported.
+    if let Some(report) = drained.filter(|report| {
+        report.total() > 0
+            && report
+                .drained_at
+                .is_some_and(|at| now - at <= time::Duration::days(7))
+    }) {
+        let mismatches = report
+            .failures
+            .get(&IngestFailure::ProtocolMismatch)
+            .copied()
+            .unwrap_or(0);
+        let kinds = report
+            .failures
+            .iter()
+            .map(|(kind, count)| format!("{count} {}", kind.label()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "hook ingest: the last tendd start found {} failed hook event(s) ({kinds}); \
+             replayed {}, skipped {} as stale or superseded, {} refused again",
+            report.total(),
+            report.replayed,
+            report.skipped,
+            report.failed
+        );
+        out.push(if mismatches > 0 || report.failed > 0 {
+            CheckResult::Warn(format!("{message} — {mismatch_remedy}"))
+        } else {
+            CheckResult::Ok(message)
+        });
+    }
+    if out.is_empty() {
+        out.push(CheckResult::Ok("hook ingest: no failed events".into()));
+    }
+    out
 }
 
 fn add(report: &mut Report, section: &'static str, group: Option<&str>, result: CheckResult) {
@@ -2373,5 +2457,62 @@ esac
         // Nobody listening: not answered, so no swap probe is made.
         let (_, responded) = probe_tendd(&dir.path().join("nobody.sock")).await;
         assert!(!responded);
+    }
+
+    fn spooled(failure: tend::hook_spool::IngestFailure) -> tend::hook_spool::SpoolEntry {
+        let at = time::OffsetDateTime::now_utc();
+        tend::hook_spool::SpoolEntry {
+            v: tend::hook_spool::SPOOL_SCHEMA_VERSION,
+            spooled_at: at,
+            failure,
+            error: "protocol mismatch: server=3 client=4".into(),
+            protocol: 4,
+            cli_version: "9.9.9".into(),
+            launch_id: None,
+            event: tend::AgentEvent::Started {
+                id: tend::event::AgentId {
+                    kind: tend::AgentKind::ClaudeCode,
+                    session_id: "s".into(),
+                    surface: None,
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                at,
+            },
+        }
+    }
+
+    #[test]
+    fn hook_spool_reports_pending_protocol_skew_and_a_recent_drain() {
+        use tend::hook_spool::{DrainReport, IngestFailure};
+        let now = time::OffsetDateTime::now_utc();
+        assert!(matches!(
+            hook_spool_verdicts(&[], None, now).as_slice(),
+            [CheckResult::Ok(_)]
+        ));
+        let pending = [spooled(IngestFailure::ProtocolMismatch)];
+        let verdicts = hook_spool_verdicts(&pending, None, now);
+        assert!(
+            matches!(verdicts.as_slice(), [CheckResult::Warn(m)] if m.contains("protocol mismatch") && m.contains("9.9.9"))
+        );
+        let clean = DrainReport {
+            drained_at: Some(now),
+            replayed: 2,
+            failures: [(IngestFailure::Unreachable, 2)].into(),
+            ..DrainReport::default()
+        };
+        assert!(matches!(
+            hook_spool_verdicts(&[], Some(&clean), now).as_slice(),
+            [CheckResult::Ok(m)] if m.contains("replayed 2")
+        ));
+        let old = DrainReport {
+            drained_at: Some(now - time::Duration::days(8)),
+            ..clean
+        };
+        assert!(matches!(
+            hook_spool_verdicts(&[], Some(&old), now).as_slice(),
+            [CheckResult::Ok(m)] if m.contains("no failed events")
+        ));
     }
 }

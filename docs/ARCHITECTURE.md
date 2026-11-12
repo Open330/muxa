@@ -105,6 +105,7 @@ hook claims the pane.
 | `collaboration.sqlite3` | Indexed durable mailbox, thread/Work metadata, and exact-session aliases/roles. An existing `collaboration.json` is imported once and retained as a migration backup. |
 | `dashboard-work.json` | Schema-v2 Work definitions and external issue references keyed by logical Work identity. |
 | `host-id` | Owner-only stable physical-node UUID used by Fleet handshakes. |
+| `hook-spool.ndjson` | Hook events that failed to ingest (daemon down, timeout, protocol mismatch), `0600`, rotated to `.1` at 512 KiB. tendd replays events younger than 15 minutes that it holds nothing newer for at startup, then writes `hook-spool-drain.json`; `tend doctor` reports both. Heartbeats and headless Ask runs are not spooled; appends, rotation and the drain serialize on `hook-spool.ndjson.lock`, and the replay runs before tendd accepts connections. |
 
 Paths are configurable; defaults live under `$XDG_DATA_HOME/tend`.
 

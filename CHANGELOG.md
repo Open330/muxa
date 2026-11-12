@@ -165,6 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaced or has exited. The reply wake follows the sender's alias (or role)
   to the one session that now holds it. If no session does, a recovery item
   tells you a reply is waiting for nobody.
+- A hook event tendd did not take is no longer lost silently. The CLI used to
+  ignore an ingest the daemon refused (a protocol mismatch while the CLI and
+  tendd are on different versions read as success) and dropped an ingest that
+  failed outright. Both now go to a small bounded spool
+  (`hook-spool.ndjson`); tendd replays the events that are still current when
+  it next starts, and `tend doctor` reports pending and replayed failures,
+  naming a protocol mismatch and its fix.
 - A peer that claims a request and ends its turn without replying no longer
   leaves the sender waiting silently. Its `Stop` hook reminds it of the
   request id (at most three times, five minutes apart); if it stays idle

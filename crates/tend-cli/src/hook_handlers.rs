@@ -6,12 +6,25 @@ use super::{
 /// Hook commands are invoked on the agent's critical path (every prompt,
 /// every tool call). If the daemon is down we MUST NOT block or fail — a
 /// best-effort ingest with a stderr warning keeps the agent healthy.
+///
+/// A failed ingest is appended to the bounded hook spool instead of being
+/// dropped: `tendd` replays what is still current when it next starts, and
+/// `tend doctor` reports the failures (a protocol mismatch included).
 pub(super) async fn best_effort_ingest(client: &Client, ev: &tend::event::AgentEvent) {
-    if let Err(e) = client
-        .ingest_with_launch_claim(ev, tend::adapters::hook::launch_claim(ev.id().kind))
-        .await
-    {
-        tracing::debug!(error = %e, "tend ingest failed (daemon down?)");
+    let launch_id = tend::adapters::hook::launch_claim(ev.id().kind);
+    if let Err(e) = client.ingest_with_launch_claim(ev, launch_id.clone()).await {
+        tracing::debug!(error = %e, "tend ingest failed; spooling the event");
+        let headless_ask = std::env::var_os(tend::ask::ASK_ENV_MARKER).is_some();
+        if !tend::hook_spool::spoolable(ev, headless_ask) {
+            return;
+        }
+        let Some(path) = tend::hook_spool::default_spool_file() else {
+            return;
+        };
+        let entry = tend::hook_spool::SpoolEntry::new(ev, launch_id, &e);
+        if let Err(error) = tend::hook_spool::append(&path, &entry) {
+            tracing::debug!(%error, "hook spool append failed");
+        }
     }
 }
 

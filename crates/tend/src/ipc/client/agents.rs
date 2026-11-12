@@ -25,8 +25,14 @@ impl Client {
         // Hook ingest is on the agent's critical path — use the tighter
         // deadline so a wedged daemon fails fast (the caller treats any error
         // as a best-effort no-op) instead of stalling the agent.
-        let _ = self.call_with_timeout(&req, HOOK_CALL_TIMEOUT).await?;
-        Ok(())
+        let response = self.call_with_timeout(&req, HOOK_CALL_TIMEOUT).await?;
+        // A refusal (a protocol mismatch during a staggered upgrade, an event
+        // this daemon cannot parse) used to read as success and vanish.
+        if response["ok"].as_bool().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(super::response_error(&response))
+        }
     }
 
     /// Only the opt-in agents JSON view consumes this additive provenance sidecar.
