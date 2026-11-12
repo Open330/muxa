@@ -18,6 +18,14 @@ pub(crate) const RETIRED: &[(&str, &str)] = &[
     ("tend_dispatch_status", "tend_wait"),
     ("tend_collaboration_guide", "tend_guide"),
     ("tend_room_context", "tend_guide"),
+    ("tend_agent_find", "tend_status"),
+    ("tend_capture_pane", "tend_status"),
+    ("tend_recent_prompts", "tend_status"),
+    ("tend_fleet_status", "tend_status"),
+    ("tend_fleet_capture", "tend_status"),
+    ("tend_fleet_send_prompt", "tend_send_prompt"),
+    ("tend_dispatch_work", "tend_start_work"),
+    ("tend_agent_read", "tend_agent_search"),
 ];
 
 pub(crate) fn replacement(name: &str) -> Option<&'static str> {
@@ -137,6 +145,23 @@ pub(crate) fn route(name: &str, args: Value) -> Result<Routed, String> {
             }
         }
         "tend_wait" => route_wait(&args),
+        "tend_status" => route_status(args),
+        "tend_send_prompt" if remote_host(&args).is_some() => route_fleet_prompt(&args),
+        "tend_start_work" if args.get("commit").is_some() => route_dispatch(&args),
+        "tend_agent_search" if args.get("event_id").is_some() => Ok(routed(
+            "tend_agent_read",
+            copy(
+                &args,
+                &[
+                    "event_id",
+                    "before",
+                    "after",
+                    "include_tool_pair",
+                    "text_offset",
+                    "max_chars",
+                ],
+            ),
+        )),
         _ => Ok(Routed {
             name: name.to_string(),
             args,
@@ -157,6 +182,195 @@ fn handle_kind(id: &str) -> &'static str {
         "dispatch"
     } else {
         "swap"
+    }
+}
+
+fn plain(name: &str, args: serde_json::Map<String, Value>) -> Routed {
+    Routed {
+        name: name.to_string(),
+        args: Value::Object(args),
+        replaced_by: None,
+    }
+}
+
+/// `tend_send_prompt` on a Fleet host.
+fn route_fleet_prompt(args: &Value) -> Result<Routed, String> {
+    // The Fleet route cannot enforce these yet; refuse rather than
+    // send without them.
+    for unsupported in ["session_id", "socket"] {
+        if args.get(unsupported).is_some() {
+            return Err(format!(
+                "{unsupported} is not supported with host yet; nothing was sent"
+            ));
+        }
+    }
+    Ok(plain(
+        "tend_fleet_send_prompt",
+        copy(args, &["host", "pane", "text", "submit"]),
+    ))
+}
+
+/// `tend_start_work` with a commit: a Fleet dispatch.
+fn route_dispatch(args: &Value) -> Result<Routed, String> {
+    let mut out = copy(
+        args,
+        &[
+            "dispatch_id",
+            "workspace",
+            "work",
+            "commit",
+            "body",
+            "selector",
+            "host",
+            "plan",
+        ],
+    );
+    // dry_run is the start_work spelling of the dispatch plan.
+    if let Some(dry_run) = args.get("dry_run") {
+        if out.get("plan").is_some_and(|plan| plan != dry_run) {
+            return Err("dry_run and plan disagree; nothing was dispatched".into());
+        }
+        out.insert("plan".into(), dry_run.clone());
+    }
+    for unsupported in [
+        "pipeline",
+        "cwd",
+        "skill",
+        "context",
+        "external",
+        "no_ticket",
+        "refresh",
+    ] {
+        if args.get(unsupported).is_some() {
+            return Err(format!(
+                    "{unsupported} is not supported with commit (Fleet dispatch); nothing was dispatched"
+                ));
+        }
+    }
+    Ok(plain("tend_dispatch_work", out))
+}
+
+/// `host` naming a Fleet host other than this one.
+fn remote_host(args: &Value) -> Option<&str> {
+    args.get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty() && *host != "local")
+}
+
+fn route_status(mut args: Value) -> Result<Routed, String> {
+    let routed = |name: &str, args: serde_json::Map<String, Value>| Routed {
+        name: name.to_string(),
+        args: Value::Object(args),
+        replaced_by: None,
+    };
+    match args.get("host").and_then(Value::as_str).map(str::trim) {
+        // The whole Fleet, explicitly.
+        Some("all") => {
+            if args.get("pane").is_some() {
+                return Err("host=all reads the Fleet summary; name a host to read a pane".into());
+            }
+            return Ok(routed(
+                "tend_fleet_status",
+                copy(&args, &["selector", "full"]),
+            ));
+        }
+        Some("local" | "") => {
+            if let Some(object) = args.as_object_mut() {
+                object.remove("host");
+            }
+        }
+        Some(_) => {
+            if args.get("pane").is_none() {
+                return Err(
+                    "name a pane on that host, or use host=all for the Fleet summary".into(),
+                );
+            }
+            return Ok(routed("tend_fleet_capture", copy(&args, &["host", "pane"])));
+        }
+        None => {}
+    }
+    if args.get("query").is_some() {
+        return Ok(routed(
+            "tend_agent_find",
+            copy(&args, &["query", "limit", "refresh", "exclude_sessions"]),
+        ));
+    }
+    if args.get("pane").is_none() && args.get("history_limit").is_some() {
+        let mut out = copy(&args, &["full"]);
+        if let Some(limit) = args.get("history_limit") {
+            out.insert("limit".into(), limit.clone());
+        }
+        return Ok(routed("tend_recent_prompts", out));
+    }
+    Ok(Routed {
+        name: "tend_status".into(),
+        args,
+        replaced_by: None,
+    })
+}
+
+/// Fold the absorbed tools' arguments into the listed schemas, tersely.
+pub(crate) fn extend_schemas(tools: &mut [Value]) {
+    for tool in tools {
+        let Some(name) = tool["name"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let (extra, description): (Value, &str) = match name.as_str() {
+            "tend_status" => (
+                json!({
+                    "query": {"type": "string", "description": "Find where agents working on a task are: a few keywords or an identifier, not a question. Returns ranked panes with evidence; matches do not prove ownership."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "query: default 10."},
+                    "refresh": {"type": "boolean", "description": "query: re-observe inventory now."},
+                    "exclude_sessions": {"type": "array", "items": {"type": "string"}, "description": "query: session ids to skip (yours)."},
+                    "host": {"type": "string", "description": "A Fleet host: with pane, capture that pane there; without, the cached Fleet summary (selector filters hosts)."},
+                    "selector": {"type": "string", "description": "host: label selector, e.g. env=prod."}
+                }),
+                " history_limit without pane lists recent prompts across panes. host reads a Fleet host; query finds agents by task.",
+            ),
+            "tend_send_prompt" => (
+                json!({"host": {"type": "string", "description": "A control-mode Fleet host; pane is that host's pane id or session/window/%N. Not gated on Idle yet."}}),
+                "",
+            ),
+            "tend_start_work" => (
+                json!({
+                    "commit": {"type": "string", "description": "Dispatch through the Fleet coordinator instead: an isolated worktree at this commit and the pipeline (needs dispatch_id, workspace, body; dry_run plans). Launched means started, not completed."},
+                    "dispatch_id": {"type": "string", "description": "commit: UUID; reuse it on retries."},
+                    "host": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "plan": {"type": "boolean", "description": "commit: read-only plan."}
+                }),
+                "",
+            ),
+            "tend_agent_search" => (
+                json!({
+                    "event_id": {"type": "string", "description": "Expand one hit instead of searching: events around it with paired tool calls/results."},
+                    "before": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "after": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "include_tool_pair": {"type": "boolean"},
+                    "text_offset": {"type": "integer", "minimum": 0},
+                    "max_chars": {"type": "integer", "minimum": 1, "maximum": 64000}
+                }),
+                "",
+            ),
+            _ => continue,
+        };
+        if let (Some(properties), Value::Object(extra)) =
+            (tool["inputSchema"]["properties"].as_object_mut(), extra)
+        {
+            properties.extend(extra);
+        }
+        if name == "tend_agent_search" {
+            // event_id alone is a valid call now.
+            if let Some(schema) = tool["inputSchema"].as_object_mut() {
+                schema.remove("required");
+            }
+        }
+        if !description.is_empty() {
+            if let Some(text) = tool["description"].as_str() {
+                tool["description"] = json!(format!("{text}{description}"));
+            }
+        }
     }
 }
 
@@ -338,6 +552,86 @@ mod tests {
         assert_eq!(routed.args["host"], "mini");
         assert_eq!(routed.args["pane_key"], json!({"pane": "%9"}));
         assert_eq!(routed.args["after_update"], 2);
+    }
+
+    #[test]
+    fn merged_observation_and_control_tools_route_to_their_handlers() {
+        assert_eq!(
+            route_ok("tend_status", json!({"query": "ENG-1"})).name,
+            "tend_agent_find"
+        );
+        assert_eq!(
+            route_ok("tend_status", json!({"host": "mini", "pane": "%3"})).name,
+            "tend_fleet_capture"
+        );
+        assert_eq!(
+            route_ok(
+                "tend_status",
+                json!({"host": "all", "selector": "env=prod"})
+            )
+            .name,
+            "tend_fleet_status"
+        );
+        assert!(route("tend_status", json!({"host": "mini"})).is_err());
+        let local = route_ok(
+            "tend_status",
+            json!({"host": "local", "pane": "%1", "include_capture": true}),
+        );
+        assert_eq!(local.name, "tend_status");
+        assert_eq!(local.args, json!({"pane": "%1", "include_capture": true}));
+        assert!(route(
+            "tend_send_prompt",
+            json!({"host": "mini", "pane": "%1", "text": "x", "session_id": "s"})
+        )
+        .is_err());
+        let plan = route_ok(
+            "tend_start_work",
+            json!({"work": "W", "commit": "abc", "dry_run": true}),
+        );
+        assert_eq!(plan.args["plan"], true);
+        assert!(route(
+            "tend_start_work",
+            json!({"work": "W", "commit": "abc", "dry_run": true, "plan": false})
+        )
+        .is_err());
+        assert!(route(
+            "tend_start_work",
+            json!({"work": "W", "commit": "abc", "pipeline": "p"})
+        )
+        .is_err());
+        let prompts = route_ok("tend_status", json!({"history_limit": 5}));
+        assert_eq!(prompts.name, "tend_recent_prompts");
+        assert_eq!(prompts.args, json!({"limit": 5}));
+        let pane = route_ok("tend_status", json!({"pane": "%1", "history_limit": 5}));
+        assert_eq!(pane.name, "tend_status");
+        assert_eq!(
+            route_ok(
+                "tend_send_prompt",
+                json!({"host": "mini", "pane": "%1", "text": "x"})
+            )
+            .name,
+            "tend_fleet_send_prompt"
+        );
+        assert_eq!(
+            route_ok(
+                "tend_send_prompt",
+                json!({"host": "local", "pane": "%1", "text": "x"})
+            )
+            .name,
+            "tend_send_prompt"
+        );
+        assert_eq!(
+            route_ok("tend_start_work", json!({"work": "W", "commit": "abc"})).name,
+            "tend_dispatch_work"
+        );
+        assert_eq!(
+            route_ok("tend_agent_search", json!({"event_id": "e1"})).name,
+            "tend_agent_read"
+        );
+        assert_eq!(
+            route_ok("tend_agent_search", json!({"query": "x"})).name,
+            "tend_agent_search"
+        );
     }
 
     #[test]

@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tend_wait_for_change`, `tend_dispatch_status`, `tend_collaboration_guide`,
   `tend_room_context`) are no longer listed but keep working, and their results
   name the replacement. `tools/list` drops from 52,864 to 50,149 bytes.
+- MCP: `tend_status` also finds agents by task (`query`), lists recent
+  prompts (`history_limit` without `pane`) and reads a Fleet host (`host`);
+  `tend_send_prompt` and `tend_start_work` take `host`/`commit` for Fleet;
+  `tend_agent_search` expands a hit with `event_id`. The eight tools they
+  absorb stay callable but unlisted. 23 tools, 45,984 bytes.
 
 ### Fixed
 
