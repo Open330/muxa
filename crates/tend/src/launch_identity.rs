@@ -105,6 +105,79 @@ pub struct LaunchRecord {
 pub fn archive_directory() -> Option<PathBuf> {
     Some(crate::paths::data_dir()?.join("tend").join("spawns"))
 }
+/// Remove terminal archives older than 30 days. Unknown intents and anything
+/// referenced by a live row or an unfinished worker ticket are retained.
+/// Age is measured from the last archive write, including receipt completion.
+pub fn prune_archives(
+    directory: &Path,
+    agents: &[Agent],
+    protected: &std::collections::BTreeSet<String>,
+    now: std::time::SystemTime,
+) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let ttl = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if protected.contains(id) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_none_or(|age| age < ttl)
+        {
+            continue;
+        }
+        let Some(record) = read_archive(directory, id) else {
+            continue;
+        };
+        if !record.failed && record.receipt.is_none() {
+            continue;
+        }
+        let referenced = agents
+            .iter()
+            .filter(|a| a.state != AgentState::Stopped)
+            .any(|agent| {
+                record.expected_session.as_deref() == Some(agent.session_id.as_str())
+                    || record.receipt.as_ref().is_some_and(|receipt| {
+                        agent.pane.as_deref() == Some(receipt.pane.as_str())
+                            && match (agent.tmux_socket.as_deref(), receipt.endpoint.as_deref()) {
+                                (Some(actual), Some(expected)) => {
+                                    crate::backend::pane_endpoints_match(
+                                        agent.pane.as_deref(),
+                                        actual,
+                                        expected,
+                                    )
+                                }
+                                _ => true,
+                            }
+                    })
+            });
+        if !referenced {
+            std::fs::remove_file(path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn archive_path(directory: &Path, id: &str) -> std::io::Result<PathBuf> {
     uuid::Uuid::parse_str(id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -374,6 +447,12 @@ impl LaunchIdentities {
                 },
             );
         }
+    }
+    pub(crate) fn protected_launches(&self) -> std::collections::BTreeSet<String> {
+        self.claims
+            .values()
+            .map(|claim| claim.launch_id.clone())
+            .collect()
     }
     pub fn remove(&mut self, session: &str) {
         self.claims.remove(session);
@@ -697,6 +776,86 @@ mod tests {
             ),
             unknown("launch_failed")
         );
+    }
+    #[tokio::test]
+    async fn archive_retention_preserves_live_pending_recent_and_unknown_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let future = now + std::time::Duration::from_secs(31 * 24 * 60 * 60);
+        let mut terminal = record();
+        prepare(directory.path(), &terminal).unwrap();
+        // Recent terminal records survive.
+        assert_eq!(
+            prune_archives(
+                directory.path(),
+                &[],
+                &std::collections::BTreeSet::default(),
+                now
+            )
+            .unwrap(),
+            0
+        );
+        let store = crate::Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: id(SESSION),
+                at: time::OffsetDateTime::now_utc(),
+            })
+            .await;
+        let agents = store.snapshot().await;
+        // Live rows and unfinished tickets independently protect old receipts.
+        assert_eq!(
+            prune_archives(
+                directory.path(),
+                &agents,
+                &std::collections::BTreeSet::default(),
+                future
+            )
+            .unwrap(),
+            0
+        );
+        let protected = [LAUNCH.to_owned()].into();
+        assert_eq!(
+            prune_archives(directory.path(), &[], &protected, future).unwrap(),
+            0
+        );
+        assert_eq!(
+            prune_archives(
+                directory.path(),
+                &[],
+                &std::collections::BTreeSet::default(),
+                future
+            )
+            .unwrap(),
+            1
+        );
+        // An unfinished intent has no age-based expiry.
+        terminal.receipt = None;
+        prepare(directory.path(), &terminal).unwrap();
+        assert_eq!(
+            prune_archives(
+                directory.path(),
+                &[],
+                &std::collections::BTreeSet::default(),
+                future
+            )
+            .unwrap(),
+            0
+        );
+        failed(directory.path(), LAUNCH).unwrap();
+        std::fs::write(directory.path().join("unknown.json"), b"not an archive").unwrap();
+        std::fs::write(directory.path().join(".temporary.tmp"), b"partial").unwrap();
+        assert_eq!(
+            prune_archives(
+                directory.path(),
+                &[],
+                &std::collections::BTreeSet::default(),
+                future
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
     }
     #[test]
     fn receipt_tab_fields_degrade_without_losing_the_created_pane() {
