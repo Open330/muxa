@@ -2,7 +2,8 @@
 //! swap service ever opens, so [`DaemonSwap`] cannot be made and every path
 //! that would run a swap reports the module missing instead.
 
-use super::{Arc, CollaborationStore, Submissions, SwapEnded, SwapStart};
+use super::{Arc, CollaborationStore};
+use crate::automation_engine::{Submissions, SwapEnded, SwapStart};
 
 /// Never constructed: there is no swap service in this build.
 pub(crate) struct DaemonSwap {
