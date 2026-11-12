@@ -287,9 +287,7 @@ See [Global agent integration](docs/AGENT_INTEGRATION.md) for canonical paths,
 updates, and removal; [MCP setup](docs/MCP.md) also covers manual registration.
 
 Connected agents are told that room peers can serve as read-only reviewers or
-narrowly scoped execution subagents. Requests and replies can also carry
-validated AIR 1.0 artifact references, which watch visualizes with
-profile-colored mailbox badges.
+narrowly scoped execution subagents.
 
 You can call a colleague directly from a connected Claude or Codex
 conversation. The agent maps the mention to Tend's durable peer-call tool:

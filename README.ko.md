@@ -240,9 +240,7 @@ tend init --component agent-instructions,agent-skills,agent-mcp
 수동 MCP 등록은 [MCP 문서](docs/MCP.md)를 참고하세요.
 
 연결된 agent에는 같은 room의 peer를 read-only reviewer 또는 좁은 범위의 실행
-subagent로 활용하라는 협업 지침이 자동으로 노출됩니다. 요청과 응답에는 검증된
-AIR 1.0 artifact 참조를 첨부할 수 있고, watch mailbox가 profile별 색상 배지로
-표시합니다.
+subagent로 활용하라는 협업 지침이 자동으로 노출됩니다.
 
 연결된 Claude 또는 Codex 대화 안에서 바로 동료를 호출할 수도 있습니다. agent가
 다음 표현을 Tend의 durable peer-call 도구로 변환합니다.
