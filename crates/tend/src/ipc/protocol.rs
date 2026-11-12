@@ -389,6 +389,12 @@ pub(super) enum RequestBody {
         /// anything else is recorded as tend.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<crate::PromptOrigin>,
+        /// `send_prompt_state_gate_v1`. `Some(false)` refuses unless the
+        /// target is Idle; `Some(true)` types regardless. Absent keeps the
+        /// pre-gate behaviour for older operator clients (watch, Mac app),
+        /// which type on a person's explicit action.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<bool>,
     },
 
     /// `prompt_origin_v1`: a caller that types into `pane` itself (a Fleet
@@ -1040,6 +1046,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "config_orchestration_v1",
     "config_edit_v1",
     DAEMON_BOOT_ID_CAPABILITY,
+    crate::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY,
 ];
 
 /// Advertised by a daemon whose `hello` and successful config read/write

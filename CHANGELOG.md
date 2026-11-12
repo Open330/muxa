@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `collaboration_human_decision_v1` gets the options and recommendation
   folded into the request text instead of losing them.
 
+### Changed
+
+- `tend_send_prompt` (MCP) now types only into an idle agent. A working
+  agent, one at a permission prompt or menu, and an untracked pane are
+  refused with `target_not_idle` and nothing is typed; pass `force=true` when
+  a person asked for that keystroke. `tend watch` and Tend for Mac are
+  unchanged. Daemon capability `send_prompt_state_gate_v1`.
+
 ### Removed
 
 - `tend graph`, the interactive terminal collaboration graph. It was a fourth
