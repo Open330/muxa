@@ -13,6 +13,8 @@ description = "tend Work model, agent launch and `work up`, shared by the CLI an
 aas = ["dep:tend-aas"]
 # For dependents' test builds only (from `[dev-dependencies]`): never write
 # worktree receipts, which would land in the user's tend data directory.
+# Cargo also turns it on for `--all-targets`/`--examples`/bench builds and
+# for `--all-features`; never ship a binary built that way.
 test-no-receipts = []
 
 [dependencies]
