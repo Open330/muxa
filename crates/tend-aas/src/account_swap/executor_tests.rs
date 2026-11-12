@@ -228,6 +228,8 @@ fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
         pane: "%1".into(),
         pane_pid: Cell::new(100),
         direct,
+        respawn_shell_pane: false,
+        launch_id: None,
         cwd: "/work".into(),
         kind,
         session_id: "S".into(),
@@ -1647,4 +1649,73 @@ mod preflight_tests {
         assert!(io.sent().is_empty(), "{:?}", io.sent());
         assert!(log.is_empty());
     }
+}
+
+/// `[swap] relaunch = "respawn"`: a pane with its shell is respawned with
+/// the relaunch and its launch id, a shell kept after it; nothing is typed
+/// into the pane but the follow-up.
+#[test]
+fn a_shell_pane_is_respawned_with_its_launch_id_when_asked() {
+    let io = FakeIo::new(
+        CODEX_IDLE,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line.starts_with("signal TERM") {
+                io.kill(AGENT);
+            }
+            if line == "respawn" {
+                io.agent_appears_in(Duration::from_secs(1));
+            }
+            if line == "text \"\\r\"" && io.previous().as_deref() == Some("prompt \"continue\"") {
+                io.show(CODEX_WORKING);
+            }
+        }),
+    );
+    let mut target = target(AgentKind::Codex, false, false);
+    target.respawn_shell_pane = true;
+    target.launch_id = Some("L-1".into());
+    let (result, _, _) = run(&io, &target, &launch(), Some("continue"), &mut NoObserver);
+    result.unwrap();
+    assert_eq!(
+        io.sent(),
+        [
+            "signal TERM [10]",
+            "respawn",
+            "prompt \"continue\"",
+            "text \"\\r\"",
+        ]
+    );
+    assert_eq!(
+        io.respawned.borrow().as_slice(),
+        ["env TEND_LAUNCH_ID=L-1 /bin/sh -lic 'RELAUNCH; exec /bin/sh -l'"]
+    );
+}
+
+/// The typed relaunch exports the launch id through `env`.
+#[test]
+fn a_typed_relaunch_carries_its_launch_id() {
+    let io = FakeIo::new(
+        CODEX_IDLE,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line.starts_with("signal TERM") {
+                io.kill(AGENT);
+            }
+            if line == "text \"\\r\""
+                && io.previous().as_deref() == Some("text \"env TEND_LAUNCH_ID=L-2 RELAUNCH\"")
+            {
+                io.agent_appears_in(Duration::from_secs(1));
+            }
+        }),
+    );
+    let mut target = target(AgentKind::Codex, false, false);
+    target.launch_id = Some("L-2".into());
+    let (result, _, _) = run(&io, &target, &launch(), None, &mut NoObserver);
+    result.unwrap();
+    assert_eq!(
+        io.sent(),
+        [
+            "signal TERM [10]",
+            "text \"env TEND_LAUNCH_ID=L-2 RELAUNCH\"",
+            "text \"\\r\"",
+        ]
+    );
 }

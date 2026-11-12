@@ -251,6 +251,7 @@
 # continue_text = "continue"         # follow-up after the resume; "" sends none
 # continue_when = "limited"          # limited | always | never
 # aas           = "aas"              # optional aas backend binary (also found in /opt/homebrew/bin, ~/.cargo/bin)
+# relaunch      = "type"             # type | respawn: respawn the pane instead of typing the relaunch into its shell
 
 # Workspace snapshots. tendd takes an automatic one every
 # `auto_interval_minutes` when the workspace changed since the last snapshot

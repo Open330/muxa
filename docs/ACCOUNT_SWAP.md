@@ -291,7 +291,29 @@ continue_text = "continue"
 continue_when = "limited" # limited | always | never
 continue_evidence = "binding" # binding | verified
 aas = "aas"              # optional aas backend; the daemon also looks in /opt/homebrew/bin etc.
+relaunch = "type"        # type | respawn: how a pane that still has its shell is relaunched
 ```
+
+### How the agent is started again
+
+Every relaunch carries a fresh launch id: the relaunched agent runs with
+`TEND_LAUNCH_ID=<uuid>` in its environment (`env TEND_LAUNCH_ID=… <line>`),
+its hooks carry it back to tendd like any tend launch, and the report shows
+it (`launch_id`). After the relaunch, the process bound to the conversation
+by its arguments is also read for that id: one that names *another* launch is
+some other start of the same conversation, so no follow-up or draft is typed
+into it. A process whose environment has no launch id, or cannot be read,
+keeps the argv binding (a wrapper may drop the variable). Not on Windows.
+
+With `relaunch = "type"` (the default) the line is typed into the pane's
+shell, as before. With `relaunch = "respawn"` nothing is typed: tend respawns
+the pane itself (`respawn-pane -k`, same pane id, in the agent's directory)
+through your login shell with the relaunch, and that shell again once the
+agent exits, so the pane still has a shell afterwards. The shell's history
+and unexported variables of the old shell do not carry over. A pane that runs
+its agent directly is always respawned. Requests the daemon relays from
+elsewhere keep typing (`respawn` applies where a direct pane may be respawned:
+`tend swap` itself and the daemon's own automation).
 
 | Flag | Overrides |
 | ---- | --------- |

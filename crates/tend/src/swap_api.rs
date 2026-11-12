@@ -80,6 +80,8 @@ pub struct SwapConfig {
     /// usual install locations; when it is not found, swaps have no
     /// account to move to and launches start bare.
     pub aas: String,
+    /// How a pane that still has its shell is relaunched.
+    pub relaunch: RelaunchMode,
 }
 
 impl Default for SwapConfig {
@@ -90,8 +92,25 @@ impl Default for SwapConfig {
             continue_when: ContinueWhen::Limited,
             continue_evidence: ContinueEvidence::Binding,
             aas: "aas".into(),
+            relaunch: RelaunchMode::Type,
         }
     }
+}
+
+/// How a swap starts the agent again in a pane that still has its shell.
+/// A pane that runs its agent directly (no shell) is always respawned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum RelaunchMode {
+    /// Type the relaunch into the pane's shell, as swaps always have.
+    #[default]
+    Type,
+    /// Respawn the pane through the login shell with the relaunch, and a
+    /// login shell after it exits: nothing is typed into the pane. Only
+    /// where a direct pane may be respawned (not for requests the daemon
+    /// relays from elsewhere, which keep typing).
+    Respawn,
 }
 
 /// An agent launched without the `aas` wrapper.
@@ -171,6 +190,10 @@ pub struct SwapOutcome {
     /// Where the resumed conversation id came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id_source: Option<SessionIdSource>,
+    /// The `TEND_LAUNCH_ID` the relaunched agent was started with, once a
+    /// relaunch was attempted. Its hooks carry it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     /// Whether the running process itself was read to be on that
     /// conversation (Claude's session file on Linux). `false` means the id
     /// was taken on the registry's or command line's word.
