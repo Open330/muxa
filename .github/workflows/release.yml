@@ -185,14 +185,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          # A cache saved from a tag can only be read by that tag; restore
+          # main's and leave it at that.
+          save-if: false
 
       - name: Install xcodegen
         run: brew install xcodegen
 
       # libghostty is cloned, patched and built from pinned commits; that is
       # minutes of Zig on a cold runner and unchanged between most releases.
-      - name: Cache libghostty
-        uses: actions/cache@v4
+      - name: Restore libghostty
+        uses: actions/cache/restore@v4
         with:
           path: |
             apps/tend-macos/.build/dependencies
