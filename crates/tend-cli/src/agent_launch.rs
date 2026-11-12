@@ -1931,7 +1931,7 @@ mod tests {
         }
     }
 
-    /// Run real start() calls in a child so HOME/PATH/socket isolation cannot
+    /// Run real `start()` calls in a child so `HOME`/`PATH`/socket isolation cannot
     /// race other unit tests. All tmux commands target a disposable server.
     #[cfg(unix)]
     #[test]
