@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.12] - 2026-11-12
+
 ### Changed
 
 - The web dashboard's HTTP server (axum, the embedded web assets, the

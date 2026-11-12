@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tend", "crates/tend-aas", "crates/tend-cli", "crates/tendd"]
 
 [workspace.package]
-version = "0.10.11"
+version = "0.10.12"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -12,8 +12,8 @@ authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-tend = { path = "crates/tend", version = "0.10.11" }
-tend-aas = { path = "crates/tend-aas", version = "0.10.11" }
+tend = { path = "crates/tend", version = "0.10.12" }
+tend-aas = { path = "crates/tend-aas", version = "0.10.12" }
 
 # external
 anyhow = "1.0.103"
