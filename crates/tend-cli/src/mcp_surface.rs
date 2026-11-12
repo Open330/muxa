@@ -26,6 +26,13 @@ pub(crate) const RETIRED: &[(&str, &str)] = &[
     ("tend_fleet_send_prompt", "tend_send_prompt"),
     ("tend_dispatch_work", "tend_start_work"),
     ("tend_agent_read", "tend_agent_search"),
+    ("tend_send_message", "tend_call_peer"),
+    ("tend_fleet_call_peer", "tend_call_peer"),
+    ("tend_list_messages", "tend_inbox"),
+    ("tend_peer_report", "tend_inbox"),
+    ("tend_fleet_update_request", "tend_update_request"),
+    ("tend_cancel_message", "tend_update_request"),
+    ("tend_withdraw_reply_wake", "tend_update_request"),
 ];
 
 pub(crate) fn replacement(name: &str) -> Option<&'static str> {
@@ -44,23 +51,23 @@ pub(crate) fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "tend_guide",
-            "description": "Orientation. topic=collaboration (default): your identity (room.self), same-window peers, launch preferences and messaging guardrails; call once (workflows=true adds detailed examples). topic=room: a cheap refresh of peers and unread counts. topic=launch: the user's agent launch preferences only.",
+            "description": "Orientation; call once. topic=collaboration (default): your identity, peers, launch preferences, guardrails (workflows=true adds examples). room: refresh peers and unread counts. launch: launch preferences.",
             "inputSchema": {"type": "object", "properties": {
                 "topic": {"type": "string", "enum": ["collaboration", "room", "launch"]},
-                "workflows": {"type": "boolean", "description": "collaboration only: include detailed workflow examples."}
+                "workflows": {"type": "boolean" }
             }, "additionalProperties": false}
         }),
         json!({
             "name": "tend_wait",
-            "description": "Wait on one handle and return its result: a request id (its final reply; a Fleet request needs no other argument when this process sent it), a dispatch UUID (its current status, returned at once), a swap job (until it ends or timeout), or a pane's next state change (pane, no id). A timeout changes nothing. Prefer wakes over waiting; use 30-60 s foreground waits, not 1 s probes.",
+            "description": "Wait on one handle: a request id (its reply), a swap job (until it ends), a dispatch UUID (current status, at once), or a pane's next state change (pane, no id). A timeout changes nothing. Prefer wakes; wait 30-60 s, not 1 s probes.",
             "inputSchema": {"type": "object", "properties": {
-                "id": {"type": "string", "description": "Request id, dispatch UUID or swap job key."},
-                "kind": {"type": "string", "enum": ["request", "dispatch", "swap"], "description": "Only when the id alone is ambiguous."},
-                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Default 30."},
-                "after_update": {"type": "integer", "minimum": 0, "description": "Fleet request: return on progress newer than this sequence."},
-                "host": {"type": "string", "description": "Fleet host of a request sent from another process; needs pane_key."},
+                "id": {"type": "string" },
+                "kind": {"type": "string", "enum": ["request", "dispatch", "swap"] },
+                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600 },
+                "after_update": {"type": "integer", "minimum": 0, "description": "Fleet: return on newer progress."},
+                "host": {"type": "string", "description": "Where it runs (default local); a Fleet request sent elsewhere also needs pane_key."},
                 "pane_key": {"type": "object"},
-                "pane": {"type": "string", "description": "Wait for this pane's state change instead of an id."},
+                "pane": {"type": "string" },
                 "until": {"type": "string", "enum": ["any", "settled", "idle", "blocked", "stopped"]},
                 "include_capture": {"type": "boolean"},
                 "max_capture_lines": {"type": "integer", "minimum": 1, "maximum": 400}
@@ -148,6 +155,9 @@ pub(crate) fn route(name: &str, args: Value) -> Result<Routed, String> {
         "tend_status" => route_status(args),
         "tend_send_prompt" if remote_host(&args).is_some() => route_fleet_prompt(&args),
         "tend_start_work" if args.get("commit").is_some() => route_dispatch(&args),
+        "tend_call_peer" => Ok(route_call_peer(args)),
+        "tend_inbox" => route_inbox(args),
+        "tend_update_request" => route_update(args),
         "tend_agent_search" if args.get("event_id").is_some() => Ok(routed(
             "tend_agent_read",
             copy(
@@ -310,55 +320,267 @@ fn route_status(mut args: Value) -> Result<Routed, String> {
     })
 }
 
+/// `tend_call_peer` is every durable request to an agent:
+/// - `host` (not local): one exact pane there (`pane`, or `target` as the
+///   pane) through the Fleet route;
+/// - `exact=true` or `intent=notice`: exact mailbox delivery to `target`,
+///   queued on a protected primary rather than rerouted to a worker;
+/// - otherwise the colleague route that selects or creates a worker.
+///
+/// It no longer waits by default: the reply arrives as a wake.
+fn route_call_peer(mut args: Value) -> Routed {
+    let object = args.as_object_mut().expect("tool arguments are an object");
+    object.entry("wait").or_insert(json!(false));
+    if remote_host(&args).is_some() {
+        if args.get("pane").is_none() {
+            if let Some(target) = args.get("target").cloned() {
+                args["pane"] = target;
+            }
+        }
+        if let Some(object) = args.as_object_mut() {
+            object.remove("target");
+            object.remove("exact");
+        }
+        return Routed {
+            name: "tend_fleet_call_peer".into(),
+            args,
+            replaced_by: None,
+        };
+    }
+    let notice = args.get("intent").and_then(Value::as_str) == Some("notice");
+    let exact = args.get("exact").and_then(Value::as_bool).unwrap_or(false);
+    if notice || exact {
+        let mut out = args.as_object().cloned().unwrap_or_default();
+        out.remove("exact");
+        out.remove("wait");
+        out.remove("timeout_secs");
+        let kind = out.remove("intent").unwrap_or(json!("review"));
+        out.insert("kind".into(), kind);
+        let execute = out
+            .remove("execute")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        out.insert(
+            "work_mode".into(),
+            json!(if execute { "execute" } else { "read_only" }),
+        );
+        for spawn_only in [
+            "skill",
+            "context",
+            "spawn_if_missing",
+            "context_bound",
+            "spawn_agent",
+            "spawn_timeout_secs",
+        ] {
+            out.remove(spawn_only);
+        }
+        return Routed {
+            name: "tend_send_message".into(),
+            args: Value::Object(out),
+            replaced_by: None,
+        };
+    }
+    if let Some(object) = args.as_object_mut() {
+        object.remove("exact");
+    }
+    Routed {
+        name: "tend_call_peer".into(),
+        args,
+        replaced_by: None,
+    }
+}
+
+/// `tend_inbox`: claim incoming work (default), or read history without
+/// claiming (`view=incoming|sent|all`), or the newest peer reply
+/// (`view=report`).
+fn route_inbox(args: Value) -> Result<Routed, String> {
+    let view = args.get("view").and_then(Value::as_str).map(str::to_string);
+    let routed = |name: &str, args: serde_json::Map<String, Value>| Routed {
+        name: name.to_string(),
+        args: Value::Object(args),
+        replaced_by: None,
+    };
+    match view.as_deref() {
+        None => Ok(routed("tend_inbox", copy(&args, &["request_id", "full"]))),
+        Some(mailbox @ ("incoming" | "sent" | "all")) => {
+            let mut out = copy(
+                &args,
+                &["request_id", "limit", "offset", "include_body", "after_update", "full"],
+            );
+            out.insert("mailbox".into(), json!(mailbox));
+            Ok(routed("tend_list_messages", out))
+        }
+        Some("report") => Ok(routed(
+            "tend_peer_report",
+            copy(&args, &["target", "request_id", "full"]),
+        )),
+        Some(other) => Err(format!(
+            "unknown inbox view {other:?}; omit it to claim work, or use incoming, sent, all or report"
+        )),
+    }
+}
+
+/// `tend_update_request`: a progress/guidance `body` (Fleet requests sent
+/// by this process need no `host` or `pane_key`), `action=cancel` while queued,
+/// or `action=withdraw_wake` for your own requests' reply wakes.
+fn route_update(mut args: Value) -> Result<Routed, String> {
+    let routed = |name: &str, args: serde_json::Map<String, Value>| Routed {
+        name: name.to_string(),
+        args: Value::Object(args),
+        replaced_by: None,
+    };
+    match args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("update")
+    {
+        "update" => {
+            if let Some(object) = args.as_object_mut() {
+                object.remove("action");
+            }
+            let id = args
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if remote_host(&args).is_none() && args.get("host").is_none() {
+                if let Some((host, pane_key)) = fleet_handle(id) {
+                    args["host"] = json!(host);
+                    args["pane_key"] = pane_key;
+                }
+            }
+            if remote_host(&args).is_some() {
+                return Ok(Routed {
+                    name: "tend_fleet_update_request".into(),
+                    args,
+                    replaced_by: None,
+                });
+            }
+            Ok(Routed {
+                name: "tend_update_request".into(),
+                args,
+                replaced_by: None,
+            })
+        }
+        "cancel" => Ok(routed("tend_cancel_message", copy(&args, &["request_id"]))),
+        "withdraw_wake" => {
+            let mut out = copy(&args, &["request_ids"]);
+            if !out.contains_key("request_ids") {
+                if let Some(id) = args.get("request_id") {
+                    out.insert("request_ids".into(), json!([id]));
+                }
+            }
+            Ok(routed("tend_withdraw_reply_wake", out))
+        }
+        other => Err(format!(
+            "unknown update action {other:?}; use update (default), cancel or withdraw_wake"
+        )),
+    }
+}
+
+/// Ids the daemon stamps from the caller's pane. Still accepted, not
+/// advertised.
+const DERIVED_IDS: &[&str] = &["thread_id", "workspace_id", "work_id", "run_id"];
+
 /// Fold the absorbed tools' arguments into the listed schemas, tersely.
+fn schema_extension(name: &str) -> Option<(Value, &'static str)> {
+    Some(match name {
+    "tend_status" => (
+        json!({
+            "query": {"type": "string", "description": "Find agents by task: keywords or an identifier. Ranked panes with evidence; not proof of ownership."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50 },
+            "refresh": {"type": "boolean" },
+            "exclude_sessions": {"type": "array", "items": {"type": "string"}, "description": "query: skip these (yours)."},
+            "host": {"type": "string", "description": "A Fleet host with pane: its screen there. all: the Fleet summary (selector filters)."},
+            "selector": {"type": "string" }
+        }),
+        "",
+    ),
+    "tend_send_prompt" => (
+        json!({"host": {"type": "string", "description": "Control-mode Fleet host (not gated on Idle yet)."}}),
+        "",
+    ),
+    "tend_start_work" => (
+        json!({
+            "commit": {"type": "string", "description": "Dispatch via the Fleet coordinator: isolated worktree at this commit (with dispatch_id, workspace, body; dry_run plans). Launched means started, not done."},
+            "dispatch_id": {"type": "string" },
+            "host": {"type": "string"},
+            "selector": {"type": "string"},
+            "plan": {"type": "boolean" }
+        }),
+        "",
+    ),
+    "tend_call_peer" => (
+        json!({
+            "intent": {"type": "string", "enum": ["review", "question", "task", "notice"], "description": "Default review. notice is one-way, delivered exactly to target."},
+            "exact": {"type": "boolean", "description": "Deliver to exactly target (queued on a protected primary) instead of selecting or creating a worker."},
+            "notify": {"type": "boolean" },
+            "expects_reply": {"type": "boolean" },
+            "host": {"type": "string", "description": "Control-mode Fleet host: one exact pane (pane or target); never auto-selects remotely."},
+            "pane": {"type": "string" },
+            "dispatch_id": {"type": "string", "description": "host: UUID, reuse on retry."}
+        }),
+        " Returns at once by default (wait=false); the reply arrives as a wake, read it with tend_inbox(request_id) or tend_wait(id).",
+    ),
+    "tend_inbox" => (
+        json!({
+            "view": {"type": "string", "enum": ["incoming", "sent", "all", "report"], "description": "Read without claiming: history, or report (newest peer reply; target filters)."},
+            "target": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "offset": {"type": "integer", "minimum": 0},
+            "include_body": {"type": "boolean"},
+            "after_update": {"type": "integer", "minimum": 0}
+        }),
+        "",
+    ),
+    "tend_update_request" => (
+        json!({
+            "action": {"type": "string", "enum": ["update", "cancel", "withdraw_wake"], "description": "update (default): append body. cancel: yours, while queued. withdraw_wake: no wake for your request_ids' late replies."},
+            "request_ids": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
+            "host": {"type": "string", "description": "Fleet request sent elsewhere; with pane_key."},
+            "pane_key": {"type": "object"}
+        }),
+        "",
+    ),
+    "tend_agent_search" => (
+        json!({
+            "event_id": {"type": "string", "description": "Expand one hit: events around it with paired tool results."},
+            "before": {"type": "integer", "minimum": 0, "maximum": 50},
+            "after": {"type": "integer", "minimum": 0, "maximum": 50},
+            "include_tool_pair": {"type": "boolean"},
+            "text_offset": {"type": "integer", "minimum": 0},
+            "max_chars": {"type": "integer", "minimum": 1, "maximum": 64000}
+        }),
+        "",
+    ),
+        _ => return None,
+    })
+}
+
 pub(crate) fn extend_schemas(tools: &mut [Value]) {
     for tool in tools {
         let Some(name) = tool["name"].as_str().map(str::to_string) else {
             continue;
         };
-        let (extra, description): (Value, &str) = match name.as_str() {
-            "tend_status" => (
-                json!({
-                    "query": {"type": "string", "description": "Find where agents working on a task are: a few keywords or an identifier, not a question. Returns ranked panes with evidence; matches do not prove ownership."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "query: default 10."},
-                    "refresh": {"type": "boolean", "description": "query: re-observe inventory now."},
-                    "exclude_sessions": {"type": "array", "items": {"type": "string"}, "description": "query: session ids to skip (yours)."},
-                    "host": {"type": "string", "description": "A Fleet host: with pane, capture that pane there; without, the cached Fleet summary (selector filters hosts)."},
-                    "selector": {"type": "string", "description": "host: label selector, e.g. env=prod."}
-                }),
-                " history_limit without pane lists recent prompts across panes. host reads a Fleet host; query finds agents by task.",
-            ),
-            "tend_send_prompt" => (
-                json!({"host": {"type": "string", "description": "A control-mode Fleet host; pane is that host's pane id or session/window/%N. Not gated on Idle yet."}}),
-                "",
-            ),
-            "tend_start_work" => (
-                json!({
-                    "commit": {"type": "string", "description": "Dispatch through the Fleet coordinator instead: an isolated worktree at this commit and the pipeline (needs dispatch_id, workspace, body; dry_run plans). Launched means started, not completed."},
-                    "dispatch_id": {"type": "string", "description": "commit: UUID; reuse it on retries."},
-                    "host": {"type": "string"},
-                    "selector": {"type": "string"},
-                    "plan": {"type": "boolean", "description": "commit: read-only plan."}
-                }),
-                "",
-            ),
-            "tend_agent_search" => (
-                json!({
-                    "event_id": {"type": "string", "description": "Expand one hit instead of searching: events around it with paired tool calls/results."},
-                    "before": {"type": "integer", "minimum": 0, "maximum": 50},
-                    "after": {"type": "integer", "minimum": 0, "maximum": 50},
-                    "include_tool_pair": {"type": "boolean"},
-                    "text_offset": {"type": "integer", "minimum": 0},
-                    "max_chars": {"type": "integer", "minimum": 1, "maximum": 64000}
-                }),
-                "",
-            ),
-            _ => continue,
+        let Some((extra, description)) = schema_extension(&name) else {
+            continue;
         };
         if let (Some(properties), Value::Object(extra)) =
             (tool["inputSchema"]["properties"].as_object_mut(), extra)
         {
             properties.extend(extra);
+        }
+        if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+            for id in DERIVED_IDS {
+                if matches!(name.as_str(), "tend_call_peer" | "tend_request_attention") {
+                    properties.remove(*id);
+                }
+            }
+        }
+        if matches!(name.as_str(), "tend_update_request" | "tend_agent_search") {
+            // Each action needs its own argument now; the handler checks.
+            if let Some(schema) = tool["inputSchema"].as_object_mut() {
+                schema.remove("required");
+            }
         }
         if name == "tend_agent_search" {
             // event_id alone is a valid call now.
@@ -632,6 +854,84 @@ mod tests {
             route_ok("tend_agent_search", json!({"query": "x"})).name,
             "tend_agent_search"
         );
+    }
+
+    #[test]
+    fn call_peer_folds_exact_notice_and_fleet_sends_and_does_not_wait() {
+        let peer = route_ok("tend_call_peer", json!({"body": "review"}));
+        assert_eq!(peer.name, "tend_call_peer");
+        assert_eq!(peer.args["wait"], false);
+        let kept = route_ok("tend_call_peer", json!({"body": "x", "wait": true}));
+        assert_eq!(kept.args["wait"], true);
+        let notice = route_ok(
+            "tend_call_peer",
+            json!({"target": "%2", "intent": "notice", "body": "fyi"}),
+        );
+        assert_eq!(notice.name, "tend_send_message");
+        assert_eq!(
+            notice.args,
+            json!({"target": "%2", "kind": "notice", "body": "fyi", "work_mode": "read_only"})
+        );
+        let exact = route_ok(
+            "tend_call_peer",
+            json!({"target": "%2", "exact": true, "intent": "task", "execute": true, "body": "do", "skill": "s"}),
+        );
+        assert_eq!(exact.name, "tend_send_message");
+        assert_eq!(exact.args["kind"], "task");
+        assert_eq!(exact.args["work_mode"], "execute");
+        assert!(exact.args.get("skill").is_none());
+        let fleet = route_ok(
+            "tend_call_peer",
+            json!({"host": "mini", "target": "%4", "body": "r"}),
+        );
+        assert_eq!(fleet.name, "tend_fleet_call_peer");
+        assert_eq!(fleet.args["pane"], "%4");
+        assert!(fleet.args.get("target").is_none());
+    }
+
+    #[test]
+    fn inbox_views_and_update_actions() {
+        assert_eq!(
+            route_ok("tend_inbox", json!({"request_id": "r"})).name,
+            "tend_inbox"
+        );
+        let sent = route_ok("tend_inbox", json!({"view": "sent", "limit": 5}));
+        assert_eq!(sent.name, "tend_list_messages");
+        assert_eq!(sent.args, json!({"mailbox": "sent", "limit": 5}));
+        assert_eq!(
+            route_ok("tend_inbox", json!({"view": "report"})).name,
+            "tend_peer_report"
+        );
+        assert!(route("tend_inbox", json!({"view": "nope"})).is_err());
+        assert_eq!(
+            route_ok(
+                "tend_update_request",
+                json!({"request_id": "r", "body": "b"})
+            )
+            .name,
+            "tend_update_request"
+        );
+        assert_eq!(
+            route_ok(
+                "tend_update_request",
+                json!({"request_id": "r", "action": "cancel"})
+            )
+            .name,
+            "tend_cancel_message"
+        );
+        let withdraw = route_ok(
+            "tend_update_request",
+            json!({"request_id": "r", "action": "withdraw_wake"}),
+        );
+        assert_eq!(withdraw.name, "tend_withdraw_reply_wake");
+        assert_eq!(withdraw.args, json!({"request_ids": ["r"]}));
+        remember_fleet_request("req_remote", "mini", &json!({"pane": "%7"}));
+        let remote = route_ok(
+            "tend_update_request",
+            json!({"request_id": "req_remote", "body": "b"}),
+        );
+        assert_eq!(remote.name, "tend_fleet_update_request");
+        assert_eq!(remote.args["pane_key"], json!({"pane": "%7"}));
     }
 
     #[test]

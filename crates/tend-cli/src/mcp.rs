@@ -534,10 +534,7 @@ fn launch_guide_summary(config: &tend::config::Config) -> String {
         None => "per agent; see launch_defaults.agent_options".to_string(),
     };
     format!(
-        "User launch preferences (use when the request is silent): placement={}, agent={}, \
-         additional agent options={}, pane direction={}. Managed Work keeps its required \
-         workspace-session/work-window/agent-pane layout, and collaboration peer spawning \
-         stays in the current window.",
+        "User defaults: placement={}, agent={}, options={}, direction={}.",
         guide.placement.as_str(),
         agent,
         options,
@@ -588,9 +585,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         json!(["agent"])
     };
     let start_description = format!(
-        "Create a detached tmux pane, window, or session and start one allowlisted coding agent in it. \
-         Use this deterministic tool instead of spending another agent turn on tmux setup. The codex \
-         profile expands the local cx behavior to codex --yolo. Returns the exact new pane id. {}",
+        "Start one allowlisted coding agent in a new tmux pane, window or session (or a managed Work window) and return its pane id. {}",
         launch_guide_summary(config)
     );
     let mut tools = vec![
@@ -611,19 +606,15 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_status",
-            "description": "Focused observation of tend agents. With no arguments, \
-                return a compact fleet summary; set full=true only when the complete managed \
-                workspace > work > agent topology is necessary. Set pane for one agent; \
-                optionally include its visible screen and recent prompt history in \
-                the same result to save MCP round trips and model context.",
+            "description": "Observe agents: a compact summary by default (full=true for the whole topology), or one pane with its screen and recent prompts in one call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "string", "description": "Optional exact pane id." },
-                    "full": { "type": "boolean", "description": "Return the complete topology when pane is omitted. Default false." },
-                    "include_capture": { "type": "boolean", "description": "Include the pane's visible screen; requires pane." },
-                    "history_limit": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Recent prompts for this pane. Default 0; requires pane." },
-                    "max_capture_lines": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Trim capture to the newest N lines. Default 120." }
+                    "full": { "type": "boolean", "description": "Whole topology." },
+                    "include_capture": { "type": "boolean", "description": "pane: its visible screen." },
+                    "history_limit": { "type": "integer", "minimum": 0, "maximum": 20, "description": "Recent prompts (of pane, or all panes)." },
+                    "max_capture_lines": { "type": "integer", "minimum": 1, "maximum": 400, "description": "Default 120." }
                 },
                 "additionalProperties": false
             },
@@ -648,20 +639,20 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "purpose": {"type":"string","enum":["primary","worker"],"description":"Default primary protects human work. Explicit worker accepts peer requests using configured provider defaults."},
-                    "agent": { "type": "string", "enum": ["claude", "codex", "agy", "opencode"], "description": "Agent provider. May be omitted when mcp.guide.agent is configured." },
-                    "options": { "type": "array", "items": { "type": "string" }, "description": "Additional provider CLI arguments. Overrides mcp.guide.options when present; Tend shell-quotes every argument." },
-                    "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Defaults to mcp.guide.placement (pane when unconfigured). Managed work always uses its workspace window." },
-                    "target": { "type": "string", "description": "Target for pane/window placement. Use the exact room pane including rmux:; defaults to the identified caller pane." },
-                    "cwd": { "type": "string", "description": "Existing working directory. Defaults to the MCP process cwd." },
-                    "prompt": { "type": "string", "description": "Optional first task; omit for an empty interactive agent." },
+                    "purpose": {"type":"string","enum":["primary","worker"],"description":"primary (default) is protected; worker takes peer requests."},
+                    "agent": { "type": "string", "enum": ["claude", "codex", "agy", "opencode"], "description": "Optional when configured." },
+                    "options": { "type": "array", "items": { "type": "string" }, "description": "Extra CLI arguments (replace the configured ones)." },
+                    "placement": { "type": "string", "enum": ["pane", "window", "session"], "description": "Default from config (pane)." },
+                    "target": { "type": "string", "description": "Pane to split; default yours." },
+                    "cwd": { "type": "string", "description": "Default this process's cwd." },
+                    "prompt": { "type": "string", "description": "First task; omit for an empty agent." },
                     "name": { "type": "string", "description": "Optional window/session name." },
-                    "workspace": { "type": "string", "description": "Managed workspace/project id. Valid with work; defaults to cwd basename." },
-                    "work": { "type": "string", "description": "Managed Work id. Reuses the current Run window or creates it once; conflicts with placement/target/name." },
+                    "workspace": { "type": "string", "description": "With work; default the cwd basename." },
+                    "work": { "type": "string", "description": "Managed Work id: reuse or create its window." },
                     "role": { "type": "string", "description": "Optional pane role such as implementer or reviewer." },
-                    "alias": { "type": "string", "description": "Stable per-work name for this pane. `tend work up` diffs on it to tell an agent it already started from one it still has to." },
+                    "alias": { "type": "string", "description": "Stable per-work pane name." },
                     "task": { "type": "string", "description": "Optional short pane task label." },
-                    "direction": { "type": "string", "enum": ["right", "down"], "description": "Pane split direction. Defaults to mcp.guide.direction (right when unconfigured)." }
+                    "direction": { "type": "string", "enum": ["right", "down"], "description": "Default from config (right)." }
                 },
                 "required": start_required,
                 "additionalProperties": false
@@ -669,16 +660,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_start_work",
-            "description": "Bring one Work's current Run to the state its configured pipeline declares: \
-                optionally resolve and link an external issue, route the Work to a workspace and directory, and create whichever agent panes \
-                are missing. This is the deterministic way to stand up a whole team (planner, implementer, \
-                reviewer) for a Work — prefer it over several tend_start_agent calls, which cannot tell an \
-                agent that already exists from one that still has to be created. Re-running converges instead \
-                of duplicating: existing panes are kept, and a body/skill/context is typed into them rather \
-                than launched again, which is also how you steer work already in flight. Panes no pipeline \
-                alias claims are reported and never touched. Requires [[route]] and [pipeline.*] config, or an \
-                explicit pipeline. Use dry_run=true first when you are unsure what it would create. \
-                CLI equivalent: `tend work up`.",
+            "description": "Bring one Work to the state its pipeline declares: resolve an external issue, route it to a workspace and directory, and create only the missing agent panes (a whole team in one call). Re-running converges: running panes get body typed in instead of a relaunch. Needs [[route]]/[pipeline.*] config or pipeline. dry_run=true shows the plan. CLI: `tend work up`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -700,11 +682,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_swap_account",
-            "description": "Move Claude/Codex agents onto another account and resume each conversation in its own pane: \
-                stop the agent, relaunch it on the account with the same session, answer startup dialogs, and send a \
-                follow-up only to agents whose turn was cut off (continue_when=limited, the default). Default targets are agents stopped by a usage cap. Accounts come \
-                from [[accounts.<provider>]] on that host, or aas. Run on this host or a control-mode Fleet host. \
-                Use dry_run=true to see the plan first. CLI equivalent: `tend swap`.",
+            "description": "Move Claude/Codex agents to another account and resume each conversation in its pane (stop, relaunch on the account with the same session, answer startup dialogs, continue only cut-off turns). Default targets: agents stopped by a usage cap. dry_run=true shows the plan. CLI: `tend swap`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -718,16 +696,15 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "spread": { "type": "boolean", "description": "Round-robin agents over every account with quota left." },
                     "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
                     "continue_text": { "type": "string", "description": "Follow-up prompt wording. Who gets it is continue_when; naming it does not widen it." },
-                    "continue_when": { "type": "string", "enum": ["limited", "always", "never"], "description": "Which swapped agents get the follow-up: limited (cut off by a usage cap or by this swap; idle, finished and waiting-for-you agents are never woken), always, or never. Defaults to [swap] continue_when." },
-                    "continue_evidence": { "type": "string", "enum": ["binding", "verified"], "description": "What the relaunch must show before the follow-up is typed: binding (its own arguments resume exactly that conversation) or verified (also read from the stopped process and confirmed on the assigned account). Defaults to [swap] continue_evidence." },
-                    "continue": { "type": "string", "description": "Deprecated alias of continue_text; no longer sends to every agent." },
+                    "continue_when": { "type": "string", "enum": ["limited", "always", "never"], "description": "Who gets the follow-up: limited (default: turns cut off by a cap or this swap), always, never." },
+                    "continue_evidence": { "type": "string", "enum": ["binding", "verified"], "description": "What the relaunch must show before the follow-up: binding (resumes that conversation) or verified (also confirmed on the account)." },
                     "no_continue": { "type": "boolean", "description": "Send no follow-up prompt." },
                     "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." },
-                    "action": { "type": "string", "enum": ["swap", "retry", "status", "cancel"], "description": "swap (default) starts one; retry reruns an ended job's safely retryable targets; status reads a job; cancel stops it at its next target. Every result carries request_key/job: the handle to read it again (action=status), never a reason to send it twice." },
+                    "action": { "type": "string", "enum": ["swap", "retry", "status", "cancel"], "description": "swap (default), retry an ended job, status, cancel. Results carry the job handle; never resend a swap." },
                     "job": { "type": "string", "description": "For retry, status and cancel: the request key (or job id) a start returned." },
-                    "request_key": { "type": "string", "description": "For swap and retry: your own key to start the job under (1-128 of letters, digits, -_.:@), so you hold the handle before anything is sent. Omitted: one is minted and returned." },
+                    "request_key": { "type": "string", "description": "swap/retry: your own job key, so you hold the handle before anything is sent." },
                     "detach": { "type": "boolean", "description": "For swap and retry: return once the job is accepted instead of waiting for it." },
-                    "wait_secs": { "type": "integer", "minimum": 0, "maximum": 120, "description": "For status and cancel: wait at most this long for the job to end (default 0: return it as it is now)." }
+                    "wait_secs": { "type": "integer", "minimum": 0, "maximum": 120, "description": "status/cancel: wait for the job to end. Prefer tend_wait(job)." },
                 },
                 "additionalProperties": false
             },
@@ -756,20 +733,16 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_send_prompt",
-            "description": "Inject text into an agent's pane as keystrokes. With \
-                submit=true (the default), a trailing Enter commits the line so the \
-                agent starts working. This is a control action against another \
-                agent — use deliberately. Refused (target_not_idle) unless the \
-                target is idle; for work, prefer the mailbox.",
+            "description": "Type keystrokes (and Enter) into an idle agent's pane; refused with target_not_idle otherwise. A control action: for work, use tend_call_peer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "pane": { "type": "string", "description": "Target pane id (e.g. %12, rmux:%12, or herdr:p1)." },
-                    "socket": { "type": "string", "description": "Explicit server endpoint; defaults to this MCP process's tmux/rmux server context." },
-                    "session_id": { "type": "string", "description": "Only send if this agent session still occupies the target pane and endpoint." },
-                    "text": { "type": "string", "description": "Literal text to type into the pane." },
-                    "submit": { "type": "boolean", "description": "Press Enter after the text. Default true." },
-                    "force": { "type": "boolean", "description": "Type even when the target is not idle (busy, at a prompt or menu, or untracked). Default false; only on a person's explicit instruction." },
+                    "pane": { "type": "string", "description": "%12, rmux:%12, herdr:p1." },
+                    "socket": { "type": "string", "description": "Server endpoint; default this process's." },
+                    "session_id": { "type": "string", "description": "Only if this session still holds the pane." },
+                    "text": { "type": "string", "description": "Literal text." },
+                    "submit": { "type": "boolean", "description": "Press Enter after. Default true." },
+                    "force": { "type": "boolean", "description": "Type even into a busy, prompting or untracked pane; only on a person's instruction." },
                 },
                 "required": ["pane", "text"],
                 "additionalProperties": false,
@@ -935,32 +908,28 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_call_peer",
-            "description": "Create a new natural colleague request for Tend-reserved @peer/@tend-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Tend /skill, sends one durable request, and optionally waits for its structured reply. Use tend_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. Generic work reuses a worker or automatically creates one using configured provider permissions. New empty Claude/Codex workers mechanically prepare known startup gates and verify an empty input composer before dispatch, without a model turn. Set context_bound=true only when the exact target conversation is required. Automatic creation can be disabled in collaboration settings.",
+            "description": "Send one durable request to another agent; the reply returns to you. Default: Tend selects a healthy same-window worker for target (or creates one with configured permissions), expands an optional /skill, and returns at once. Defaults to review + read_only; execute=true only on the user's explicit authorization. context_bound=true when that exact conversation is required. For an existing reply use tend_inbox(view=report).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Default auto. Accepts auto/peer, codex/claude/agy/opencode (with or without @), pane:%N/%N, @alias, role:<name>, or a workspace/work/role[@alias] path." },
-                    "intent": { "type": "string", "enum": ["review", "question", "task"], "description": "Default review." },
-                    "body": { "type": "string", "description": "Request-specific instruction. Optional when skill is supplied." },
-                    "skill": { "type": "string", "description": "Registered Tend message skill name, with or without leading /. Its prompt is expanded before sending." },
-                    "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Tend never attaches transcripts or diffs implicitly." },
-                    "execute": { "type": "boolean", "description": "Default false. Requires intent=task and explicit user authorization." },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
-                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
-                    "spawn_if_missing": { "type": "boolean", "description": "Override collaboration.auto_spawn_workers (default true). Reuse an existing worker first; new peers use configured provider permissions unless worker_bypass_permissions is explicitly enabled." },
-                    "context_bound": {"type":"boolean","description":"Default false routes generic work to a dedicated worker, including when an exact target is primary. True requires that exact session's conversation and keeps primary requests queued for acceptance unless user_authorized is also true."},
-                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "agy", "opencode"], "description": "Provider to create when spawn_if_missing=true. Defaults to the current agent's opposite provider." },
-                    "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60, "description": "Grace period for the new pane to register as a collaboration peer before the request is queued against the pane itself. Default 10. Never poll the pane instead of raising this." },
-                    "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; tend assigns its request id. When parent_request_id is set, this must match the parent's canonical thread." },
-                    "parent_request_id": { "type": "string", "description": "Exact prior request that caused this follow-up. Tend validates the parent and inherits its canonical thread_id when thread_id is omitted." },
-                    "workspace_id": { "type": "string", "description": "Stable workspace/project id used to group collaboration history." },
-                    "work_id": { "type": "string", "description": "Durable Work id within the workspace, used to group requests across runs." },
-                    "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
-                    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
-                    "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
-                    "user_authorized": { "type": "boolean", "description": "Set true only when the user explicitly told you to deliver this particular request to that session. A protected primary (a human's own session) then takes it without by-id acceptance, at its next turn boundary (the end of its current turn or the user's next prompt), through its provider hook; nothing is typed into its terminal. An exact primary target is kept rather than rerouted to a worker. It asserts the user's instruction to deliver; it grants no execute authority. Recorded on the request." },
-                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and tend_wait_reply results are unchanged. Applied atomically with this send." }
+                    "target": { "type": "string", "description": "Default auto: peer, a provider (codex, claude, ...), %N, @alias, role:<name>, or workspace/work/role[@alias]." },
+                    "intent": { "type": "string", "enum": ["review", "question", "task", "notice"], "description": "Default review. notice is one-way, delivered exactly to target." },
+                    "body": { "type": "string", "description": "The instruction. Optional with skill." },
+                    "skill": { "type": "string", "description": "Registered Tend message skill, expanded before sending." },
+                    "context": { "type": "string", "description": "Bounded context appended after body; nothing is attached implicitly." },
+                    "execute": { "type": "boolean", "description": "Needs intent=task and the user's authorization." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope for execute work." },
+                    "wait": { "type": "boolean", "description": "Block for the reply in this call (timeout_secs, default 300). Default false: the reply arrives as a wake." },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600 },
+                    "spawn_if_missing": { "type": "boolean", "description": "Override automatic worker creation." },
+                    "context_bound": {"type":"boolean","description":"Require that exact session's conversation; a primary keeps it queued for acceptance unless user_authorized."},
+                    "spawn_agent": { "type": "string", "enum": ["claude", "codex", "agy", "opencode"], "description": "Provider to create. Default: the opposite of yours." },
+                    "spawn_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+                    "parent_request_id": { "type": "string", "description": "The prior request this follows up." },
+                    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifact identifiers or locators." },
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "Related URLs or locators." },
+                    "user_authorized": { "type": "boolean", "description": "Only when the user told you to deliver this request to that session: a protected primary takes it at its next turn boundary without being typed into. Grants no execute authority." },
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your earlier request ids this replaces; their late replies will not wake you." }
                 },
                 "additionalProperties": false
             },
@@ -992,7 +961,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_request_attention",
-            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed and why in body; put the choices in options, your pick in recommendation and what to check (commits, PRs, test runs) in evidence. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work; that includes ending your turn on a question only the person can answer.",
+            "description": "Ask the person for a required approval, choice or missing information, including when you would otherwise end your turn on a question only they can answer. One durable request, shown in every Fleet client and the Mac app. body says what and why; options, recommendation and evidence carry the choices, your pick and what to check. Keep the id; its answer arrives as a wake (tend_wait(id)). Timeout or delivery is never approval. Not for progress or peer work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1117,7 +1086,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         ) {
             tool["inputSchema"]["properties"]["task_contract"] =
                 tend::collaboration::task_contract_schema();
-            tool["inputSchema"]["properties"]["supersedes_request_id"] = json!({"type":"string","description":"Supersede your read-only request for the same task_id, room and work. The old request closes without interrupting a process; late reports remain historical and do not wake the sender. Never transfers edit authority."});
+            tool["inputSchema"]["properties"]["supersedes_request_id"] = json!({"type":"string","description":"Close your read-only request for the same task_id and replace it; never transfers edit authority."});
         }
         if tool["name"] == "tend_request_attention" {
             if let (Some(properties), Value::Object(decision)) = (
@@ -5956,6 +5925,26 @@ mod tests {
         rows.sort();
         for (bytes, name) in &rows {
             println!("{bytes:>6} {name}");
+            if std::env::var("TEND_SCHEMA_DETAIL").is_ok() {
+                let tool = tools
+                    .iter()
+                    .find(|tool| tool["name"] == name.as_str())
+                    .unwrap();
+                println!(
+                    "         description {}",
+                    tool["description"].to_string().len()
+                );
+                if let Some(properties) = tool["inputSchema"]["properties"].as_object() {
+                    let mut sizes: Vec<_> = properties
+                        .iter()
+                        .map(|(key, value)| (value.to_string().len(), key.clone()))
+                        .collect();
+                    sizes.sort();
+                    for (size, key) in sizes.iter().rev().take(6) {
+                        println!("         {size:>5} {key}");
+                    }
+                }
+            }
         }
         println!(
             "{:>6} TOTAL {} tools",
@@ -7553,19 +7542,12 @@ mod tests {
                 "tend_swap_account",
                 "tend_manage_tmux",
                 "tend_send_prompt",
-                "tend_fleet_call_peer",
                 "tend_update_request",
-                "tend_fleet_update_request",
                 "tend_call_peer",
-                "tend_peer_report",
                 "tend_set_identity",
                 "tend_request_attention",
-                "tend_send_message",
                 "tend_inbox",
-                "tend_list_messages",
                 "tend_reply",
-                "tend_withdraw_reply_wake",
-                "tend_cancel_message",
                 "tend_agent_search",
                 "tend_file_result",
                 "tend_guide",
@@ -7625,22 +7607,14 @@ mod tests {
     }
 
     fn assert_fleet_tool_definitions(tools: &[Value], _instructions: &str) {
-        let fleet_call = tools
+        let call = tools
             .iter()
-            .find(|tool| tool["name"] == "tend_fleet_call_peer")
+            .find(|tool| tool["name"] == "tend_call_peer")
             .unwrap();
-        assert_eq!(
-            fleet_call["inputSchema"]["required"],
-            json!(["host", "pane"])
-        );
-        assert_eq!(
-            fleet_call["inputSchema"]["properties"]["intent"]["enum"],
-            json!(["review", "question", "task"])
-        );
-        assert!(fleet_call["description"]
+        assert!(call["inputSchema"]["properties"]["host"]["description"]
             .as_str()
             .unwrap()
-            .contains("never auto-selects or spawns"));
+            .contains("never auto-selects remotely"));
         let wait = tools
             .iter()
             .find(|tool| tool["name"] == "tend_wait")
@@ -7658,45 +7632,29 @@ mod tests {
             .unwrap();
         assert_eq!(
             call_peer["inputSchema"]["properties"]["intent"]["enum"],
-            json!(["review", "question", "task"])
+            json!(["review", "question", "task", "notice"])
         );
         assert!(call_peer["description"]
             .as_str()
             .unwrap()
             .contains("Defaults to review + read_only"));
-        let peer_report = tools
+        let inbox = tools
             .iter()
-            .find(|tool| tool["name"] == "tend_peer_report")
+            .find(|tool| tool["name"] == "tend_inbox")
             .unwrap();
-        assert!(peer_report["description"]
-            .as_str()
+        assert!(inbox["inputSchema"]["properties"]["view"]["enum"]
+            .as_array()
             .unwrap()
-            .contains("not a GitHub PR review"));
-        assert!(peer_report["inputSchema"]["properties"]["request_id"].is_object());
-
-        let send_message = tools
-            .iter()
-            .find(|tool| tool["name"] == "tend_send_message")
-            .unwrap();
-        for tool in [call_peer, send_message] {
-            let properties = &tool["inputSchema"]["properties"];
-            for field in [
-                "thread_id",
-                "parent_request_id",
-                "workspace_id",
-                "work_id",
-                "run_id",
-                "artifacts",
-                "links",
-            ] {
-                assert!(properties[field].is_object(), "missing {field} on {tool}");
-                assert!(
-                    properties[field]["description"]
-                        .as_str()
-                        .is_some_and(|description| !description.is_empty()),
-                    "missing {field} description on {tool}"
-                );
-            }
+            .contains(&json!("report")));
+        let properties = &call_peer["inputSchema"]["properties"];
+        for field in ["parent_request_id", "artifacts", "links"] {
+            assert!(properties[field]["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty()));
+        }
+        // Stamped from the caller's pane; accepted but not advertised.
+        for field in ["thread_id", "workspace_id", "work_id", "run_id"] {
+            assert!(properties.get(field).is_none(), "{field} still listed");
         }
     }
 
@@ -9403,18 +9361,11 @@ mod tests {
     #[test]
     fn task_contract_tools_advertise_and_parse_the_same_bounded_contract() {
         let defs = tool_definitions(&tend::config::Config::default());
-        for name in [
-            "tend_call_peer",
-            "tend_send_message",
-            "tend_fleet_call_peer",
-        ] {
-            let tool = defs.iter().find(|t| t["name"] == name).unwrap();
-            assert_eq!(
-                tool["inputSchema"]["properties"]["task_contract"]["properties"]["version"]
-                    ["const"],
-                1
-            );
-        }
+        let tool = defs.iter().find(|t| t["name"] == "tend_call_peer").unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["task_contract"]["properties"]["version"]["const"],
+            1
+        );
         let reply = defs.iter().find(|t| t["name"] == "tend_reply").unwrap();
         assert!(reply["inputSchema"]["properties"]["report"].is_object());
         let args = json!({"task_contract":task_contract_fixture()});
