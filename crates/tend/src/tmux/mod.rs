@@ -1011,6 +1011,49 @@ pub fn list_clients() -> Result<Vec<ClientInfo>, TmuxError> {
     Ok(parse_client_lines(&stdout))
 }
 
+/// Sessions and clients from one `tmux` invocation instead of two: the
+/// session-activity sampler needs both every few seconds. Each row is
+/// tagged with the command that printed it so the two listings can be told
+/// apart.
+pub fn list_sessions_and_clients() -> Result<(Vec<SessionInfo>, Vec<ClientInfo>), TmuxError> {
+    let sessions_fmt = format!("{SESSION_ROW_TAG}{SESSION_FMT}");
+    let clients_fmt = format!("{CLIENT_ROW_TAG}{CLIENT_FMT}");
+    let out = tmux_output(&[
+        "list-sessions",
+        "-F",
+        &sessions_fmt,
+        ";",
+        "list-clients",
+        "-F",
+        &clients_fmt,
+    ])?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
+    Ok(parse_sessions_and_clients(&stdout))
+}
+
+const SESSION_ROW_TAG: &str = "S\t";
+const CLIENT_ROW_TAG: &str = "C\t";
+
+fn parse_sessions_and_clients(stdout: &str) -> (Vec<SessionInfo>, Vec<ClientInfo>) {
+    let mut sessions = String::new();
+    let mut clients = String::new();
+    for line in stdout.lines() {
+        if let Some(row) = line.strip_prefix(SESSION_ROW_TAG) {
+            sessions.push_str(row);
+            sessions.push('\n');
+        } else if let Some(row) = line.strip_prefix(CLIENT_ROW_TAG) {
+            clients.push_str(row);
+            clients.push('\n');
+        }
+    }
+    (parse_session_lines(&sessions), parse_client_lines(&clients))
+}
+
 pub fn inside_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
@@ -1849,5 +1892,23 @@ mod tests {
         assert_eq!(parse_tmux_session_target(""), None);
         assert_eq!(parse_tmux_session_target("/tmp/sock,82477,abc"), None);
         assert_eq!(parse_tmux_session_target("/tmp/sock,82477,"), None);
+    }
+
+    #[test]
+    fn one_invocation_lists_sessions_and_clients_apart() {
+        let stdout = concat!(
+            "S\t$1\tmain\t1\t\n",
+            "C\t/dev/ttys001\tmain\t0\t1700000100\t1700000000\t0\n",
+            "S\t$2\tside\t0\t\n",
+        );
+        let (sessions, clients) = parse_sessions_and_clients(stdout);
+        assert_eq!(
+            sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["main", "side"]
+        );
+        assert_eq!(sessions[0].attached_clients, 1);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].session, "main");
+        assert_eq!(clients[0].last_activity, 1_700_000_100);
     }
 }
