@@ -97,8 +97,8 @@ pub struct Input {
     #[serde(default)]
     pub prompt: Option<String>,
     /// Path to the JSONL session transcript. Provided by Claude Code on
-    /// every hook event; we use it on `Stop` to extract the assistant's
-    /// last response since the hook payload itself doesn't carry one.
+    /// every hook event; we read it on `Stop` for the recap, the title, a
+    /// rate limit, and the response when the payload carries none.
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
     /// `StopFailure` hook only: which API error class triggered the
@@ -111,10 +111,11 @@ pub struct Input {
     /// API response (e.g., `"429 Too Many Requests"`).
     #[serde(default)]
     pub error_details: Option<String>,
-    /// `StopFailure` hook only: assistant text rendered in-TUI just
-    /// before the failure (e.g., `"You've hit your limit · resets …"`).
-    /// Echoes content the transcript also captures, but is cheaper to
-    /// read here and avoids racing the JSONL flush.
+    /// `Stop` and `StopFailure`: the text of the turn's last assistant
+    /// message (on `StopFailure`, e.g. `"You've hit your limit · resets …"`).
+    /// Echoes content the transcript also captures, but the hook can run
+    /// before Claude Code flushes the final message to the JSONL, so the
+    /// transcript tail may still end on the turn's previous text.
     #[serde(default)]
     pub last_assistant_message: Option<String>,
     /// `PreToolUse` only: the tool's input object. We read only the `Task`
@@ -235,11 +236,11 @@ impl HookAdapter for ClaudeAdapter {
                     .unwrap_or_default();
                 let recap = summary.recap.map(|r| truncate(r, 2_000));
                 let ai_title = summary.ai_title.map(|t| truncate(t, 200));
-                match input
+                let outcome = input
                     .transcript_path
                     .as_deref()
-                    .and_then(transcript::last_turn_outcome)
-                {
+                    .and_then(transcript::last_turn_outcome);
+                match stop_outcome(input.last_assistant_message, outcome) {
                     Some(transcript::TurnOutcome::RateLimited(text)) => AgentEvent::RateLimited {
                         id,
                         scope: RateLimitScope::Unknown,
@@ -473,6 +474,29 @@ pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> Age
         rate_limit_7d_pct: seven_day_pct,
         rate_limit_7d_resets_at: seven_day_reset,
         at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// The outcome a `Stop` hook reports. The payload's
+/// `last_assistant_message` is the turn's final text; the transcript tail
+/// can lag behind it (the hook may run before Claude Code flushes the last
+/// message), and then ends on an earlier text of the same turn, such as
+/// "I'll ask you two questions" written before an `AskUserQuestion` call.
+/// The transcript still decides a rate limit when its synthetic message is
+/// the payload's text, and stands in when the payload has no text (older
+/// Claude Code, or a turn that ended on a tool call).
+fn stop_outcome(
+    last_assistant_message: Option<String>,
+    transcript: Option<transcript::TurnOutcome>,
+) -> Option<transcript::TurnOutcome> {
+    let Some(message) = last_assistant_message.filter(|m| !m.trim().is_empty()) else {
+        return transcript;
+    };
+    match transcript {
+        Some(transcript::TurnOutcome::RateLimited(text)) if text.trim() == message.trim() => {
+            Some(transcript::TurnOutcome::RateLimited(text))
+        }
+        _ => Some(transcript::TurnOutcome::Response(message)),
     }
 }
 
@@ -906,6 +930,109 @@ mod tests {
                 assert!(message.unwrap().contains("You've hit your limit"));
             }
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    fn stop_input_with_message(transcript_path: Option<PathBuf>, message: &str) -> Input {
+        Input {
+            last_assistant_message: Some(message.into()),
+            ..stop_input(transcript_path)
+        }
+    }
+
+    fn transcript_with(lines: &[&str]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        f
+    }
+
+    const RATE_LIMIT_LINE: &str = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your limit · resets 2:40pm (Asia/Seoul)"}]},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
+
+    #[test]
+    fn stop_prefers_the_payload_message_over_a_transcript_that_lags() {
+        // The hook ran before the final message reached the JSONL: the tail
+        // still ends on the text written before an AskUserQuestion call.
+        let f = transcript_with(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll ask you two questions."}]}}"#,
+        ]);
+        let ev = ClaudeAdapter::normalize(
+            Event::Stop,
+            stop_input_with_message(Some(f.path().into()), "Both approved jobs are running."),
+            None,
+        );
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => {
+                assert_eq!(response.as_deref(), Some("Both approved jobs are running."));
+            }
+            other => panic!("expected TurnStopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reports_a_rate_limit_only_when_it_is_the_payload_message() {
+        let f = transcript_with(&[RATE_LIMIT_LINE]);
+        let limited = ClaudeAdapter::normalize(
+            Event::Stop,
+            stop_input_with_message(
+                Some(f.path().into()),
+                "You've hit your limit · resets 2:40pm (Asia/Seoul)",
+            ),
+            None,
+        );
+        assert!(
+            matches!(limited, AgentEvent::RateLimited { .. }),
+            "got {limited:?}"
+        );
+
+        // A limit from an earlier turn, with this turn's text not flushed yet.
+        let answered = ClaudeAdapter::normalize(
+            Event::Stop,
+            stop_input_with_message(Some(f.path().into()), "Done after the reset."),
+            None,
+        );
+        match answered {
+            AgentEvent::TurnStopped { response, .. } => {
+                assert_eq!(response.as_deref(), Some("Done after the reset."));
+            }
+            other => panic!("expected TurnStopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_with_a_blank_payload_message_falls_back_to_the_transcript() {
+        let f = transcript_with(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"from the transcript"}]}}"#,
+        ]);
+        let ev = ClaudeAdapter::normalize(
+            Event::Stop,
+            stop_input_with_message(Some(f.path().into()), "  "),
+            None,
+        );
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => {
+                assert_eq!(response.as_deref(), Some("from the transcript"));
+            }
+            other => panic!("expected TurnStopped, got {other:?}"),
+        }
+        let limited = ClaudeAdapter::normalize(
+            Event::Stop,
+            stop_input_with_message(Some(transcript_with(&[RATE_LIMIT_LINE]).path().into()), ""),
+            None,
+        );
+        assert!(
+            matches!(limited, AgentEvent::RateLimited { .. }),
+            "got {limited:?}"
+        );
+    }
+
+    #[test]
+    fn stop_without_a_transcript_uses_the_payload_message() {
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input_with_message(None, "hi"), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => assert_eq!(response.as_deref(), Some("hi")),
+            other => panic!("expected TurnStopped, got {other:?}"),
         }
     }
 

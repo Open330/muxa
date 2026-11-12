@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A Claude turn's last response is the text the `Stop` hook carries, not the
+  transcript tail. The hook can run before Claude Code writes the final
+  message, so tend kept the turn's earlier text. A turn that said "I'll ask
+  you two questions", asked them in a dialog, and then finished showed as
+  still asking, with that sentence as the question. The transcript still
+  decides a rate limit and fills in for Claude Code builds that don't send
+  the text.
+
 ## [0.10.7] - 2026-11-11
 
 ### Fixed
