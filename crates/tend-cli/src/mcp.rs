@@ -995,7 +995,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_request_attention",
-            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work; that includes ending your turn on a question only the person can answer.",
+            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed and why in body; put the choices in options, your pick in recommendation and what to check (commits, PRs, test runs) in evidence. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work; that includes ending your turn on a question only the person can answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1122,6 +1122,14 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                 tend::collaboration::task_contract_schema();
             tool["inputSchema"]["properties"]["supersedes_request_id"] = json!({"type":"string","description":"Supersede your read-only request for the same task_id, room and work. The old request closes without interrupting a process; late reports remain historical and do not wake the sender. Never transfers edit authority."});
         }
+        if tool["name"] == "tend_request_attention" {
+            if let (Some(properties), Value::Object(decision)) = (
+                tool["inputSchema"]["properties"].as_object_mut(),
+                crate::decision_record::decision_schema_properties(),
+            ) {
+                properties.extend(decision);
+            }
+        }
         if tool["name"] == "tend_reply" {
             tool["inputSchema"]["properties"]["report"] = tend::collaboration::task_report_schema();
         }
@@ -1185,6 +1193,14 @@ async fn call_tool_inner(
         object.insert("expects_reply".into(), json!(true));
         object.insert("notify".into(), json!(true));
         object.insert("work_mode".into(), json!("read_only"));
+        let stores = crate::decision_record::daemon_supports(
+            client,
+            tend::decision::HUMAN_DECISION_CAPABILITY,
+        )
+        .await;
+        if let Err(error) = crate::decision_record::attention_decision(object, stores) {
+            return Ok(error_result(&error));
+        }
         "tend_send_message"
     } else {
         name
@@ -4649,6 +4665,7 @@ fn new_request_from_args(
         return Err("task_contract requires a reply-bearing agent request".into());
     }
     Ok(NewRequest {
+        decision: crate::decision_record::request_decision(args)?,
         task_contract,
         supersedes_request_id,
         dispatch_id: optional_string(args, "dispatch_id")?,

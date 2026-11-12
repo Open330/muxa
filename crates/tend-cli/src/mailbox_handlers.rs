@@ -455,6 +455,7 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &origin,
                     &target,
                     &NewRequest {
+                        decision: None,
                         task_contract: task_contract
                             .as_deref()
                             .map(|p| {

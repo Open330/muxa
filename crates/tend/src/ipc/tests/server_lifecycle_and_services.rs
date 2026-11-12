@@ -2388,9 +2388,19 @@ async fn review_items_round_trip_over_ipc() {
             kind: ActorKind::Agent,
             label: Some("impl".into()),
         },
+        decision: Some(crate::decision::Decision {
+            needed: Some("merge or hold?".into()),
+            options: vec!["merge".into(), "hold".into()],
+            recommendation: Some("merge".into()),
+            evidence: vec![crate::decision::Evidence::Commit {
+                sha: "abc123".into(),
+                repo: None,
+            }],
+        }),
     };
     let item = client.review_create(&new).await.unwrap();
     assert_eq!(client.review_create(&new).await.unwrap(), item);
+    assert_eq!(item.decision, new.decision, "the decision round-trips");
     assert_eq!(client.review_get(&item.id).await.unwrap(), item);
     let summary = client
         .review_summary_with_timeout(Duration::from_secs(3))

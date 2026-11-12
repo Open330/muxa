@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Review items and human requests can carry a structured decision: what
+  needs deciding, the options, the asker's recommendation and typed
+  evidence (commit, pull request, diff range, test command with its result
+  and output tail, path). `tend review request` takes `--decision-needed`,
+  `--option`, `--recommend` and `--evidence`; `tend_request_attention` takes
+  `decision_needed`, `options`, `recommendation` and `evidence`, and `body`
+  keeps working on its own. A tendd without `review_decision_v1` /
+  `collaboration_human_decision_v1` gets the options and recommendation
+  folded into the request text instead of losing them.
+
 ### Removed
 
 - `tend graph`, the interactive terminal collaboration graph. It was a fourth

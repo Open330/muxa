@@ -1004,6 +1004,8 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::review::REVIEW_CAPABILITY,
     "turn_evidence_v1",
     crate::review::REVIEW_RECORD_CAPABILITY,
+    crate::decision::REVIEW_DECISION_CAPABILITY,
+    crate::decision::HUMAN_DECISION_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",

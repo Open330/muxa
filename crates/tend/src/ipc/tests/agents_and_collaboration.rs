@@ -1695,6 +1695,7 @@ async fn widening_a_listing_over_ipc_is_console_only() {
                     &from,
                     to,
                     &NewRequest {
+                        decision: None,
                         user_authorized: false,
                         task_contract: None,
                         supersedes_request_id: None,
@@ -1849,6 +1850,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             &sender,
             "role:review",
             &NewRequest {
+                decision: None,
                 user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,
@@ -1882,6 +1884,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             &sender,
             "@reviewer",
             &NewRequest {
+                decision: None,
                 user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,
@@ -2009,6 +2012,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             &sender,
             "role:rust",
             &NewRequest {
+                decision: None,
                 user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,
@@ -2168,6 +2172,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
             },
             "pane:%1",
             &NewRequest {
+                decision: None,
                 user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,

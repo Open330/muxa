@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::fmt::Write as _;
+use tend::decision::{Decision, Evidence, REVIEW_DECISION_CAPABILITY};
 use tend::ipc::Client;
 use tend::review::{
     ActorKind, DispositionKind, NewReview, ReviewActor, ReviewItem, ReviewQuery, ReviewTarget,
@@ -53,7 +54,90 @@ struct DisposeArgs {
     json: bool,
 }
 
+/// Structured decision context for a review item (`review_decision_v1`).
+#[derive(Debug, Default, clap::Args)]
+pub(crate) struct DecisionArgs {
+    /// The decision the person is asked to make.
+    #[arg(long, value_name = "TEXT")]
+    pub decision_needed: Option<String>,
+    /// One choice on offer; repeat for each.
+    #[arg(long = "option", value_name = "TEXT")]
+    pub options: Vec<String>,
+    /// What you would do, and why.
+    #[arg(long, value_name = "TEXT")]
+    pub recommend: Option<String>,
+    /// Evidence: commit:SHA, pr:URL, diff:RANGE, test:CMD, test-pass:CMD,
+    /// test-fail:CMD or path:PATH. Repeat for each.
+    #[arg(long, value_name = "KIND:VALUE")]
+    pub evidence: Vec<String>,
+    /// Git checkout that commit: and diff: evidence lives in. Defaults to
+    /// the current directory's checkout when it has one.
+    #[arg(long, value_name = "DIR")]
+    pub repo: Option<std::path::PathBuf>,
+}
+
+impl DecisionArgs {
+    /// `None` when no decision flag was given.
+    pub(crate) fn build(self) -> Result<Option<Decision>> {
+        let needs_repo = self
+            .evidence
+            .iter()
+            .any(|spec| spec.starts_with("commit:") || spec.starts_with("diff:"));
+        let repo = match self.repo {
+            Some(repo) => Some(
+                std::path::absolute(&repo)
+                    .with_context(|| format!("resolving --repo {}", repo.display()))?,
+            ),
+            None if needs_repo => current_checkout(),
+            None => None,
+        };
+        let repo = repo.map(|repo| repo.to_string_lossy().into_owned());
+        let evidence = self
+            .evidence
+            .iter()
+            .map(|spec| Evidence::parse(spec, repo.as_deref()).map_err(anyhow::Error::msg))
+            .collect::<Result<Vec<_>>>()?;
+        let decision = Decision {
+            needed: self.decision_needed,
+            options: self.options,
+            recommendation: self.recommend,
+            evidence,
+        };
+        decision.validate().map_err(anyhow::Error::msg)?;
+        Ok(decision.into_option())
+    }
+}
+
+/// Top of the git checkout holding the current directory, if any.
+fn current_checkout() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let top = String::from_utf8(output.stdout).ok()?;
+    let top = top.trim();
+    (output.status.success() && !top.is_empty()).then(|| top.into())
+}
+
+/// Refuse decision fields a daemon would reject as unknown, with the fix.
+pub(crate) async fn require_decision_capability(client: &Client) -> Result<()> {
+    let hello = client
+        .hello(std::time::Duration::from_secs(3))
+        .await
+        .context("asking tendd what it supports")?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|c| c == REVIEW_DECISION_CAPABILITY)
+    {
+        bail!("this tendd does not store decision fields ({REVIEW_DECISION_CAPABILITY}); restart it with the same tend build");
+    }
+    Ok(())
+}
+
 #[derive(Debug, clap::Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per invocation
 enum Action {
     /// Ask for review of one result. Exactly one target: --session, --work
     /// or --request.
@@ -83,6 +167,8 @@ enum Action {
         /// Retry key: the same key returns the same item instead of a new one.
         #[arg(long)]
         key: Option<String>,
+        #[command(flatten)]
+        decision: DecisionArgs,
         /// Who is asking.
         #[arg(long = "as", value_enum, default_value_t = Actor::User)]
         actor: Actor,
@@ -134,11 +220,16 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
             request,
             anchor,
             key,
+            decision,
             actor,
             label,
             json,
         } => {
             let target = target(session, provider, work, alias, request)?;
+            let decision = decision.build()?;
+            if decision.is_some() {
+                require_decision_capability(client).await?;
+            }
             let item = client
                 .review_create(&NewReview {
                     target,
@@ -149,6 +240,7 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
                         kind: actor.into(),
                         label,
                     },
+                    decision,
                 })
                 .await?;
             print_item(&item, json)
@@ -361,7 +453,45 @@ fn render_item(item: &ReviewItem, now: OffsetDateTime) -> String {
         }
     }
     let _ = writeln!(out, "\n{}", item.summary);
+    if let Some(decision) = &item.decision {
+        render_decision(&mut out, decision);
+    }
     out
+}
+
+/// The decision block of `tend review show`: question, options,
+/// recommendation, evidence, in that order.
+pub(crate) fn render_decision(out: &mut String, decision: &Decision) {
+    if let Some(needed) = &decision.needed {
+        let _ = writeln!(out, "\ndecision needed:\n  {}", indent(needed));
+    }
+    if !decision.options.is_empty() {
+        let _ = writeln!(out, "\noptions:");
+        for (n, option) in decision.options.iter().enumerate() {
+            let _ = writeln!(out, "  {}. {option}", n + 1);
+        }
+    }
+    if let Some(recommendation) = &decision.recommendation {
+        let _ = writeln!(out, "\nrecommendation:\n  {}", indent(recommendation));
+    }
+    if !decision.evidence.is_empty() {
+        let _ = writeln!(out, "\nevidence:");
+        for evidence in &decision.evidence {
+            let _ = writeln!(out, "  - {}", evidence.describe());
+            if let Evidence::Test {
+                tail: Some(tail), ..
+            } = evidence
+            {
+                for line in tail.lines() {
+                    let _ = writeln!(out, "      {line}");
+                }
+            }
+        }
+    }
+}
+
+fn indent(text: &str) -> String {
+    text.replace('\n', "\n  ")
 }
 
 /// tmux status segment for open review items: empty when there are none.
@@ -401,6 +531,38 @@ mod tests {
             review_segment(&summary, now),
             "#[fg=yellow]◇ 4 to review · 3h#[default]"
         );
+    }
+
+    #[test]
+    fn decision_flags_build_a_validated_decision() {
+        assert!(DecisionArgs::default().build().unwrap().is_none());
+        let decision = DecisionArgs {
+            decision_needed: Some("merge?".into()),
+            options: vec!["merge".into(), "hold".into()],
+            recommend: Some("merge".into()),
+            evidence: vec!["commit:abc123".into(), "test-pass:cargo test".into()],
+            repo: Some("/src/tend".into()),
+        }
+        .build()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            decision.evidence[0],
+            Evidence::Commit {
+                sha: "abc123".into(),
+                repo: Some("/src/tend".into())
+            }
+        );
+        let mut out = String::new();
+        render_decision(&mut out, &decision);
+        assert!(out.contains("  1. merge\n  2. hold"), "{out}");
+        assert!(out.contains("test passed: cargo test"), "{out}");
+        let bad = DecisionArgs {
+            evidence: vec!["commit:--exec".into()],
+            repo: Some("/src/tend".into()),
+            ..DecisionArgs::default()
+        };
+        assert!(bad.build().is_err());
     }
 
     #[test]
