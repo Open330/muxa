@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`dashboard-operators/`) and share databases (`dashboard-sharing/`) work
   again unchanged. The 0.10.12 warning that called these sections ignored is
   gone.
+- The BarShelf `tend Watch` widget (`widgets/tend-watch`) is back. 0.10.12
+  deleted its source, but tend was its only home: BarShelf's gallery installs
+  it from this repository, and four installed cards (this Mac plus three SSH
+  hosts) were in daily use. It is restored unchanged and still reads the current
+  `tend status --json`. The install command in `docs/WATCH.md` now points at
+  this repository instead of a path in the BarShelf repository that never
+  existed.
 
 ## [0.10.13] - 2026-11-12
 

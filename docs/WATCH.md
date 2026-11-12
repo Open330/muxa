@@ -596,6 +596,28 @@ pairing or screen sharing:
 tmux set-option -t <session> @no_auto_view 1
 ```
 
+## macOS Menu Bar with BarShelf
+
+The bundled [BarShelf](https://github.com/Open330/barshelf) `tend Watch`
+widget provides a compact menu-bar popover view of the same agent state. It
+shows the five most recently active agents in the familiar `NAME / ST / ACT /
+LAST PROMPT` layout. The widget refreshes every five seconds while the popover
+is open and does not poll in the background.
+
+Install it from the BarShelf gallery, or directly with:
+
+```bash
+barshelf install https://github.com/Open330/tend/tree/main/widgets/tend-watch
+```
+
+The widget requires Deno and a `tend` version that supports the versioned
+snapshot command below. Set `TEND_BIN` or the widget's custom socket setting
+when the defaults do not match your installation.
+
+```bash
+tend status --json
+```
+
 ## Columns
 
 Columns are configured under `[watch]`:
