@@ -13,7 +13,8 @@ Start with [DIRECTION.md](DIRECTION.md) for what tend is and
 
 English is the source of truth. Korean translations (`*.ko.md`) are kept for
 user-facing guides (README, install, configuration, watch, collaboration,
-Fleet, onboarding, timeline, activity, pipeline, dashboard CLI, agent
-integration, architecture). A Korean file may lag; when the two disagree,
-the English file wins. Internal contracts, proposals, and validation records
+Fleet, timeline, activity, pipeline, dashboard CLI, agent integration,
+architecture). A Korean file may lag; when the two disagree, the English file
+wins. `ONBOARDING.ko.md` exists only in Korean; `tend onboard` itself is
+bilingual. Internal contracts, proposals, and validation records
 are written once, in either language, and not translated.

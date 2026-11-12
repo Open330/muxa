@@ -117,7 +117,7 @@ Tend는 두 층으로 되어 있습니다. **Attention** 층은 이미 돌리는
 | `tend stats` / `tend stats report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `tend timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `tend stats activity` | stats/report에 들어간 raw duration ledger 조회. |
-| Tend for Mac | Work·Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 작업 공간, libghostty 터미널과 알림. 네이티브 PTY는 `tendd`가 소유. |
+| Tend for Mac | Home(Work 단위를 Your turn·In progress·Finished lane으로 표시)에서 시작해 Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 앱, libghostty 터미널과 알림. 네이티브 PTY는 `tendd`가 소유. |
 | Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph를 제공하며 bearer token이 유일한 인증 수단. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
@@ -441,7 +441,8 @@ tend는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | --- | --- | --- |
 | tmux | 전체 | 기본 백엔드. |
 | [herdr](https://herdr.dev) | 전체 | herdr 소켓 API 경유; [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI 기본 (adopt 전용) | hook이 붙은 pane 관찰과 이동만 지원하며 capture·send는 없음. WASM 플러그인 계획은 중단. |
+| cmux | Labs (adopt 전용) | hook 환경으로 현재 surface를 식별해 이동·텍스트 전송만 지원하며 전체 inventory·pid map·capture는 없음. [docs/CMUX.md](docs/CMUX.md) 참고. |
+| zellij | Labs (adopt 전용) | hook이 붙은 pane 관찰과 이동만 지원하며 capture·send는 없음. WASM 플러그인 계획은 중단. |
 
 여러 호스트 동시 관측은 [docs/MULTI_HOST.md](docs/MULTI_HOST.md) 참고.
 

@@ -21,7 +21,7 @@ standalone entry point.
 
 | Layer | Promise | Surfaces |
 | --- | --- | --- |
-| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, Tend for Mac menu bar, stats/timeline |
+| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, Tend for Mac menu bar, `review` |
 | **Runtime** | Agents are launched, organized, coordinated, and recovered as Work, not as loose panes. | Work/Run model, `work`/`workspace`/`agent`, tendd-owned PTYs and Tend for Mac, collaboration mailbox and `@peer`, workers, Fleet, snapshot/restore, usage-limit recovery, MCP |
 
 Rules that keep the layers honest:
@@ -100,14 +100,23 @@ whether the feature matters.
 
 | Tier | Bar | Members |
 | --- | --- | --- |
-| **Core** | Regressions block release; live tour + tests required | Attention layer, Work/Run model, collaboration mailbox, MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
-| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, dashboard, account routing and usage-limit recovery |
-| **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts |
+| **Core** | Regressions block release; tests required | Attention layer, Work/Run model, collaboration mailbox, review queue and decision record (`tend review`, the `tend work done` result), MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
+| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, loopback dashboard (single user, bearer token, `dashboard` cargo feature), account routing and usage-limit recovery |
+| **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, cmux and zellij backends (adopt-only) |
+| **Labs, frozen** | Kept working, no new features; candidates for removal at the next review | `tend stats` (with `stats report` and `stats activity`) and `tend timeline` analytics, the 16-step `tend onboard` live tour |
 
 A Labs feature graduates when it has a written contract, a recovery path, and
 evidence (from `tend stats` or issues) that it is used outside a single
 workflow. A feature with no use over a release cycle is a removal candidate;
-the Work board replacing the card dashboard is the model.
+the Work board replacing the card dashboard is the model. Removals are
+recorded in CHANGELOG.md under **Removed** with the reason. The 2026-11-12
+pass removed `tend graph`, the BarShelf widget, the zellij plugin stub, and
+the dashboard's OIDC sign-in, viewer accounts and pane sharing; it moved
+analytics and the 16-step onboarding tour to frozen Labs.
+
+Frozen means: bug fixes and keeping it compiling with the rest of tend, but
+no new screens, options or data. Work there is better spent on Core, and a
+frozen feature that still shows no use at the next review is removed.
 
 ## Before 1.0
 
