@@ -361,6 +361,7 @@ struct FleetWaitingAgent<Answer: View>: View {
                 .font(TendType.body)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+            FleetAskedContext(agent: hosted.agent)
             if hosted.pane != nil, ["waiting_input", "waiting_choice"].contains(hosted.agent.state) {
                 FleetChoicePanel(model: model, hosted: hosted, fallback: answer)
                     .id(hosted.id)

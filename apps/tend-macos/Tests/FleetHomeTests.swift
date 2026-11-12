@@ -904,3 +904,28 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(TendNotificationRules.event(from: firstKey, to: TendNotificationRules.key(second)) == .attention("asked"))
     #expect(TendNotificationActions.category(for: .attention("asked")) == TendNotificationActions.inputCategory)
 }
+
+@Test func anAskedCardShowsTheResponseBehindItsQuestion() throws {
+    let response = "> Is everything done?\n>\n> **Useful expressions:** …\n\n---\n\n"
+        + "**고치려면 (제안, 아직 안 함)**\n- IaC PR로 레이블을 `jiun-mbp`로 바꾸고 배포합니다.\n\n"
+        + "레이블 정리 PR을 만들어서 배포까지 진행할까요?"
+    let asked = try agent([
+        "state": "idle", "last_response": response,
+        "awaiting_reply": ["question": "레이블 정리 PR을 만들어서 배포까지 진행할까요?", "since": "2026-11-12T02:18:03Z"],
+    ], id: "a")
+    let context = try #require(FleetAskedContext.context(for: asked))
+    // The restated prompt above the answer is dropped; the proposal stays.
+    #expect(context.hasPrefix("**고치려면"))
+    #expect(context.hasSuffix("진행할까요?"))
+
+    // Nothing beyond the question itself: no context block.
+    let bare = try agent([
+        "state": "idle", "last_response": "진행할까요?",
+        "awaiting_reply": ["question": "진행할까요?"],
+    ], id: "b")
+    #expect(FleetAskedContext.context(for: bare) == nil)
+
+    // Not asking: no context block.
+    let idle = try agent(["state": "idle", "last_response": response], id: "c")
+    #expect(FleetAskedContext.context(for: idle) == nil)
+}

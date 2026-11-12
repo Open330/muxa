@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The window is the original idle deadline for idle-wait jobs, otherwise 30 minutes
   from first deferral. Cancellation remains in force; unavailable follow-up text
   is withheld.
+- A question an agent ends on says what it asks about. A short question
+  ("진행할까요?", "Shall I go ahead?") now keeps the sentence before it on the
+  same line ("정식 수정 두 개만 따로 PR로 올려 머지할 수 있습니다. 진행할까요?").
+  Opening an asked card in Home also shows the response behind the question,
+  scrolled to the end, so the proposal it refers to is on screen.
 
 ## [0.10.9] - 2026-11-12
 
