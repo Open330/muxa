@@ -15,7 +15,7 @@ see the links per tool. Nothing was run against a live binary.
 | **Cursor CLI** (`agent` / `cursor-agent`) | Cursor's agent in the terminal | `~/.cursor/hooks.json`; payloads carry `conversation_id`, `generation_id`, `transcript_path`, `hook_event_name`; `stop` has `status` (completed/aborted/error) | Closed source, dated releases; which events fire in the CLI varies by version (a Linux build was reported firing none) | Small–medium | **After Copilot**, labelled beta, each event verified on a real build before it is claimed |
 | **T3 Code** | A local server plus desktop/web/mobile GUI that drives other agents (Codex app-server, Claude Agent SDK, opencode SDK, …) | No pane-level hooks. Exposes an OAuth-gated MCP endpoint, a `t3 thread start/send/show/list` CLI, and an internal event-sourced SQLite store (not a contract) | Very early (0.1.x), nightly builds | Not a pane adapter at all; a bridge would be medium–large | **No pane adapter.** Revisit as a Fleet-style bridge once its thread API stabilises |
 | Kiro CLI | AWS's agent CLI | V3 hooks in `~/.kiro/hooks/` with `session_id`, `hook_event_name`, `cwd` | Mid-migration to V3; payload docs incomplete | Small–medium | Later |
-| Amp | Sourcegraph's agent | No shell hooks; in-process TypeScript plugins (`~/.config/amp/plugins/`), event names not officially documented | Active | Medium (same shape as the opencode plugin) | Later, once the plugin API is documented |
+| Amp | Sourcegraph's agent | Documented in-process TypeScript plugin API (`~/.config/amp/plugins/`, run with Bun): `session.start` and `tool.call` carry `thread.id`; `tool.result` has `status`; `agent.start` / `agent.end` frame each turn | Active; core plugin API documented, only the `experimental` namespace is marked unstable | Medium (same shape as the opencode plugin bridge) | **Later, strong candidate.** The signals are deterministic; it ranks behind Copilot only because a plugin bridge needs in-process code and more state than a hooks file |
 
 Not surveyed in depth: Goose, Qwen Code, Crush, Kimi CLI, Factory droid. They
 keep their screen-detection manifests where tend already ships one.
@@ -42,4 +42,4 @@ keep their screen-detection manifests where tend already ships one.
 - Cursor CLI on Linux not firing hooks: https://forum.cursor.com/t/cursor-agent-cli-never-invokes-hooks-json-on-linux-2026-08-11-same-version-works-on-macos/168326
 - T3 Code: https://github.com/pingdotgg/t3code, `docs/user/outside-agents.md`, `docs/internals/overview.md`
 - Kiro hooks: https://kiro.dev/docs/cli/v3/hooks-migration/
-- Amp streaming JSON: https://ampcode.com/news/streaming-json
+- Amp plugin API: https://ampcode.com/docs/plugin-api; setup: https://ampcode.com/docs/customize/plugins
