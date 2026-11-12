@@ -229,6 +229,7 @@ hook commands without overwriting existing user hooks.
 | Claude Code | Merge `examples/claude-settings.json` into `~/.claude/settings.json`. |
 | OpenAI Codex | Prefer `tend init` for compatible hooks. The daemon also reads local session-rollout logs every two seconds; hook support alone is not required for lifecycle recovery. |
 | Google Antigravity CLI | Add the `tend` block from `crates/tend/src/adapters/antigravity.rs` to `~/.gemini/config/hooks.json`. Note this is agy's own `hooks.json`, **not** `~/.gemini/settings.json`. |
+| opencode | Use `tend init --component opencode-hooks`; the plugin body lives in `crates/tend-cli/src/init/files/opencode.rs`. See [OPENCODE.md](OPENCODE.md). |
 
 ## Verify
 

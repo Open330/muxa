@@ -6,8 +6,8 @@
 //! the boilerplate. Their payload shapes are not interchangeable.
 //!
 //! opencode does not expose shell hooks; its integration ships as an
-//! in-process TS plugin that forwards pre-normalized `AgentEvent`s — see the
-//! [`opencode`] module.
+//! in-process TS plugin that forwards a filtered subset of opencode's own
+//! events, which [`opencode::parse`] maps — see the [`opencode`] module.
 
 pub mod antigravity;
 pub mod antigravity_transcript;
@@ -24,4 +24,3 @@ pub use hook::{run_hook, AdapterError, HookAdapter};
 pub use antigravity::AntigravityAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
-pub use opencode::OpencodeAdapter;

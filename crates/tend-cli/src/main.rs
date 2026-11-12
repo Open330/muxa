@@ -74,9 +74,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tend::adapters::{
-    claude, run_hook, AntigravityAdapter, ClaudeAdapter, CodexAdapter, OpencodeAdapter,
-};
+use tend::adapters::{claude, run_hook, AntigravityAdapter, ClaudeAdapter, CodexAdapter};
 use tend::collaboration::{
     CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch, MailboxScope,
     NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, WorkMode,

@@ -97,6 +97,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resume-after-limit`. Release builds include the module (cargo feature
   `aas`, on by default); `--no-default-features` builds `tend` and `tendd`
   without it.
+- opencode is supported at the same depth as Claude Code and Codex. The
+  `tend init` plugin (`~/.config/opencode/plugins/tend.ts`) now forwards
+  opencode's own session, prompt, tool, permission and question events, and
+  `tend hook opencode` maps only their documented shapes: an opencode pane
+  goes working on a prompt, waiting on a permission prompt or a question,
+  idle with the turn's response, and error on a failed request (not on Esc).
+  Subagent sessions no longer register as extra agents, and switching
+  sessions in the TUI moves the pane's row. `opencode` panes are discovered
+  by process name like `claude`, `codex` and `agy`, so an MCP-spawned opencode
+  worker is recognised before its first event. Re-run
+  `tend init --component opencode-hooks` and restart opencode to pick up the
+  new plugin. See [docs/OPENCODE.md](docs/OPENCODE.md).
 - tendd now bounds the files it used to grow forever. The collaboration audit
   ledger rotates to `collaboration-audit.ndjson.1` at 8 MiB
   (`[storage].audit_max_bytes`); `backups/` under the data directory keeps the
