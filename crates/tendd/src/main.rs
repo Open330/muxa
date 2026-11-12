@@ -253,6 +253,19 @@ async fn run() -> Result<()> {
         boot_id = tend::ipc::daemon_boot_id(),
         "starting tendd"
     );
+    let owns_data_dir = owns_default_data_dir(
+        &socket,
+        cfg.socket.as_deref(),
+        args.config.as_deref(),
+        paths::default_config_file().as_deref(),
+    );
+    if !owns_data_dir {
+        tracing::info!(
+            socket = %socket.display(),
+            config = ?args.config,
+            "socket or config override: skipping data-directory retention and the hook-spool drain, which belong to the default daemon"
+        );
+    }
     // A second daemon used to load the registry, start its snapshotter and
     // notifiers and heal tmux before its bind failed — and a KeepAlive
     // service manager restarted it every ten seconds for as long as the
@@ -337,7 +350,9 @@ async fn run() -> Result<()> {
     // Hook events that failed to ingest while this daemon was down or
     // incompatible. Replayed into the registry now, before any producer task
     // or the IPC server runs, so no live event can interleave with it.
-    drain_hook_spool(&store).await;
+    if owns_data_dir {
+        drain_hook_spool(&store).await;
+    }
     store
         .reconcile_native_surfaces(|id| sessions.session_liveness(id))
         .await;
@@ -382,6 +397,7 @@ async fn run() -> Result<()> {
         &store,
         &collaboration,
         cfg.storage.backups_keep,
+        owns_data_dir,
         &shutdown_tx,
     );
     let directory_max_age = if cfg.reconciler.enabled {
@@ -3416,6 +3432,7 @@ fn spawn_gc_task(
     store: &tend::SharedStore,
     collaboration: &Arc<CollaborationStore>,
     backups_keep: usize,
+    owns_data_dir: bool,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let store = store.clone();
@@ -3437,7 +3454,7 @@ fn spawn_gc_task(
                     // its snapshot still sees rows about to be swept.
                     if last_storage_sweep.is_none_or(|at| at.elapsed() >= storage_tick) {
                         last_storage_sweep = Some(tokio::time::Instant::now());
-                        sweep_storage(&store, &collaboration, backups_keep).await;
+                        sweep_storage(&store, &collaboration, backups_keep, owns_data_dir).await;
                     }
                     let removed = store.gc(ttl).await;
                     if removed > 0 {
@@ -3455,11 +3472,27 @@ fn spawn_gc_task(
 
 /// Hourly storage retention: spawn archives, `backups/`, and expired
 /// mailbox threads. Each step logs and continues on failure.
+///
+/// The two data-directory sweeps run only when `owns_data_dir`: they act on
+/// whatever `$XDG_DATA_HOME` resolves to, which for a daemon started on a
+/// throwaway socket or config (a test, a demo) is still the operator's
+/// real one. Mailbox retention follows the mailbox this daemon opened.
 async fn sweep_storage(
     store: &tend::SharedStore,
     collaboration: &Arc<CollaborationStore>,
     backups_keep: usize,
+    owns_data_dir: bool,
 ) {
+    match collaboration.apply_retention().await {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "collaboration retention pruned expired threads");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "collaboration retention sweep failed"),
+    }
+    if !owns_data_dir {
+        return;
+    }
     if let Some(directory) = tend::paths::default_backups_dir() {
         let result = tokio::task::spawn_blocking(move || {
             tend::retention::prune_backups(&directory, backups_keep)
@@ -3475,13 +3508,6 @@ async fn sweep_storage(
             Err(error) => tracing::warn!(%error, "backup retention sweep task failed"),
             _ => {}
         }
-    }
-    match collaboration.apply_retention().await {
-        Ok(removed) if removed > 0 => {
-            tracing::info!(removed, "collaboration retention pruned expired threads");
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(%error, "collaboration retention sweep failed"),
     }
     // Snapshot first: open tickets and live rows protect launch archives,
     // including launches that have not registered an agent yet.
@@ -4511,6 +4537,29 @@ fn should_heal_tmux_socket_env(
     socket == default_socket || cfg_socket == Some(socket)
 }
 
+/// Whether this tendd is the default daemon — on the canonical socket (see
+/// [`should_heal_tmux_socket_env`]) and the default config file — and so
+/// owns the data directory's retention and hook spool. A daemon given its
+/// own `--socket`/`TEND_SOCKET` or `--config`/`TEND_CONFIG` (e2e tests,
+/// the onboarding sandbox, demos) must not prune or drain them: without an
+/// `XDG_DATA_HOME` override they are the operator's real files.
+fn owns_default_data_dir(
+    socket: &Path,
+    cfg_socket: Option<&Path>,
+    config: Option<&Path>,
+    default_config: Option<&Path>,
+) -> bool {
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    should_heal_tmux_socket_env(socket, &paths::default_socket(), cfg_socket)
+        && config.is_none_or(|config| default_config.is_some_and(|default| same(config, default)))
+}
+
 /// Decide whether to fire the one-shot discovery pass and, if so, spawn it
 /// onto the current tokio runtime.
 ///
@@ -4731,6 +4780,44 @@ fn spawn_periodic_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_default_daemon_owns_the_data_directory() {
+        let default_socket = paths::default_socket();
+        let config = std::path::Path::new("/home/u/.config/tend/config.toml");
+        let other = std::path::Path::new("/tmp/t/tend-e2e.toml");
+        // The service and `tend daemon start`: canonical socket, default config.
+        assert!(owns_default_data_dir(
+            &default_socket,
+            None,
+            None,
+            Some(config)
+        ));
+        assert!(owns_default_data_dir(
+            &default_socket,
+            None,
+            Some(config),
+            Some(config)
+        ));
+        // The socket named in config is canonical too.
+        let named = std::path::Path::new("/run/tend/custom.sock");
+        assert!(owns_default_data_dir(
+            named,
+            Some(named),
+            None,
+            Some(config)
+        ));
+        // e2e and the onboarding sandbox: their own socket, their own config.
+        let tmp = std::path::Path::new("/tmp/t/tend-e2e.sock");
+        assert!(!owns_default_data_dir(tmp, None, Some(other), Some(config)));
+        assert!(!owns_default_data_dir(tmp, None, None, Some(config)));
+        assert!(!owns_default_data_dir(
+            &default_socket,
+            None,
+            Some(other),
+            Some(config)
+        ));
+    }
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tend::backend::{BackendCaps, HostKind, PaneBackend};

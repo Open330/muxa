@@ -8,7 +8,7 @@ use std::{
 
 struct Server {
     socket: String,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 impl Server {
     fn new() -> Self {
@@ -19,7 +19,7 @@ impl Server {
                 .join("sidebar.sock")
                 .to_string_lossy()
                 .into_owned(),
-            _directory: directory,
+            directory,
         }
     }
     fn mux(&self, args: &[&str]) -> String {
@@ -52,6 +52,8 @@ impl Server {
             .args(extra)
             .env("TEND_HOST", "rmux")
             .env("TEND_HOSTS", "rmux")
+            .env("XDG_DATA_HOME", self.directory.path().join("data-home"))
+            .env("XDG_STATE_HOME", self.directory.path().join("state-home"))
             .output()
             .unwrap();
         assert!(

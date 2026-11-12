@@ -163,7 +163,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pruned after 90 days by default (`[collaboration].retention_days`, `0` keeps
   everything) at startup and hourly rather than only at startup; and launch
   archives in `spawns/` that never completed expire after 90 days. The audit,
-  backup and mailbox caps can each be turned off with `0`.
+  backup and mailbox caps can each be turned off with `0`. The directory
+  sweeps (`backups/`, `spawns/`) and the hook-spool drain run only in the
+  default daemon; see Fixed for why.
 
 - tendd spawns far fewer processes on macOS. In a 35-pane benchmark of
   hook-owned Codex panes behind a wrapper, tmux and `ps` spawns dropped from
@@ -179,6 +181,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   26 a minute. Requests, Fleet and liveness reconciliation still list fresh.
 
 ### Fixed
+
+- A tendd started on its own socket or config no longer prunes or drains the
+  operator's real data directory. Before release, the new `backups/`
+  retention ran in every tendd, including those the e2e test suite starts
+  with a temporary `--socket` and `--config` but no `XDG_DATA_HOME`. On the
+  maintainer's Mac, test daemons deleted 42 of 46 real install backups. Now
+  only the default daemon (canonical socket, default config) sweeps
+  `backups/` and `spawns/` and drains the hook spool, and other daemons log
+  that they skipped it. Backups are ordered by creation time, a pass holds
+  `backups/.prune.lock` and stages each victim in its own marked
+  `backups/.tend-prune/` before deleting it, so
+  concurrent pruners cannot delete a backup they should keep; and the e2e and CLI integration tests run
+  with private `XDG_DATA_HOME`/`XDG_STATE_HOME`.
 
 - A reply no longer goes unannounced when the agent that asked has been
   replaced or has exited. The reply wake follows the sender's alias (or role)

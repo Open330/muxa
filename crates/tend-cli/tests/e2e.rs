@@ -31,6 +31,15 @@ fn wait_for_socket(path: &Path, deadline: Duration) {
     );
 }
 
+/// Private data/state homes under `dir`, created.
+fn isolated_homes(dir: &Path) -> (PathBuf, PathBuf) {
+    let data_home = dir.join("data-home");
+    let state_home = dir.join("state-home");
+    std::fs::create_dir_all(&data_home).expect("create isolated data home");
+    std::fs::create_dir_all(&state_home).expect("create isolated state home");
+    (data_home, state_home)
+}
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -39,6 +48,14 @@ struct Daemon {
     /// especially important for daemon startup, which may heal the tmux-global
     /// `TEND_SOCKET` when it owns the selected canonical socket.
     tmux_tmpdir: PathBuf,
+    /// Per-test `XDG_DATA_HOME` / `XDG_STATE_HOME` for the daemon and every
+    /// CLI call. Config paths alone do not isolate the data directory:
+    /// tendd's directory retention, launch archives and the hook spool all
+    /// resolve it from the environment, and an unset `XDG_DATA_HOME` is the
+    /// operator's real one. Before this, e2e daemons pruned the real
+    /// `backups/` and CLI hooks could spool into the real hook spool.
+    data_home: PathBuf,
+    state_home: PathBuf,
     /// Per-test history NDJSON path. Tests that want to verify on-disk
     /// persistence read this directly; tests that don't care about
     /// history simply ignore it.
@@ -70,6 +87,16 @@ impl Daemon {
         let session_activity_path = dir.join("session-activity.json");
         let tmux_tmpdir = dir.join("tmux-tmp");
         std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
+        let (mut data_home, mut state_home) = isolated_homes(&dir);
+        // A test that brings its own homes (to share them with its own CLI
+        // calls) keeps them; the daemon and `cli()` then agree on them.
+        for (key, value) in env {
+            match *key {
+                "XDG_DATA_HOME" => data_home = PathBuf::from(value),
+                "XDG_STATE_HOME" => state_home = PathBuf::from(value),
+                _ => {}
+            }
+        }
 
         // Default config that isolates persisted state into the per-test tempdir.
         // Tests that want richer config concatenate their own TOML body.
@@ -108,6 +135,8 @@ enabled = false
             .arg("--config")
             .arg(&cfg_path)
             .env("RUST_LOG", "tend=warn")
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_STATE_HOME", &state_home)
             .env_remove("RMUX")
             .env_remove("RMUX_PANE")
             .env_remove("TMUX")
@@ -123,6 +152,8 @@ enabled = false
             socket,
             config: cfg_path,
             tmux_tmpdir,
+            data_home,
+            state_home,
             history: history_path,
             activity: activity_path,
         }
@@ -135,6 +166,8 @@ enabled = false
         // the daemon reads the temporary config while the CLI can pick up an
         // operator's real ~/.config/tend/config.toml.
         c.env("TEND_CONFIG", &self.config);
+        c.env("XDG_DATA_HOME", &self.data_home);
+        c.env("XDG_STATE_HOME", &self.state_home);
         c.env_remove("RMUX")
             .env_remove("RMUX_PANE")
             .env_remove("TMUX");
@@ -620,6 +653,7 @@ fn spawn_dashboard(token: Option<&str>) -> Option<DashboardDaemon> {
     let session_activity_path = dir.join("session-activity.json");
     let tmux_tmpdir = dir.join("tmux-tmp");
     std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
+    let (data_home, state_home) = isolated_homes(&dir);
 
     // Tests that want the open surface must explicitly opt into the
     // `auth = "none"` escape hatch. A `Some(token)` case is wired via
@@ -667,6 +701,8 @@ path = "{}"
         .arg("--dashboard-bind")
         .arg("127.0.0.1:0")
         .env("RUST_LOG", "tend=info")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_STATE_HOME", &state_home)
         .env_remove("RMUX")
         .env_remove("RMUX_PANE")
         .env_remove("TMUX")
@@ -711,6 +747,8 @@ path = "{}"
             socket,
             config: cfg_path,
             tmux_tmpdir,
+            data_home,
+            state_home,
             history: history_path,
             activity: activity_path,
         },
@@ -766,6 +804,8 @@ fn manual_dashboard_without_token_fails_startup() {
         .arg("--dashboard")
         .arg("--dashboard-bind")
         .arg("127.0.0.1:0")
+        .env("XDG_DATA_HOME", dir.path().join("data-home"))
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
         .env_remove("TEND_DASHBOARD_TOKEN")
         .env_remove("TEND_DASHBOARD_AUTH")
         .stdout(Stdio::null())
@@ -833,6 +873,8 @@ fn init_dashboard_prints_fragment_url_for_persisted_token() {
         ])
         .env("HOME", dir.path())
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", dir.path().join("data-home"))
+        .env("XDG_STATE_HOME", dir.path().join("state-home"))
         .env("PATH", &tools_dir)
         .env_remove("TEND_CONFIG")
         .output()
@@ -1221,4 +1263,93 @@ prompt = "Test provider"
     request["work"] = "VERIFY".into();
     assert_eq!(decode(dispatch(&request))["state"], "failed");
     assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+}
+
+/// A tendd started the way this harness used to start it — its own
+/// `--socket` and `--config`, but no `XDG_DATA_HOME` — must leave the
+/// default data directory alone. On 2026-11-12 such daemons pruned the
+/// operator's real `backups/` from 46 entries to 4.
+///
+/// `HOME` points at a fixture so "the default data directory" is a
+/// throwaway one; `XDG_DATA_HOME` is removed so tendd falls back to it,
+/// exactly as on a developer machine.
+#[cfg(unix)]
+#[test]
+fn a_daemon_on_its_own_socket_and_config_leaves_the_default_data_dir_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else {
+        home.join(".local").join("share")
+    };
+    let backups = data.join("tend").join("backups");
+    for index in 0..8 {
+        std::fs::create_dir_all(backups.join(format!("local-install-{index:02}"))).unwrap();
+    }
+    let spool = data.join("tend").join(tend::hook_spool::SPOOL_FILENAME);
+    let event = tend::AgentEvent::Started {
+        id: tend::event::AgentId {
+            kind: tend::AgentKind::ClaudeCode,
+            session_id: "spooled-by-the-operator".into(),
+            surface: None,
+            pane: None,
+            tmux_socket: None,
+            cwd: None,
+        },
+        at: time::OffsetDateTime::now_utc(),
+    };
+    let entry =
+        tend::hook_spool::SpoolEntry::new(&event, None, &tend::ipc::RuntimeError::Disconnected);
+    tend::hook_spool::append(&spool, &entry).unwrap();
+
+    let socket = dir.path().join("tend-e2e.sock");
+    let config = dir.path().join("tend-e2e.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[state]\npath = \"{}\"\n[reconciler]\nenabled = false\n",
+            dir.path().join("state.json").display()
+        ),
+    )
+    .unwrap();
+    let tmux_tmpdir = dir.path().join("tmux-tmp");
+    std::fs::create_dir(&tmux_tmpdir).unwrap();
+    let mut child = Command::new(bin("tendd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--config")
+        .arg(&config)
+        .env("HOME", &home)
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TEND_SOCKET")
+        .env_remove("TEND_CONFIG")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
+        .env("TMUX_TMPDIR", &tmux_tmpdir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tendd");
+    wait_for_socket(&socket, Duration::from_secs(5));
+    // The spool drain runs before the socket appears; the storage sweep on
+    // the GC task's first, immediate tick. Give both ample time.
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = child.wait();
+
+    let left = std::fs::read_dir(&backups).unwrap().count();
+    assert_eq!(left, 8, "the default data dir's backups were pruned");
+    let (spooled, _) = tend::hook_spool::read_all(&spool);
+    assert_eq!(
+        spooled.len(),
+        1,
+        "the default data dir's hook spool was drained"
+    );
 }

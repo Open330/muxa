@@ -60,13 +60,19 @@ backups_keep = 5          # 0이면 백업을 모두 보존
 `audit_max_bytes`에 이르면 `collaboration-audit.ndjson`을
 `collaboration-audit.ndjson.1`로 넘깁니다. 이전 세대는 하나만 남기므로 ledger는 cap의
 두 배 안쪽을 유지합니다. `backups_keep`은 설치·업그레이드 백업이 모이는
-`$XDG_DATA_HOME/tend/backups`에서 수정 시각 기준 최신 항목만 남기고, 나머지는 daemon
+`$XDG_DATA_HOME/tend/backups`에서 생성 시각(파일 시스템이 기록하지 않으면 수정 시각) 기준 최신 항목만 남기고, 나머지는 daemon
 시작 시와 매시간 지웁니다. 숨김 항목은 건드리지 않고 symlink는 따라가지 않고 링크만
 지웁니다.
 
 tendd는 `$XDG_DATA_HOME/tend/spawns`의 launch provenance 기록도 정리합니다. 완료나
 실패한 launch는 30일, 끝내 완료되지 않은 launch는 90일이 지나면 지우며, 살아 있는
 agent나 열린 worker ticket이 가리키는 기록은 남깁니다.
+
+이 두 디렉터리 정리와 hook spool drain은 기본 daemon만 실행합니다. 기본 daemon은 canonical
+socket(기본값 또는 이 설정의 `socket`)과 기본 설정 파일로 뜬 daemon입니다. 테스트, 데모,
+onboarding sandbox처럼 `--socket`/`TEND_SOCKET`이나 `--config`/`TEND_CONFIG`를 따로 받은
+tendd는 이를 건너뛰고 로그에 남깁니다. `XDG_DATA_HOME`을 바꾸지 않았다면 그 daemon의 데이터
+디렉터리도 사용자의 실제 디렉터리이기 때문입니다.
 
 ## MCP 오케스트레이션 가이드
 

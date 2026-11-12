@@ -61,15 +61,25 @@ backups_keep = 5          # 0 keeps every backup
 `audit_max_bytes` rotates `collaboration-audit.ndjson` to
 `collaboration-audit.ndjson.1` when the live ledger reaches that size; one
 previous generation is kept, so the ledger stays under about twice the cap.
-`backups_keep` keeps only the newest entries (by modification time) in
+`backups_keep` keeps only the newest entries (by creation time, or
+modification time where the filesystem records none) in
 `$XDG_DATA_HOME/tend/backups`, where install and upgrade backups go; older
 entries are deleted at daemon startup and hourly. Hidden entries are left
-alone and symlinks are removed without being followed.
+alone and symlinks are removed without being followed. A pass holds
+`backups/.prune.lock` (a second pruner skips) and moves each victim into its
+own marked staging directory `backups/.tend-prune/` before deleting it.
 
 tendd also expires its own launch-provenance archives under
 `$XDG_DATA_HOME/tend/spawns`: completed or failed launches after 30 days, and
 launches that never completed after 90 days, unless a live agent or an open
 worker ticket still refers to them.
+
+Only the default daemon runs these two directory sweeps and drains the hook
+spool: one on the canonical socket (the default, or `socket` in this config)
+with the default config file. A tendd started with its own `--socket` /
+`TEND_SOCKET` or `--config` / `TEND_CONFIG`, such as a test, a demo or the
+onboarding sandbox, skips them and logs that it did, because without an
+`XDG_DATA_HOME` override its data directory is still yours.
 
 ## Snapshots
 

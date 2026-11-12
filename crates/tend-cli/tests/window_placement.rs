@@ -32,13 +32,13 @@ fn tmux_installed() -> bool {
 /// operator's `~/.tmux.conf` (hooks included) stays out of the test.
 struct Server {
     socket: PathBuf,
-    _dir: tempfile::TempDir,
+    home: tempfile::TempDir,
 }
 
 impl Server {
     fn start(dir: tempfile::TempDir) -> Self {
         let socket = dir.path().join("tmux.sock");
-        let server = Self { socket, _dir: dir };
+        let server = Self { socket, home: dir };
         server
             .tmux(&[
                 "new-session",
@@ -178,6 +178,11 @@ fn launch_and_assert(server: &Server, launch: &Launch<'_>, target: &str, owner: 
         ])
         .env("PATH", path)
         .env("TEND_TMUX_SOCKET", &server.socket)
+        // Keep the launch away from the operator's daemon and data dir: it
+        // writes launch archives under `$XDG_DATA_HOME/tend/spawns`.
+        .env("TEND_SOCKET", server.home.path().join("tendd.sock"))
+        .env("XDG_DATA_HOME", server.home.path().join("data-home"))
+        .env("XDG_STATE_HOME", server.home.path().join("state-home"))
         .env_remove("RMUX")
         .env_remove("RMUX_PANE")
         .env("TMUX", launch.tmux_env)
