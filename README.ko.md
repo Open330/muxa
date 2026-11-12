@@ -117,7 +117,6 @@ Tend는 두 층으로 되어 있습니다. **Attention** 층은 이미 돌리는
 | `tend stats` / `tend stats report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `tend timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `tend stats activity` | stats/report에 들어간 raw duration ledger 조회. |
-| BarShelf widget (macOS) | active/working/waiting/error agent를 메뉴바 popover에서 요약. |
 | Tend for Mac | Work·Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 작업 공간, libghostty 터미널과 알림. 네이티브 PTY는 `tendd`가 소유. |
 | Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph와 [OIDC 로그인 기반 pane/window 공유](docs/DASHBOARD.md#invite-someone-to-a-pane)(조회/프롬프트 권한)를 지원. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
@@ -325,7 +324,6 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `tend status [--flat\|--json]` | 추적 중인 agent를 session / window / pane 트리로 보여 줌(`--flat`: agent당 한 줄), 또는 desktop integration용 versioned JSON snapshot. |
 | `tend watch [--view session\|window\|pane]` | workspace → work → agent live TUI picker/dashboard. |
 | `tend dashboard [--since today]` | watch Work board: agent별/Work 일괄 prompt·중단, agent로서 메시지·메일함, 협업 수, ACT/WACT 요약. |
-| `tend graph` | [터미널 인터랙티브 그래프](docs/GRAPH.ko.md)에서 session/window/pane 연결·협업 메시지 탐색. |
 | `tend attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `tend status-line [--pane %N]` | tmux status-line 출력. |
 | `tend peek [--plain] [--expanded]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이므로 이를 그릴 수 없는 환경 — client를 붙이지 않는 프런트엔드(cmux), control mode 클라이언트(`tmux -CC` — amux, iTerm2) — 에서는 텍스트 리포트로 대체하고 이유를 stderr에 알림. |
@@ -440,7 +438,7 @@ tend는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | --- | --- | --- |
 | tmux | 전체 | 기본 백엔드. |
 | [herdr](https://herdr.dev) | 전체 | herdr 소켓 API 경유; [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI 기본 | 플러그인 경로 예정; [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md). |
+| zellij | CLI 기본 (adopt 전용) | hook이 붙은 pane 관찰과 이동만 지원하며 capture·send는 없음. WASM 플러그인 계획은 중단. |
 
 여러 호스트 동시 관측은 [docs/MULTI_HOST.md](docs/MULTI_HOST.md) 참고.
 

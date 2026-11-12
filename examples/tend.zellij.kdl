@@ -13,13 +13,6 @@
 // To pin the host explicitly (useful for nested setups, e.g. zellij
 // inside tmux), export `TEND_HOST=zellij` before launching zellij.
 //
-// Future: once the tend zellij plugin (`tend-zellij-plugin.wasm`,
-// shipped from `feat/zellij-plugin`) is published, replace this layout
-// with one that loads the plugin so pane-level metadata (foreground
-// command, screen capture, pid map) flows back to the daemon. The
-// plugin is purely additive — this layout keeps working unchanged
-// after install, you'll just see richer rows in `tend watch`.
-
 layout {
     default_tab_template {
         children

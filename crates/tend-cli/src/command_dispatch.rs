@@ -3,11 +3,11 @@ use super::{
     cmd_dashboard, cmd_detach, cmd_fleet_watch, cmd_forget_agent, cmd_identity, cmd_msg, cmd_panes,
     cmd_peers, cmd_prune, cmd_recap, cmd_register, cmd_run, cmd_status, cmd_status_line, cmd_sync,
     cmd_watch, cmd_zellij_plugin_snapshot, collaboration_client_kind, config_cmd, daemon, doctor,
-    fleet_cli, graph, handle_hook, init, logs, mcp, message_skill, mux_control, onboarding,
-    parse_args, paths, peek, relay, reload, run_agent_cmd, run_window_cmd, run_work_cmd,
-    run_workspace_cmd, servers_cmd, set_icon_set, sidebar, start, stats, swap, timeline, upgrade,
-    worker_cmd, worktrees_cmd, AgentCmd, AgentViewCmd, AskOptions, Client, Cmd, Config, Context,
-    ProcCmd, RegistryCmd, Result, WatchInvocation, WindowCmd, WorkCmd, WorkspaceCmd, CALLER_CLIENT,
+    fleet_cli, handle_hook, init, logs, mcp, message_skill, mux_control, onboarding, parse_args,
+    paths, peek, relay, reload, run_agent_cmd, run_window_cmd, run_work_cmd, run_workspace_cmd,
+    servers_cmd, set_icon_set, sidebar, start, stats, swap, timeline, upgrade, worker_cmd,
+    worktrees_cmd, AgentCmd, AgentViewCmd, AskOptions, Client, Cmd, Config, Context, ProcCmd,
+    RegistryCmd, Result, WatchInvocation, WindowCmd, WorkCmd, WorkspaceCmd, CALLER_CLIENT,
 };
 
 #[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
@@ -188,7 +188,6 @@ pub(super) async fn main() -> Result<()> {
         Cmd::Dashboard(args) => {
             cmd_dashboard(&client, cfg.clone(), config_path.clone(), &args).await
         }
-        Cmd::Graph(args) => graph::run(&cfg, args).await,
         Cmd::Activity(activity) => activity_query::run(&cfg, &activity.window, activity.args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),

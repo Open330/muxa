@@ -1,5 +1,10 @@
 # Zellij backend (planned)
 
+> **Status (2026-11-12):** the WASM plugin path described below was dropped
+> and the `tend-zellij-plugin` stub crate was removed. zellij stays at the CLI
+> baseline: adopt-only observation and jump, no capture or send. This document
+> is kept as a record of the design, not as a plan.
+
 This document captures the design plan for adding a [zellij](https://zellij.dev)
 backend alongside the existing tmux backend. **Not yet implemented** — this is
 a work item parked for later. Refer back here before starting; update in place

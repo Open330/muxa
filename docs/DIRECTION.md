@@ -21,7 +21,7 @@ standalone entry point.
 
 | Layer | Promise | Surfaces |
 | --- | --- | --- |
-| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, BarShelf, stats/timeline |
+| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, Tend for Mac menu bar, stats/timeline |
 | **Runtime** | Agents are launched, organized, coordinated, and recovered as Work, not as loose panes. | Work/Run model, `work`/`workspace`/`agent`, tendd-owned PTYs and Tend for Mac, collaboration mailbox and `@peer`, workers, Fleet, snapshot/restore, usage-limit recovery, MCP |
 
 Rules that keep the layers honest:
@@ -102,7 +102,7 @@ whether the feature matters.
 | --- | --- | --- |
 | **Core** | Regressions block release; live tour + tests required | Attention layer, Work/Run model, collaboration mailbox, MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
 | **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, dashboard, account routing and usage-limit recovery |
-| **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, `graph` |
+| **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts |
 
 A Labs feature graduates when it has a written contract, a recovery path, and
 evidence (from `tend stats` or issues) that it is used outside a single

@@ -51,9 +51,9 @@ use crate::tmux::PaneInfo;
 
 /// CLI-baseline zellij backend.
 ///
-/// Holds a shared snapshot of pane metadata that the future
-/// `tend-zellij-plugin` WASM module will populate over IPC. Without the
-/// plugin the snapshot stays empty and methods that depend on
+/// Holds a shared snapshot of pane metadata that a WASM plugin could
+/// populate over IPC. No such plugin ships (the stub crate was removed),
+/// so the snapshot stays empty and methods that depend on
 /// pane-level metadata return empty / `None` — `caps()` is the
 /// authoritative signal for what's actually available.
 ///
