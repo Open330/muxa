@@ -87,7 +87,16 @@ impl Daemon {
         let session_activity_path = dir.join("session-activity.json");
         let tmux_tmpdir = dir.join("tmux-tmp");
         std::fs::create_dir(&tmux_tmpdir).expect("create isolated tmux tmpdir");
-        let (data_home, state_home) = isolated_homes(&dir);
+        let (mut data_home, mut state_home) = isolated_homes(&dir);
+        // A test that brings its own homes (to share them with its own CLI
+        // calls) keeps them; the daemon and `cli()` then agree on them.
+        for (key, value) in env {
+            match *key {
+                "XDG_DATA_HOME" => data_home = PathBuf::from(value),
+                "XDG_STATE_HOME" => state_home = PathBuf::from(value),
+                _ => {}
+            }
+        }
 
         // Default config that isolates persisted state into the per-test tempdir.
         // Tests that want richer config concatenate their own TOML body.
