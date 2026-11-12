@@ -1036,7 +1036,28 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "config_launch_v1",
     "config_orchestration_v1",
     "config_edit_v1",
+    DAEMON_BOOT_ID_CAPABILITY,
 ];
+
+/// Advertised by a daemon whose `hello` and successful config read/write
+/// responses carry [`daemon_boot_id`]. A client that sees it may treat a
+/// changed `boot_id` as proof of a different daemon process; without it, the
+/// client must fall back to weaker evidence.
+pub const DAEMON_BOOT_ID_CAPABILITY: &str = "daemon_boot_id_v1";
+
+/// A random identity drawn once per daemon process image.
+///
+/// `generation` cannot tell daemons apart: every fresh process starts at 0 and
+/// only a self-reexec increments it, so an external stop/start looks
+/// identical. This id is 128 random bits, generated on first use and fixed for
+/// the life of the process image. A self-reexec loads a new image and so
+/// draws a new id; the generation changes in the same step, so the pair stays
+/// consistent and no state has to survive `exec`.
+#[must_use]
+pub fn daemon_boot_id() -> &'static str {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
 
 /// Advertised only when the server has the controller required to come back
 /// after draining. A server without one refuses `restart`.
@@ -1100,6 +1121,12 @@ pub struct Response {
     /// the old daemon still finishing an in-flight response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// Per-process daemon identity from [`daemon_boot_id`], present on every
+    /// `hello` and successful config read/write from a daemon advertising
+    /// [`DAEMON_BOOT_ID_CAPABILITY`]. Unlike `generation` it differs across an
+    /// external stop/start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<&'static str>,
     /// With `turn_evidence`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_evidence: Option<Box<crate::agent_records::evidence::TurnEvidence>>,
@@ -1286,6 +1313,7 @@ impl Response {
             collaboration_open_counts: None,
             collaboration_byte_budget: None,
             generation: None,
+            boot_id: None,
             turn_evidence: None,
             prompt_token: None,
             sessions: None,
@@ -1572,9 +1600,13 @@ impl Response {
         response.ask_conversation = Some(conversation);
         response
     }
+    /// Every successful config read or write names the daemon process that
+    /// served it, so a client can anchor "saved, applies on restart" to the
+    /// daemon that actually took the write rather than to a cached hello.
     pub(super) fn with_config(document: crate::config_file::ConfigDocument) -> Self {
         let mut response = Self::ok();
         response.config = Some(document);
+        response.boot_id = Some(daemon_boot_id());
         response
     }
 
@@ -1610,6 +1642,7 @@ impl Response {
         r.capabilities = Some(capabilities);
         r.version = Some(env!("CARGO_PKG_VERSION"));
         r.generation = restart.map(RestartController::generation);
+        r.boot_id = Some(daemon_boot_id());
         r
     }
 }

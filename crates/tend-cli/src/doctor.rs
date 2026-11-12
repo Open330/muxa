@@ -1501,6 +1501,7 @@ mod tests {
             collaboration_error: None,
             capabilities: Vec::new(),
             generation: None,
+            boot_id: None,
             protocol: tend::event::PROTOCOL_VERSION,
             version: Some(env!("CARGO_PKG_VERSION").into()),
         };

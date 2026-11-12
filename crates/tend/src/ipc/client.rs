@@ -24,6 +24,9 @@ pub struct Hello {
     pub collaboration_error: Option<String>,
     pub capabilities: Vec<String>,
     pub generation: Option<u64>,
+    /// The daemon process's random per-start identity. `None` from a daemon
+    /// that predates `daemon_boot_id_v1`.
+    pub boot_id: Option<String>,
     /// The daemon's crate version. `None` from a daemon built before the
     /// field existed — which already means it is older than this client.
     pub version: Option<String>,

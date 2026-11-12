@@ -149,6 +149,10 @@ impl Client {
                 })
                 .unwrap_or_default(),
             generation: resp["generation"].as_u64(),
+            boot_id: resp["boot_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
             version: resp["version"].as_str().map(str::to_string),
             protocol: resp["protocol"]
                 .as_u64()

@@ -47,6 +47,20 @@ private struct TendConfigEnvelope: Decodable {
     let ok: Bool?
     let error: String?
     let config: TendDaemonConfigDocument?
+    let bootID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, error, config
+        case bootID = "boot_id"
+    }
+}
+
+/// A successful `config_write`, with the daemon process that served it.
+struct TendConfigWrite: Sendable {
+    let document: TendDaemonConfigDocument
+    /// The serving daemon's boot id; nil from a tendd older than
+    /// `daemon_boot_id_v1`.
+    let servedBy: String?
 }
 
 struct TendLaunchProvider: Codable, Hashable, Sendable, Identifiable {
@@ -128,6 +142,12 @@ struct TendLaunchSettings: Codable, Hashable, Sendable {
 struct TendLaunchDocument: Decodable, Sendable {
     let config: TendDaemonConfigDocument
     let launch: TendLaunchSettings
+    /// The serving daemon's boot id; nil from an older tendd.
+    var servedBy: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case config, launch
+    }
 }
 
 private struct TendLaunchEnvelope: Decodable {
@@ -135,6 +155,12 @@ private struct TendLaunchEnvelope: Decodable {
     let error: String?
     let config: TendDaemonConfigDocument?
     let launch: TendLaunchSettings?
+    let bootID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, error, config, launch
+        case bootID = "boot_id"
+    }
 }
 
 /// The `config_read` / `config_write` pair, on its own connection for the
@@ -177,10 +203,16 @@ final class TendConfigClient: Sendable {
     }
 
     func read() async throws -> TendDaemonConfigDocument {
-        try await document(Self.readRequest())
+        try await document(Self.readRequest()).document
     }
 
     func write(text: String, expectedText: String?) async throws -> TendDaemonConfigDocument {
+        try await writeServed(text: text, expectedText: expectedText).document
+    }
+
+    /// `write`, plus which daemon process took it — the one whose restart
+    /// applies the change.
+    func writeServed(text: String, expectedText: String?) async throws -> TendConfigWrite {
         try await document(Self.writeRequest(text: text, expectedText: expectedText))
     }
 
@@ -207,10 +239,14 @@ final class TendConfigClient: Sendable {
         guard let config = response.config, let launch = response.launch else {
             throw TendIPCError.missingField("config / launch")
         }
-        return TendLaunchDocument(config: config, launch: launch)
+        return TendLaunchDocument(
+            config: config,
+            launch: launch,
+            servedBy: response.bootID.flatMap { $0.isEmpty ? nil : $0 }
+        )
     }
 
-    private func document(_ object: [String: Any]) async throws -> TendDaemonConfigDocument {
+    private func document(_ object: [String: Any]) async throws -> TendConfigWrite {
         let payload = try JSONSerialization.data(withJSONObject: object)
         let data = try await transport.request(
             path: socketPath,
@@ -231,7 +267,7 @@ final class TendConfigClient: Sendable {
         guard let config = response.config else {
             throw TendIPCError.missingField("config")
         }
-        return config
+        return TendConfigWrite(document: config, servedBy: response.bootID.flatMap { $0.isEmpty ? nil : $0 })
     }
 }
 

@@ -22,43 +22,62 @@ struct DaemonSocketOwner: Equatable, Sendable {
     let pid: Int32
     let executablePath: String
 
-    static func find(socketPath: String) async throws -> DaemonSocketOwner {
-        try await Task.detached(priority: .userInitiated) {
-            let attributes = try FileManager.default.attributesOfItem(atPath: socketPath)
-            let socketOwner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
-            guard socketOwner == getuid() else {
-                throw TendIPCError.server("refusing to replace a socket not owned by this user")
-            }
+    /// How long `lsof` may take before the lookup gives up and kills it.
+    static let lookupTimeout: TimeInterval = 2
 
-            let data = try TendCLIProcess.run(
-                executable: URL(fileURLWithPath: "/usr/sbin/lsof"),
-                arguments: ["-nP", "-Fpcu", "-a", "-U", socketPath]
-            ).standardOutput
-            let records = parseLsof(String(decoding: data, as: UTF8.self))
-            let candidates = records.compactMap { record -> Int32? in
-                guard record.command == "tendd", record.uid == getuid() else { return nil }
-                return record.pid
-            }
-            guard candidates.count == 1, let pid = candidates.first else {
-                throw TendIPCError.server(
-                    "could not identify exactly one owner-only tendd for \(socketPath)"
-                )
-            }
+    static func find(
+        socketPath: String,
+        timeout: TimeInterval = lookupTimeout
+    ) async throws -> DaemonSocketOwner {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-Fpcu", "-a", "-U", socketPath]
+        let lsof = TendBoundedSubprocess(process)
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                try owner(socketPath: socketPath, lsof: lsof, timeout: timeout)
+            }.value
+        } onCancel: {
+            lsof.cancel()
+        }
+    }
 
-            var pathBuffer = [CChar](repeating: 0, count: 4096)
-            let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
-            guard pathLength > 0 else {
-                throw TendIPCError.posix(operation: "proc_pidpath", code: errno)
-            }
-            let executablePath = String(
-                decoding: pathBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) },
-                as: UTF8.self
+    private static func owner(
+        socketPath: String,
+        lsof: TendBoundedSubprocess,
+        timeout: TimeInterval
+    ) throws -> DaemonSocketOwner {
+        let attributes = try FileManager.default.attributesOfItem(atPath: socketPath)
+        let socketOwner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
+        guard socketOwner == getuid() else {
+            throw TendIPCError.server("refusing to replace a socket not owned by this user")
+        }
+
+        let data = try lsof.run(timeout: timeout)
+        let records = parseLsof(String(decoding: data, as: UTF8.self))
+        let candidates = records.compactMap { record -> Int32? in
+            guard record.command == "tendd", record.uid == getuid() else { return nil }
+            return record.pid
+        }
+        guard candidates.count == 1, let pid = candidates.first else {
+            throw TendIPCError.server(
+                "could not identify exactly one owner-only tendd for \(socketPath)"
             )
-            guard URL(fileURLWithPath: executablePath).lastPathComponent == "tendd" else {
-                throw TendIPCError.server("the socket owner is not a tendd executable")
-            }
-            return DaemonSocketOwner(pid: pid, executablePath: executablePath)
-        }.value
+        }
+
+        var pathBuffer = [CChar](repeating: 0, count: 4096)
+        let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        guard pathLength > 0 else {
+            throw TendIPCError.posix(operation: "proc_pidpath", code: errno)
+        }
+        let executablePath = String(
+            decoding: pathBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+        guard URL(fileURLWithPath: executablePath).lastPathComponent == "tendd" else {
+            throw TendIPCError.server("the socket owner is not a tendd executable")
+        }
+        return DaemonSocketOwner(pid: pid, executablePath: executablePath)
     }
 
     static func parseLsof(_ output: String) -> [LsofRecord] {
@@ -167,6 +186,159 @@ struct DaemonSocketOwner: Equatable, Sendable {
                 // with, which is already the state this call wants.
             }
         }.value
+    }
+}
+
+/// One subprocess run with a deadline. On timeout or cancellation the child's
+/// process group gets SIGTERM, then SIGKILL after a short grace, and `run`
+/// returns only once the child has been reaped (or the reap timeout passed)
+/// and the stdout reader has stopped — a child that ignores SIGTERM can hold
+/// neither the caller nor a reader thread.
+final class TendBoundedSubprocess: @unchecked Sendable {
+    struct TimedOut: LocalizedError {
+        let timeout: TimeInterval
+        var errorDescription: String? { "subprocess did not finish within \(timeout)s" }
+    }
+
+    /// How long a signalled child has to exit before SIGKILL.
+    static let terminationGrace: TimeInterval = 0.3
+    /// How long to wait for the reap after SIGKILL.
+    static let reapTimeout: TimeInterval = 2
+
+    private let lock = NSLock()
+    private let process: Process
+    /// Signalled on exit and on cancellation; waiters re-check the flags.
+    private let wake = DispatchSemaphore(value: 0)
+    private var cancelled = false
+    private var exited = false
+    private var output = Data()
+    private var readerStopped = false
+
+    init(_ process: Process) {
+        self.process = process
+    }
+
+    /// Stops the child (if running) and makes `run` throw
+    /// `CancellationError`; a later `run` refuses to start.
+    func cancel() {
+        lock.withLock { cancelled = true }
+        wake.signal()
+    }
+
+    /// Whether the child has been reaped.
+    var hasExited: Bool { lock.withLock { exited } }
+    /// Whether the stdout reader has stopped for good.
+    var readerFinished: Bool { lock.withLock { readerStopped } }
+
+    /// Runs the child to exit and returns its stdout. Blocks the calling
+    /// thread for at most `timeout` plus the grace and reap bounds.
+    func run(timeout: TimeInterval) throws -> Data {
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        process.terminationHandler = { [self] _ in
+            lock.withLock { exited = true }
+            wake.signal()
+        }
+        try lock.withLock {
+            if cancelled { throw CancellationError() }
+            try process.run()
+        }
+        // Foundation starts the child as its own process-group leader, so
+        // signalling the group also reaches anything it spawned.
+        let pid = process.processIdentifier
+        let ownsGroup = getpgid(pid) == pid
+        let reader = startReading(pipe.fileHandleForReading)
+
+        let deadline = DispatchTime.now() + timeout
+        var failure: Error?
+        while failure == nil, !hasExited {
+            if lock.withLock({ cancelled }) {
+                failure = CancellationError()
+            } else if wake.wait(timeout: deadline) == .timedOut, !hasExited {
+                failure = TimedOut(timeout: timeout)
+            }
+        }
+        if let failure {
+            stop(pid: pid, ownsGroup: ownsGroup)
+            reader.finish()
+            throw failure
+        }
+        // Exited: take what is buffered, but never wait on a straggler that
+        // inherited the pipe.
+        _ = reader.endOfFile.wait(timeout: .now() + 1)
+        reader.finish()
+        if lock.withLock({ cancelled }) { throw CancellationError() }
+        return lock.withLock { output }
+    }
+
+    private func stop(pid: pid_t, ownsGroup: Bool) {
+        func send(_ signal: Int32) {
+            if ownsGroup {
+                Darwin.kill(-pid, signal)
+            } else if !hasExited {
+                Darwin.kill(pid, signal)
+            }
+        }
+        send(SIGTERM)
+        let exitedGracefully = waitForExit(Self.terminationGrace)
+        // Even after a graceful exit, a group member may be ignoring SIGTERM.
+        if !exitedGracefully || ownsGroup { send(SIGKILL) }
+        if !exitedGracefully { _ = waitForExit(Self.reapTimeout) }
+    }
+
+    private func waitForExit(_ timeout: TimeInterval) -> Bool {
+        let deadline = DispatchTime.now() + timeout
+        while !hasExited {
+            if wake.wait(timeout: deadline) == .timedOut { return hasExited }
+        }
+        return true
+    }
+
+    private final class Reader: @unchecked Sendable {
+        let source: DispatchSourceRead
+        let handle: FileHandle
+        let endOfFile = DispatchSemaphore(value: 0)
+        let cancelled = DispatchSemaphore(value: 0)
+        init(source: DispatchSourceRead, handle: FileHandle) {
+            self.source = source
+            self.handle = handle
+        }
+        /// Cancels the source, waits until no event handler can still be
+        /// running, then closes the descriptor.
+        func finish() {
+            source.cancel()
+            cancelled.wait()
+            try? handle.close()
+        }
+    }
+
+    /// Reads without ever blocking: a dispatch source fires only when data
+    /// or end-of-file is ready, so stopping it never waits on the child.
+    private func startReading(_ handle: FileHandle) -> Reader {
+        let descriptor = handle.fileDescriptor
+        let source = DispatchSource.makeReadSource(
+            fileDescriptor: descriptor,
+            queue: DispatchQueue(label: "dev.tend.mac.bounded-subprocess", qos: .userInitiated)
+        )
+        let reader = Reader(source: source, handle: handle)
+        source.setEventHandler { [self, weak source] in
+            var buffer = [UInt8](repeating: 0, count: 16_384)
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                lock.withLock { output.append(contentsOf: buffer[0..<count]) }
+            } else if count == 0 || (errno != EAGAIN && errno != EINTR) {
+                reader.endOfFile.signal()
+                source?.cancel()
+            }
+        }
+        source.setCancelHandler { [self] in
+            lock.withLock { readerStopped = true }
+            reader.cancelled.signal()
+        }
+        source.resume()
+        return reader
     }
 }
 

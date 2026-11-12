@@ -72,6 +72,7 @@ pub mod metrics;
 pub mod notify;
 pub mod orchestration;
 pub mod paths;
+mod pid_liveness;
 pub mod pipeline;
 pub mod pipeline_run;
 mod process_snapshot;

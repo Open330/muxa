@@ -84,6 +84,7 @@ fn hello_reports_no_skew_against_a_matching_daemon() {
         collaboration_error: None,
         capabilities: Vec::new(),
         generation: None,
+        boot_id: None,
         protocol: PROTOCOL_VERSION,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
@@ -98,6 +99,7 @@ fn hello_reports_skew_against_a_different_build() {
         collaboration_error: None,
         capabilities: Vec::new(),
         generation: None,
+        boot_id: None,
         protocol: PROTOCOL_VERSION,
         version: Some("0.0.1-ancient".to_string()),
     };
@@ -117,6 +119,7 @@ fn hello_treats_a_silent_daemon_as_skewed() {
         collaboration_error: None,
         capabilities: Vec::new(),
         generation: None,
+        boot_id: None,
         protocol: PROTOCOL_VERSION,
         version: None,
     };
@@ -1264,7 +1267,10 @@ async fn restart_preflight_refusal_does_not_signal_shutdown_and_success_pins_tar
     std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(controller.request_checked_restart().await.unwrap());
     assert!(rx.try_recv().is_ok());
-    assert_eq!(controller.validated_launch().await.unwrap().target, target);
+    assert_eq!(
+        controller.validated_launch().await.unwrap().target,
+        std::fs::canonicalize(&target).unwrap()
+    );
     controller.stop();
     assert!(!controller.request_checked_restart().await.unwrap());
 }

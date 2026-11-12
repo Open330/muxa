@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A prompt sent from the dashboard or through Fleet while a peer's wake
+  message was being typed into the same agent no longer merges with it. Both
+  used to land on one input line and be submitted together by a single Enter;
+  now each prompt waits for the one before it to be submitted. Dashboard and
+  Fleet prompts to a worker that is being drained for shutdown are refused
+  with `worker_draining`, as `tend` prompts already were.
+- On macOS, tendd no longer marks a tracked task as stopped when its process
+  is still running under another user, and no longer starts a `kill` process
+  for every pid-tracked row while holding the agent registry.
 - The macOS app no longer freezes an action that runs the bundled `tend`
   command (registering a host, drafting a pipeline, starting an agent) when
   that command prints a lot of output or errors.
@@ -35,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs it. The Automations run log shows the last 10 entries with Show All,
   the usage-limit policy moves to Accounts, and the raw configuration file
   opens in its own window from Advanced.
+
+### Fixed
+
+- The "Restart tendd to apply" bar now clears when tendd is restarted outside
+  the app (`tend daemon stop`/`start`, a service restart). tendd's IPC `hello`
+  carries a random per-process `boot_id` (capability `daemon_boot_id_v1`,
+  also shown by the new `tend daemon status --json`), and the app reads it on
+  every refresh and reconnect. Config writes return the `boot_id` of the
+  daemon that served them, so a save is tied to the daemon that has to restart
+  rather than to the last one the app saw. Against an older tendd the app
+  falls back to a fresh hello and the socket owner's pid, looked up only after
+  a reconnect or a write, with `lsof` bounded to 2 seconds and killed if it
+  overruns.
 
 ## [0.10.10] - 2026-11-12
 
