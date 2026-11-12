@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tend for Mac: the Review sheet has a **History** of decided items, newest
   first, from tendd's `decision_history`: what was decided, what you said and
   when.
+- `swap_health` reports `module_off` (capability `swap_health_module_v1`)
+  when the daemon's account module is off. Tend for Mac then disables
+  Settings › Accounts with what to set to turn it on, and hides the menu-bar
+  account usage chip and its panel.
 
 ### Fixed
 

@@ -345,6 +345,11 @@ final class TendSwapCenter: ObservableObject {
     /// Why the last check could not answer.
     @Published private(set) var healthError: String?
 
+    /// This Mac's tendd says its account module is off: account settings
+    /// and the usage chip have nothing to act on. False until a daemon
+    /// that can say (`swap_health_module_v1`) says so.
+    var accountModuleOff: Bool { health?.moduleOff == true }
+
     private var healthCheckedAt: Date?
 
     /// `refreshHealth` at most once a minute: for the app's reconcile loop.
@@ -577,18 +582,24 @@ struct TendSwapHealth: Decodable, Equatable, Sendable {
     let jobsRunning: Int
     /// Upkeep that failed; jobs are still taken.
     let maintenance: String?
+    /// The daemon's account module is off (`swap_health_module_v1`):
+    /// accounts are not configured for it, or not in its build. False from
+    /// a daemon that cannot say, which keeps the account settings shown.
+    let moduleOff: Bool
 
     enum CodingKeys: String, CodingKey {
         case readiness, reason, fault, maintenance
         case jobsRunning = "jobs_running"
+        case moduleOff = "module_off"
     }
 
-    init(readiness: Readiness, reason: String? = nil, fault: String? = nil, jobsRunning: Int = 0, maintenance: String? = nil) {
+    init(readiness: Readiness, reason: String? = nil, fault: String? = nil, jobsRunning: Int = 0, maintenance: String? = nil, moduleOff: Bool = false) {
         self.readiness = readiness
         self.reason = reason
         self.fault = fault
         self.jobsRunning = jobsRunning
         self.maintenance = maintenance
+        self.moduleOff = moduleOff
     }
 
     init(from decoder: Decoder) throws {
@@ -598,6 +609,7 @@ struct TendSwapHealth: Decodable, Equatable, Sendable {
         fault = try values.decodeIfPresent(String.self, forKey: .fault)
         jobsRunning = try values.decodeIfPresent(Int.self, forKey: .jobsRunning) ?? 0
         maintenance = try values.decodeIfPresent(String.self, forKey: .maintenance)
+        moduleOff = (try? values.decodeIfPresent(Bool.self, forKey: .moduleOff)) ?? false
     }
 
     var isReady: Bool { readiness == .ready }

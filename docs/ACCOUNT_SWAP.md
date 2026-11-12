@@ -41,6 +41,12 @@ them too. To read or cancel older jobs, turn the module on and restart
 tendd. A launch that asks for an account starts bare and reports why, as it
 does when no account backend is found.
 
+`swap_health` says so as a field: `module_off` is true when the module is not
+enabled for the daemon's config or not in its build (capability
+`swap_health_module_v1`). Tend for Mac reads it to disable Settings ›
+Accounts, with what to set, and to drop the menu-bar usage chip; against an
+older daemon it shows them as before.
+
 Release builds include the module. It is the `aas` cargo feature of
 `tend-cli` and `tendd`, on by default, so `scripts/release-local.sh`, the
 release workflow, `embed-tendd.sh` and `install.sh` need no flag.

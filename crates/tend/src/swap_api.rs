@@ -557,6 +557,7 @@ pub enum SwapReadiness {
 pub struct UnopenedSwap {
     reason: String,
     expected_schema: i64,
+    module_off: bool,
 }
 
 impl UnopenedSwap {
@@ -565,6 +566,18 @@ impl UnopenedSwap {
         Self {
             reason,
             expected_schema,
+            module_off: false,
+        }
+    }
+
+    /// The account module is off for this daemon (not enabled by its
+    /// config, or not in this build), as opposed to a service that failed
+    /// to open.
+    #[must_use]
+    pub fn module_off(reason: String, expected_schema: i64) -> Self {
+        Self {
+            module_off: true,
+            ..Self::new(reason, expected_schema)
         }
     }
 
@@ -616,6 +629,10 @@ impl SwapJobs for UnopenedSwap {
     fn exists(&self) -> bool {
         false
     }
+
+    fn module_off(&self) -> bool {
+        self.module_off
+    }
 }
 
 /// What an IPC caller may do with swap jobs. Every request through it is a
@@ -644,6 +661,12 @@ pub trait SwapJobs: Send + Sync {
     /// one did not.
     fn exists(&self) -> bool {
         true
+    }
+    /// The account module is off: nothing account-related will answer
+    /// until the config turns it on and tendd restarts. `swap_health`
+    /// reports it as `module_off` (`swap_health_module_v1`).
+    fn module_off(&self) -> bool {
+        false
     }
     /// Readable whatever state the service is in, so a halted or recovered
     /// job can always be inspected.

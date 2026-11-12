@@ -5,13 +5,26 @@ import SwiftUI
 struct TendAccountsSettingsPane: View {
     @ObservedObject var model: AppModel
     @ObservedObject var registry: TendModuleRegistry
+    @ObservedObject var swaps: TendSwapCenter
     @ObservedObject private var automations = AutomationStore.shared
 
     private var aas: AasModule? { registry.module(AasModule.self) }
-    private var isEnabled: Bool { registry.isEnabled(AasModule.identity.id) }
+    /// The daemon's account module is off: nothing here would act.
+    private var moduleOff: Bool { swaps.accountModuleOff }
+    private var isEnabled: Bool { registry.isEnabled(AasModule.identity.id) && !moduleOff }
 
     var body: some View {
         Form {
+            if moduleOff {
+                Section {
+                    Label("The account module is off in tendd", systemImage: "person.2.slash")
+                        .font(.headline)
+                    TendSettingsCaption("Switching agents between accounts is an optional module. Set [modules] accounts = true in config.toml, or configure accounts, then restart tendd. Usage limits are still seen and resumed without it.")
+                    if let reason = swaps.health?.reason {
+                        TendSettingsCaption(verbatim: reason)
+                    }
+                }
+            }
             Section {
                 Toggle(isOn: Binding(
                     get: { isEnabled },
@@ -24,12 +37,13 @@ struct TendAccountsSettingsPane: View {
                         TendSettingsCaption(verbatim: AasModule.identity.blurb)
                     }
                 }
-                if let aas {
+                if let aas, !moduleOff {
                     TendModuleAvailabilityRow(module: aas, isEnabled: isEnabled)
                 }
             } header: {
                 Text(verbatim: "aas")
             }
+            .disabled(moduleOff)
 
             Section("When an agent hits its usage limit") {
                 TendLimitPolicyPicker(model: model, store: automations, showsTitle: false)

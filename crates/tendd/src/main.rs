@@ -470,6 +470,7 @@ async fn run() -> Result<()> {
     // The account module opens only when this config turns it on
     // (`[modules] accounts`, or settings that already use accounts).
     let accounts_module = cfg.accounts_module();
+    let module_off = !cfg!(feature = "aas") || !accounts_module.enabled;
     let opened_swap = if cfg!(feature = "aas") && !accounts_module.enabled {
         tracing::info!("account module not enabled; swap jobs are off");
         Err(tend::swap_api::module_unavailable(true))
@@ -491,6 +492,10 @@ async fn run() -> Result<()> {
     // health check can still say why.
     let swap_jobs: Arc<dyn tend::swap_api::SwapJobs> = match &opened_swap {
         Ok(swap) => swap_runner::jobs(swap),
+        Err(reason) if module_off => Arc::new(tend::swap_api::UnopenedSwap::module_off(
+            reason.clone(),
+            swap_runner::JOB_SCHEMA,
+        )),
         Err(reason) => Arc::new(tend::swap_api::UnopenedSwap::new(
             reason.clone(),
             swap_runner::JOB_SCHEMA,

@@ -7,6 +7,10 @@ pub const SWAP_PLAN_CAPABILITY: &str = "swap_plan_v1";
 /// `swap_health_v1`: `swap_health`, answered whatever the service's state,
 /// including one that never opened.
 pub const SWAP_HEALTH_CAPABILITY: &str = "swap_health_v1";
+/// `swap_health_module_v1`: `swap_health` carries `module_off`, true when
+/// the account module is off for this daemon, so a client can hide account
+/// settings instead of reading the reason text.
+pub const SWAP_HEALTH_MODULE_CAPABILITY: &str = "swap_health_module_v1";
 
 /// How long `swap_health` waits on the service before saying so.
 pub(super) const SWAP_HEALTH_ANSWER: Duration = Duration::from_secs(2);
@@ -19,10 +23,15 @@ pub(super) async fn swap_health_response(
     let Some(swap) = swap.cloned() else {
         return Response::err("swap jobs are not offered by this daemon".to_owned());
     };
-    let check = tokio::task::spawn_blocking(move || swap.health());
+    let check = tokio::task::spawn_blocking(move || (swap.health(), swap.module_off()));
     match tokio::time::timeout(SWAP_HEALTH_ANSWER, check).await {
-        Ok(Ok(health)) => match serde_json::to_value(&health) {
-            Ok(value) => Response::with_swap(value),
+        Ok(Ok((health, module_off))) => match serde_json::to_value(&health) {
+            Ok(mut value) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("module_off".into(), module_off.into());
+                }
+                Response::with_swap(value)
+            }
             Err(error) => Response::err(error.to_string()),
         },
         Ok(Err(error)) => Response::err(format!("swap health check failed: {error}")),

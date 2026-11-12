@@ -369,6 +369,37 @@ private func capRule(_ action: TendAutomationAction, agents: [String] = [], scop
     #expect(future.readiness == .unknown("warming"))
 }
 
+@Test func swapHealthSaysWhenTheAccountModuleIsOff() async throws {
+    let off = try JSONDecoder().decode(TendSwapHealth.self, from: Data(#"""
+    {"readiness":"unavailable","reason":"the account module is not enabled","expected_schema":3,"jobs_running":0,"module_off":true}
+    """#.utf8))
+    #expect(off.moduleOff)
+    // A daemon that cannot say keeps the account settings: no reading of
+    // the reason text.
+    let older = try JSONDecoder().decode(TendSwapHealth.self, from: Data(#"""
+    {"readiness":"unavailable","reason":"the account module is not enabled","expected_schema":3,"jobs_running":0}
+    """#.utf8))
+    #expect(!older.moduleOff)
+
+    let client = TendIPCClient(socketPath: "/tmp/tend-module-off-\(UUID().uuidString).sock") { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        if object["kind"] as? String == "hello" {
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true, "min_protocol": 1, "max_protocol": 6,
+                "capabilities": ["session_bytes_v1", "session_attachment_identity_v1", "work_control_v1",
+                                 "swap_health_v1", "swap_health_module_v1"],
+            ])
+        }
+        return try JSONSerialization.data(withJSONObject: ["ok": true, "swap": [
+            "readiness": "unavailable", "reason": "the account module is not enabled", "jobs_running": 0, "module_off": true,
+        ]])
+    }
+    try await client.hello()
+    let model = await AppModel(client: client)
+    await model.swaps.refreshHealth()
+    #expect(await model.swaps.accountModuleOff)
+}
+
 @Test func aSwapFieldOfAnotherShapeDoesNotFailTheReply() throws {
     struct Reply: Decodable { let swap: TendLenient<TendSwapHealth>? }
     let job = try JSONDecoder().decode(Reply.self, from: Data(#"{"swap":{"job_id":"j1","state":"running"}}"#.utf8))

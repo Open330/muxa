@@ -23592,6 +23592,36 @@
           }
         }
       }
+    },
+    "The account module is off in tendd" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tendd에서 계정 모듈이 꺼져 있습니다"
+          }
+        }
+      }
+    },
+    "Switching agents between accounts is an optional module. Set [modules] accounts = true in config.toml, or configure accounts, then restart tendd. Usage limits are still seen and resumed without it." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트의 계정을 바꾸는 기능은 선택 모듈입니다. config.toml에 [modules] accounts = true를 설정하거나 계정을 구성한 뒤 tendd를 다시 시작하세요. 모듈이 없어도 사용량 한도는 감지되고 한도가 풀리면 다시 이어집니다."
+          }
+        }
+      }
+    },
+    "The account module is off in tendd, so there is no account usage to show." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tendd에서 계정 모듈이 꺼져 있어 보여 줄 계정 사용량이 없습니다."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
