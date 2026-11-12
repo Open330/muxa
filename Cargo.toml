@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/tend", "crates/tend-aas", "crates/tend-cli", "crates/tendd"]
+members = [
+    "crates/tend",
+    "crates/tend-aas",
+    "crates/tend-cli",
+    "crates/tend-work",
+    "crates/tendd",
+]
 
 [workspace.package]
 version = "0.10.15"
@@ -14,6 +20,7 @@ authors = ["Open330 Contributors"]
 # internal
 tend = { path = "crates/tend", version = "0.10.15" }
 tend-aas = { path = "crates/tend-aas", version = "0.10.15" }
+tend-work = { path = "crates/tend-work", version = "0.10.15" }
 
 # external
 anyhow = "1.0.103"

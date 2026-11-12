@@ -1,4 +1,5 @@
 use super::{Client, Context, Duration, Path, PathBuf, Result, Write};
+use tend_work::caller::caller_env;
 
 pub(super) async fn cmd_run(
     client: &Client,
@@ -36,20 +37,6 @@ pub(super) async fn cmd_run(
         attach_session(client, &session.id).await?;
     }
     Ok(())
-}
-
-pub(crate) fn caller_env(socket_path: &Path) -> Vec<(String, String)> {
-    let mut env = std::env::vars_os()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .collect::<Vec<_>>();
-    match env.iter_mut().find(|(key, _)| key == "TEND_SOCKET") {
-        Some((_, value)) if value.is_empty() => {
-            *value = socket_path.display().to_string();
-        }
-        Some(_) => {}
-        None => env.push(("TEND_SOCKET".into(), socket_path.display().to_string())),
-    }
-    env
 }
 
 pub(super) async fn cmd_attach(client: &Client, session: &str) -> Result<()> {

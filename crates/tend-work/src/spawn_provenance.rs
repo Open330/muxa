@@ -7,7 +7,7 @@ use tend::collaboration::CollaborationEndpoint;
 use tend::tmux::layout::SpawnProvenance;
 
 /// Resolve through tendd so shared app-server environments cannot invent a parent.
-pub(crate) fn resolve_creator(socket: &Path) -> Option<CollaborationEndpoint> {
+pub fn resolve_creator(socket: &Path) -> Option<CollaborationEndpoint> {
     let origin = if let Ok(session) = std::env::var("CODEX_THREAD_ID") {
         if session.trim().is_empty() {
             return None;
@@ -20,10 +20,10 @@ pub(crate) fn resolve_creator(socket: &Path) -> Option<CollaborationEndpoint> {
             agent_session_id: Some(session),
         }
     } else {
-        if crate::mcp::pane_env_is_borrowed() {
+        if crate::caller::pane_env_is_borrowed() {
             return None;
         }
-        crate::mcp::current_collaboration_origin().ok()?
+        crate::caller::current_collaboration_origin().ok()?
     };
     let response = tend::ipc::blocking_call(
         socket,
@@ -38,7 +38,7 @@ pub(crate) fn resolve_creator(socket: &Path) -> Option<CollaborationEndpoint> {
     (!room.current.console).then(|| (&room.current).into())
 }
 
-pub(crate) fn record(request: &crate::agent_launch::StartRequest, pane: &str, launch_id: &str) {
+pub fn record(request: &crate::agent_launch::StartRequest, pane: &str, launch_id: &str) {
     let Some(creator) = request.creator.clone() else {
         return;
     };

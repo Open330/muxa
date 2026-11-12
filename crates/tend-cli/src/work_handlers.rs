@@ -53,7 +53,7 @@ pub(super) async fn run_work_cmd(
         }
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Compose(args) => work_compose::run(args, cfg).await,
-        WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
+        WorkCmd::Up(args) => crate::work_up_cmd::run(args, cfg, config_path, Some(client)).await,
         WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket(), cfg),
         WorkCmd::Plan(args) => work_backlog::run_plan(args, client).await,
         WorkCmd::Link(args) => work_external::run_link(args, client).await,
@@ -63,10 +63,10 @@ pub(super) async fn run_work_cmd(
                 work_backlog::run_list_stage(client, stage, args.workspace.as_deref(), args.json)
                     .await
             }
-            None => tmux_work::run_work_list(args, client).await,
+            None => crate::work_cmds::run_work_list(args, client).await,
         },
-        WorkCmd::Show(args) => tmux_work::run_work_show(args, client).await,
-        WorkCmd::Done(args) => tmux_work::run_work_done(args, client, cfg).await,
+        WorkCmd::Show(args) => crate::work_cmds::run_work_show(args, client).await,
+        WorkCmd::Done(args) => crate::work_cmds::run_work_done(args, client, cfg).await,
         WorkCmd::Reconcile(args) => work_up::run_reconcile(args, client, cfg).await,
         WorkCmd::Close(args) | WorkCmd::Down(args) => tmux_work::run_work_close(args),
         WorkCmd::Options(args) => work_options::run_options(args, cfg, config_path),

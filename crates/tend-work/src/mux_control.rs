@@ -113,39 +113,13 @@ pub fn run(endpoint: &BackendEndpoint, args: &[&str]) -> Result<(), String> {
     capture(endpoint, args).map(|_| ())
 }
 
-/// Resolve the host and socket ourselves: an existing rmux server's run-shell
-/// PATH can point `tmux` at native tmux rather than the rmux shim.
-pub fn watch_popup(client: Option<&str>, source: Option<&str>) -> anyhow::Result<()> {
-    let executable = std::env::current_exe()?;
-    let mut words = vec![executable.into_os_string()];
-    let work_pane = source.and_then(|pane| crate::sidebar::watch_source(&Control::Ambient, pane));
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--popup" {
-            continue;
-        }
-        if work_pane.is_some() && arg == "--caller-pane" {
-            args.next();
-            continue;
-        }
-        if work_pane.is_some() && arg.to_string_lossy().starts_with("--caller-pane=") {
-            continue;
-        }
-        words.push(arg);
-    }
-    if let Some(pane) = work_pane {
-        words.extend(["--caller-pane".into(), pane.into()]);
-    }
-    full_popup(&words, client, "99%")
-}
-
 pub fn peek_popup(client: Option<&str>) -> anyhow::Result<()> {
     let mut words = vec![std::env::current_exe()?.into_os_string()];
     words.extend(std::env::args_os().skip(1).filter(|arg| arg != "--popup"));
     full_popup(&words, client, "100%")
 }
 
-fn full_popup(
+pub fn full_popup(
     words: &[std::ffi::OsString],
     client: Option<&str>,
     height: &str,
@@ -164,7 +138,7 @@ fn full_popup(
     Ok(())
 }
 
-fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
+pub fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
     let words = words
         .iter()
         .map(|word| {
@@ -179,7 +153,7 @@ fn popup_shell_command(words: &[std::ffi::OsString]) -> anyhow::Result<String> {
     })
 }
 
-fn posix_command(words: &[&str]) -> String {
+pub fn posix_command(words: &[&str]) -> String {
     words
         .iter()
         .map(|word| format!("'{}'", word.replace('\'', "'\"'\"'")))
@@ -191,7 +165,7 @@ fn posix_command(words: &[&str]) -> String {
 /// by default. A line of quoted words is a parse error there — a leading
 /// string is an expression, not a command — so the program needs the call
 /// operator, and a single quote escapes by doubling.
-fn powershell_command(words: &[&str]) -> String {
+pub fn powershell_command(words: &[&str]) -> String {
     let quoted = words
         .iter()
         .map(|word| format!("'{}'", word.replace('\'', "''")))

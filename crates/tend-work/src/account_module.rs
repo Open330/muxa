@@ -6,10 +6,10 @@
 use tend::swap_api::{AccountRoute, RoutedLaunch};
 
 /// Whether this build carries the account module.
-pub(crate) const COMPILED: bool = cfg!(feature = "aas");
+pub const COMPILED: bool = cfg!(feature = "aas");
 
 /// Where a new agent starts. `Err` is why it starts bare.
-pub(crate) fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
+pub fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     #[cfg(feature = "aas")]
     {
         tend_aas::account_route::decide(route)
@@ -23,7 +23,7 @@ pub(crate) fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
 
 /// Why `tend swap` and friends refuse, when they do: the module is not in
 /// this build, or `config` does not turn it on.
-pub(crate) fn unavailable(config: &tend::Config) -> Option<String> {
+pub fn unavailable(config: &tend::Config) -> Option<String> {
     if !COMPILED {
         return Some(tend::swap_api::module_unavailable(false));
     }

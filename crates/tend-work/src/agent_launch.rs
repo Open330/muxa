@@ -44,7 +44,7 @@ impl AgentProgram {
     }
 
     /// The provider's CLI name, and the `[agent.<program>]` config key.
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -613,7 +613,7 @@ async fn run_native(
         .spawn_session(tend::SpawnSession {
             command: launch.command,
             args: launch.args,
-            env: crate::caller_env(socket_path),
+            env: crate::caller::caller_env(socket_path),
             cwd: Some(cwd.clone()),
             name: args
                 .name
@@ -1434,7 +1434,7 @@ fn resolve_placement_target(request: &mut StartRequest, cwd: &Path) -> Result<()
         let target = request
             .target
             .clone()
-            .or_else(crate::mcp::own_tmux_pane)
+            .or_else(crate::caller::own_tmux_pane)
             .filter(|target| !target.trim().is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!("window placement needs --target or this pane's own TMUX_PANE")
@@ -1541,7 +1541,7 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
         request
             .target
             .clone()
-            .or_else(crate::mcp::own_tmux_pane)
+            .or_else(crate::caller::own_tmux_pane)
             .filter(|target| !target.trim().is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(

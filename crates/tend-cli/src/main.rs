@@ -1,9 +1,7 @@
 //! tend CLI — user-facing entry point.
 
-mod account_module;
 mod activity_query;
 mod agent_find;
-mod agent_launch;
 mod agent_move;
 mod agent_records;
 mod ask_progress;
@@ -32,7 +30,7 @@ mod mcp_reload;
 mod mcp_revision;
 mod mcp_surface;
 mod message_skill;
-mod mux_control;
+mod mux_popup;
 mod onboarding;
 mod orchestration;
 mod owner_only;
@@ -45,7 +43,6 @@ mod review_cmd;
 mod review_evidence;
 mod servers_cmd;
 mod sidebar;
-mod spawn_provenance;
 mod stale_agents;
 mod start;
 mod stats;
@@ -53,21 +50,24 @@ mod swap;
 mod theme;
 mod time_range;
 mod timeline;
-mod tmux_work;
 mod upgrade;
 mod watch;
 #[cfg(windows)]
 mod windows_detach;
 mod work_backlog;
+mod work_cmds;
 mod work_compose;
 mod work_external;
 mod work_init;
 mod work_options;
 mod work_pipeline;
-mod work_up;
+mod work_up_cmd;
 mod worker_cmd;
-mod worker_startup;
 mod worktrees_cmd;
+
+// The Work model and agent launch live in the `tend-work` library, shared
+// with the daemon; these keep the `crate::…` paths the CLI already uses.
+use tend_work::{account_module, agent_launch, mux_control, tmux_work, work_up, worker_startup};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -1008,12 +1008,12 @@ enum WorkCmd {
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
     /// List tend-managed work windows.
-    List(tmux_work::WorkListArgs),
+    List(work_cmds::WorkListArgs),
     /// Show one work window and its agent panes.
     Show(tmux_work::WorkShowArgs),
     /// Report that this agent finished its part of the work, which opens
     /// any `after` edge waiting on it. Run it from the agent's own pane.
-    Done(tmux_work::WorkDoneArgs),
+    Done(work_cmds::WorkDoneArgs),
     /// Internal daemon callback: launch dependency-ready durable aliases.
     #[command(hide = true)]
     Reconcile(work_up::ReconcileArgs),
@@ -1264,9 +1264,7 @@ mod mailbox_handlers;
 use mailbox_handlers::{cmd_identity, cmd_msg, cmd_peers};
 
 mod session_handlers;
-use session_handlers::{
-    caller_env, cmd_attach, cmd_detach, cmd_register, cmd_run, cmd_zellij_plugin_snapshot,
-};
+use session_handlers::{cmd_attach, cmd_detach, cmd_register, cmd_run, cmd_zellij_plugin_snapshot};
 
 mod watch_handlers;
 use watch_handlers::{

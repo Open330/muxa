@@ -20,11 +20,12 @@ path = "src/main.rs"
 # is `[modules] accounts` in config.toml. `--no-default-features` builds
 # without it.
 default = ["aas"]
-aas = ["dep:tend-aas"]
+aas = ["dep:tend-aas", "tend-work/aas"]
 
 [dependencies]
 uuid.workspace = true
 tend = { workspace = true }
+tend-work = { workspace = true }
 # The optional account module; see the `aas` feature.
 tend-aas = { workspace = true, optional = true }
 
@@ -90,6 +91,9 @@ rand = "0.8"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 [dev-dependencies]
+# Test builds never write worktree receipts into the user's data directory
+# (see tend-work's `test-no-receipts`).
+tend-work = { workspace = true, features = ["test-no-receipts"] }
 tempfile = "3"
 # `test-util` enables `tokio::time::pause`/`advance`, which the watch
 # refresh-task tests use to drive the periodic tick deterministically
