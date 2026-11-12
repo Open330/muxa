@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the daemon's account module is off. Tend for Mac then disables
   Settings › Accounts with what to set to turn it on, and hides the menu-bar
   account usage chip and its panel.
+- Tend for Mac: Home shows a **Backlog** column of planned Work
+  (`tend work plan`, `work_backlog_v1`) with **Start**, which runs
+  `tend work up` from the saved plan.
 
 ### Fixed
 

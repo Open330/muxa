@@ -23622,6 +23622,76 @@
           }
         }
       }
+    },
+    "Backlog" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "백로그"
+          }
+        }
+      }
+    },
+    "Planned, not started" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계획만 있고 시작 전"
+          }
+        }
+      }
+    },
+    "Could not read the backlog: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "백로그를 읽지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "The Work did not start." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work가 시작되지 않았습니다."
+          }
+        }
+      }
+    },
+    "Backlog priority: lower starts first" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "백로그 우선순위: 낮을수록 먼저 시작합니다"
+          }
+        }
+      }
+    },
+    "Start" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시작"
+          }
+        }
+      }
+    },
+    "Start this Work from its plan (tend work up)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장된 계획대로 이 Work를 시작합니다 (tend work up)"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

@@ -21,6 +21,8 @@ struct FleetHomeView: View {
     @State private var showsLeftovers = false
     /// The daemon's decision queue, read while Home is on screen.
     @StateObject private var decisionFeed = FleetDecisionFeed()
+    /// Planned Work not started yet (`work_backlog_v1`).
+    @StateObject private var backlogFeed = FleetBacklogFeed()
     /// A commit or range from a decision's evidence, open in Changes.
     @State private var revisionTarget: FleetRevisionTarget?
     @AppStorage("home.review.scope") private var reviewScope: FleetReviewScope = .day
@@ -114,6 +116,13 @@ struct FleetHomeView: View {
                 try? await Task.sleep(for: FleetDecisionFeed.refreshEvery)
             }
         }
+        .task {
+            // Work planned with `tend work plan` shows up while Home is open.
+            while !Task.isCancelled {
+                await backlogFeed.load(model.client)
+                try? await Task.sleep(for: FleetBacklogFeed.refreshEvery)
+            }
+        }
         .sheet(isPresented: $showsReview) {
             FleetReviewView(
                 model: model,
@@ -202,8 +211,10 @@ struct FleetHomeView: View {
     /// Narrows the board to one host and/or one project.
     private var filterMenu: some View {
         let all = allWorks
-        let hosts = Array(Set(all.flatMap(\.hostAliases))).sorted()
-        let projects = Array(Set(all.compactMap(\.repo))).sorted()
+        // Planned Work counts too: a project with only a plan can be picked.
+        let planned = backlogFeed.shown(on: all)
+        let hosts = Array(Set(all.flatMap(\.hostAliases) + (planned.isEmpty ? [] : [model.localHostAlias]))).sorted()
+        let projects = Array(Set(all.compactMap(\.repo) + planned.compactMap(\.project))).sorted()
         let active = hostFilter != nil || projectFilter != nil
         return Menu {
             Picker("Host", selection: $hostFilter) {
@@ -274,6 +285,15 @@ struct FleetHomeView: View {
         decisionFeed.decisions(model).filter { decision in
             (hostFilter == nil || decision.host.alias == hostFilter)
                 && (projectFilter == nil || decision.repo == projectFilter)
+        }
+    }
+
+    /// Planned Work under the same filters as the cards: this Mac's backlog,
+    /// by the project its plan starts in.
+    private var backlog: [TendWorkRecord] {
+        guard hostFilter == nil || hostFilter == model.localHostAlias else { return [] }
+        return backlogFeed.shown(on: allWorks).filter { record in
+            projectFilter == nil || record.project == projectFilter
         }
     }
 
@@ -437,8 +457,9 @@ struct FleetHomeView: View {
         Group {
             // A decision read that failed keeps the lanes, so its warning
             // shows instead of an ordinary empty Home.
-            let problem = decisionFeed.problem == nil ? 0 : 1
-            if FleetBoard.showsEmptyBoard(visible: works.count + decisions.count + problem, reviewed: reviewedCount) {
+            let problem = decisionFeed.problem == nil && backlogFeed.problem == nil ? 0 : 1
+            let backlog = backlog
+            if FleetBoard.showsEmptyBoard(visible: works.count + decisions.count + backlog.count + problem, reviewed: reviewedCount) {
                 FleetEmptyBoard(
                     isConnected: model.isConnected,
                     newAgent: { model.presentNewAgent() },
@@ -446,6 +467,14 @@ struct FleetHomeView: View {
                 )
             } else {
                 HStack(alignment: .top, spacing: 12) {
+                    // A failed backlog read shows its column with the reason.
+                    if !backlog.isEmpty || backlogFeed.problem != nil {
+                        FleetBacklogColumn(feed: backlogFeed, records: backlog) { record in
+                            let feed = backlogFeed
+                            let model = model
+                            Task { await feed.start(record, model: model) }
+                        }
+                    }
                     ForEach(FleetLane.allCases) { lane in
                         FleetLaneColumn(
                             lane: lane,

@@ -70,6 +70,11 @@ The native workspace follows two proven desktop navigation patterns:
   first, from `decision_history`: Looks Good, Send Back and answers from
   Home, review dispositions made anywhere (`tend review`), and answered
   human requests with the answer. It is read-only and filterable.
+- A **Backlog** column, left of Your turn, lists Work planned with
+  `tend work plan` and not started (`work_backlog_v1`, stage `queued`), in
+  the daemon's priority order, under the same host and project filters.
+  **Start** runs `tend work up` from the saved plan on this Mac. The column
+  is not shown when the backlog is empty or the daemon has none.
 - Below Home, VS Code's Activity Bar pattern switches one contextual sidebar
   at a time while the editor area remains stable. Tend applies that to
   **Explore**, **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped
