@@ -157,7 +157,25 @@ cannot loop its own turn; after that, and for quiet notices or
 `wake = "never"`, only a turn the user starts carries it. Offer attempts are
 recorded on the request (`turn_offer`); they are attempts, not proof of
 delivery. A primary that is idle with no turn coming keeps the request queued
-until then. The flag asserts the
+until then.
+
+The same `Stop` hook also catches a recipient that claimed a request expecting
+a reply and then ended its turn without replying. It continues that turn once
+with a *reply reminder* naming the request id (at most three times, five
+minutes apart; recorded as `turn_offer.reply_reminders`). Workers are
+reminded; so is a primary for user-authorized work it took through an offer,
+but not a human who accepted a request by id in their own session. A recipient
+waiting on an open request of its own, sent after the claim, is not reminded:
+ending a turn to wait for that reply's wake (until the wake is delivered) is
+the intended pattern. Every `Stop` without a reply is recorded
+(`turn_offer.unanswered_stop_at`); seeing the recipient work or take a new
+prompt clears it, so an Idle inferred by a timeout never counts. If, after at
+least one reminder, the recipient is still Idle five minutes after its latest
+recorded `Stop`, the request is marked `peer_interrupted` with reason `reply_overdue` and goes
+through the ordinary interruption path below: the sender's wait returns it
+first, and the linked human recovery item follows after the two-minute grace.
+Working again or a reply clears it. Providers without a `Stop` hook are never
+reminded and so never marked overdue. The flag asserts the
 user's instruction to deliver that request; it grants no execute authority.
 Fleet sends refuse the flag until relay and destination negotiate it. The protection exists to stop
 unsolicited agent work, not to second-guess the user, so nobody has to accept

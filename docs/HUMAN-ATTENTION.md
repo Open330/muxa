@@ -57,7 +57,10 @@ be built and visually verified on macOS before publishing a Tend.app bundle.
 The shared skill's **Peer interruption recovery** section and the MCP guide's
 `workflows.peer_interruption` define coordinator recovery. A peer's quota/error
 state and a durable reply are distinct: upgraded daemons return `peer_interrupted`
-on known error/stopped recipients without fabricating a terminal reply. Use waits of at most 60 seconds plus a chosen overall budget,
+on known error/stopped recipients without fabricating a terminal reply. A
+recipient that claimed a request, was reminded at its `Stop` hook to reply, and
+stays Idle five minutes later is reported the same way with reason
+`reply_overdue` (see [COLLABORATION](COLLABORATION.md)). Use waits of at most 60 seconds plus a chosen overall budget,
 then check fresh identity-matched recipient state. Do not use the request's
 snapshot of `to.state` or usage percentage alone to declare failure.
 

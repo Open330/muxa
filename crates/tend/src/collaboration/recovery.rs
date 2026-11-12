@@ -88,6 +88,43 @@ fn missing_binding_reason(
     .then_some("binding_unavailable")
 }
 
+/// The recipient claimed this request, was reminded at a Stop boundary to
+/// reply, and is still Idle a full backoff after its latest recorded Stop
+/// without a reply, with no prompt submitted since. The Stop and the prompt
+/// are hook facts; a timeout-inferred Idle without a Stop never qualifies,
+/// because working again clears the recorded Stop (see the caller).
+fn reply_overdue<'a>(
+    request: &CollaborationRequest,
+    agent: Option<&Agent>,
+    requests: impl IntoIterator<Item = &'a CollaborationRequest>,
+    now: OffsetDateTime,
+) -> Option<&'static str> {
+    let offer = request.turn_offer.as_ref()?;
+    let stop = offer.unanswered_stop_at?;
+    let agent = agent?;
+    (request.status == RequestStatus::Claimed
+        && request.reply.is_none()
+        && agent.state == AgentState::Idle
+        && agent.last_prompt_at.is_none_or(|at| at <= stop)
+        && offer.reminder_overdue(now)
+        && !super::turn_offer::waits_on_own_request(requests, &request.to, request.claimed_at))
+    .then_some("reply_overdue")
+}
+
+/// The claimant was seen working, or took a new prompt, after its recorded
+/// Stop: that idle episode is over and must not be judged overdue later.
+fn close_stale_stop(request: &mut CollaborationRequest, agent: Option<&Agent>) {
+    let Some(agent) = agent else { return };
+    let Some(offer) = request.turn_offer.as_mut() else {
+        return;
+    };
+    if offer.unanswered_stop_at.is_some_and(|stop| {
+        agent.state == AgentState::Working || agent.last_prompt_at.is_some_and(|at| at > stop)
+    }) {
+        offer.unanswered_stop_at = None;
+    }
+}
+
 fn recovery_action(
     parent: &CollaborationRequest,
     id: String,
@@ -154,6 +191,11 @@ fn recovery_body(
         };
         return format!(
             "Tend is retaining request {request_id} while recipient {session} waits for provider {needed}.\nThe request has not completed. Open this exact recipient's prompt and review its sender/action preview. Resolve the provider prompt, or choose to wait or stop the work. Tend will observe the recipient resume and clear this recovery item automatically; do not resend the request or relaunch the agent merely to clear the hold. Answering this recovery item does not itself grant provider tool permissions."
+        );
+    }
+    if current_reason == "reply_overdue" {
+        return format!(
+            "Tend is retaining request {request_id}: recipient {session} claimed it, was reminded to reply, and is idle without replying.\nThe request has not completed. Choose: wait, ask the recipient for its result (tend_update_request on {request_id}), or stop this work attempt. Tend clears this item when the recipient replies or resumes work; do not resend the request. Your answer records a decision; it does not restart, cancel, or spend automatically."
         );
     }
     let observation = if current_reason == "binding_unavailable" {
@@ -241,8 +283,10 @@ impl CollaborationStore {
                 .filter(|reason| {
                     !matches!(*reason, "approval_required" | "input_required") || handed_over
                 })
-                .or(missing_reason);
+                .or(missing_reason)
+                .or_else(|| reply_overdue(original, agent, snapshot.values(), now));
             let mut parent = original.clone();
+            close_stale_stop(&mut parent, agent);
             if let Some(current_reason) = current_reason.filter(|_| !parent.status.is_terminal()) {
                 if !parent.peer_interrupted() {
                     parent.interruption = Some(PeerInterruption {
@@ -1064,5 +1108,215 @@ mod tests {
         agent.pane = Some("%1".into());
         agent.tmux_socket = Some("other-server".into());
         assert!(exact_agent(&synthetic, &[agent]).is_none());
+    }
+
+    async fn age_reminders(mailbox: &CollaborationStore, by: time::Duration) {
+        let mut requests = mailbox.requests.write().await;
+        for request in requests.values_mut() {
+            if let Some(offer) = request.turn_offer.as_mut() {
+                offer.last_reply_reminder_at = offer.last_reply_reminder_at.map(|at| at - by);
+                offer.unanswered_stop_at = offer.unanswered_stop_at.map(|at| at - by);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reminded_recipient_that_stays_idle_without_replying_is_interrupted() {
+        use crate::collaboration::turn_offer::{TurnBoundaryEvent, OFFER_BACKOFF};
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_by_id(&recipient, &request.id).await.unwrap();
+        peer.state = AgentState::Idle;
+        // Idle without a reminder yet: not ours to judge (no Stop hook seen).
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        assert!(!mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        let reminders = mailbox
+            .offer_turn_boundary(&recipient, TurnBoundaryEvent::Stop, None, None)
+            .await
+            .unwrap();
+        assert_eq!(reminders.len(), 1);
+        // The reminder gets a full backoff to produce a reply.
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        assert!(!mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        age_reminders(&mailbox, OFFER_BACKOFF).await;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        let held = mailbox.get_for(&sender, &request.id).await.unwrap();
+        assert!(held.peer_interrupted(), "the silent stall now has an owner");
+        assert_eq!(held.status, RequestStatus::Claimed);
+        assert_eq!(held.interruption.as_ref().unwrap().reason, "reply_overdue");
+        // The healthy sender sees it first; the human item follows the grace.
+        assert!(mailbox.pending_human_notifications().await.is_empty());
+        {
+            let mut requests = mailbox.requests.write().await;
+            let row = requests.get_mut(&request.id).unwrap();
+            let info = row.interruption.as_mut().unwrap();
+            info.observed_at -= time::Duration::minutes(2);
+        }
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        let action = mailbox.pending_human_notifications().await.remove(0);
+        assert!(action.body.contains("was reminded to reply"));
+        // The recipient resumes: the hold and its human item clear.
+        peer.state = AgentState::Working;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        assert!(!mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        assert!(mailbox.pending_human_notifications().await.is_empty());
+        // Idle again without a new Stop (e.g. inferred by a timeout): the old
+        // episode's evidence is gone, so nothing re-raises.
+        peer.state = AgentState::Idle;
+        age_reminders(&mailbox, OFFER_BACKOFF).await;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        assert!(!mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        // A new Stop without a reply is a new episode and is judged again.
+        mailbox
+            .offer_turn_boundary(&recipient, TurnBoundaryEvent::Stop, None, None)
+            .await
+            .unwrap();
+        age_reminders(&mailbox, OFFER_BACKOFF).await;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        assert!(mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+    }
+
+    #[tokio::test]
+    async fn waiting_on_a_child_reply_or_its_wake_is_not_overdue() {
+        use crate::collaboration::turn_offer::{TurnBoundaryEvent, OFFER_BACKOFF};
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let (child_peer, _) = actor("%3", "child").await;
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_by_id(&recipient, &request.id).await.unwrap();
+        // Reminded at a Stop, then (without any observed Working) it
+        // delegates and ends its turn to wait for the child.
+        mailbox
+            .offer_turn_boundary(&recipient, TurnBoundaryEvent::Stop, None, None)
+            .await
+            .unwrap();
+        let child = mailbox
+            .create(
+                recipient.clone(),
+                child_peer.clone(),
+                NewRequest {
+                    body: "sub-review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(mailbox
+            .offer_turn_boundary(&recipient, TurnBoundaryEvent::Stop, None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        age_reminders(&mailbox, OFFER_BACKOFF).await;
+        peer.state = AgentState::Idle;
+        let agents = [coordinator.clone(), peer.clone()];
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(!mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        // The child replies; its wake to the recipient is still owed.
+        mailbox.claim_by_id(&child_peer, &child.id).await.unwrap();
+        mailbox
+            .reply(
+                &child_peer,
+                &child.id,
+                RequestStatus::Completed,
+                "ok".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(
+            !mailbox
+                .get_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .peer_interrupted(),
+            "an undelivered reply wake is still a wait, not a stall"
+        );
+        // The wake lands as a new prompt: the old Stop no longer counts.
+        mailbox
+            .requests
+            .write()
+            .await
+            .get_mut(&child.id)
+            .unwrap()
+            .mark_reply_read(OffsetDateTime::now_utc());
+        peer.last_prompt_at = Some(OffsetDateTime::now_utc());
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator, peer])
+            .await
+            .unwrap();
+        assert!(!mailbox
+            .get_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
     }
 }

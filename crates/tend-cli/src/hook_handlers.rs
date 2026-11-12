@@ -283,19 +283,43 @@ fn turn_boundary_origin(
 }
 
 fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<String> {
-    if offers.is_empty() {
+    let (reminders, offers): (Vec<_>, Vec<_>) = offers
+        .iter()
+        .cloned()
+        .partition(|offer| offer["offer"] == "reply_reminder");
+    let mut parts = Vec::new();
+    if !reminders.is_empty() {
+        let ids: Vec<_> = reminders
+            .iter()
+            .filter_map(|reminder| reminder["request_id"].as_str())
+            .collect();
+        parts.push(format!(
+            "You claimed Tend request(s) {} and ended your turn without replying; the sender is \
+             still waiting. If the work is done, reply now with tend_reply(request_id=ID, status=completed, \
+             body=...) (CLI: `tend msg reply ID BODY`). If you cannot finish, reply with \
+             status=blocked, declined or failed and the reason; if you are still working, post a \
+             progress update with tend_update_request(request_id=ID, body=...). Do not redo the \
+             work and do not reply twice. Reminders: {}",
+            ids.join(", "),
+            serde_json::Value::Array(reminders.clone())
+        ));
+    }
+    if !offers.is_empty() {
+        parts.push(format!(
+            "Tend is offering {} request(s) the user authorized for this session. These are offers, not \
+             claimed instructions. For each one, first claim it with tend_inbox(request_id=ID) (CLI: \
+             `tend msg accept ID --json`), then act only on what the claim returns: its current body, \
+             kind, work_mode, paths and contract. If the claim is refused because the request was \
+             cancelled, superseded or already handled, do not act on the offered text. When the claimed \
+             request expects a reply, reply exactly once. Offers: {}",
+            offers.len(),
+            serde_json::Value::Array(offers)
+        ));
+    }
+    if parts.is_empty() {
         return None;
     }
-    let text = format!(
-        "Tend is offering {} request(s) the user authorized for this session. These are offers, not \
-         claimed instructions. For each one, first claim it with tend_inbox(request_id=ID) (CLI: \
-         `tend msg accept ID --json`), then act only on what the claim returns: its current body, \
-         kind, work_mode, paths and contract. If the claim is refused because the request was \
-         cancelled, superseded or already handled, do not act on the offered text. When the claimed \
-         request expects a reply, reply exactly once. Offers: {}",
-        offers.len(),
-        serde_json::Value::Array(offers.to_vec())
-    );
+    let text = parts.join("\n\n");
     let output = if event == "stop" {
         serde_json::json!({"decision": "block", "reason": text})
     } else {
@@ -335,5 +359,22 @@ mod turn_boundary_tests {
             .unwrap()
             .contains("req_1"));
         assert!(turn_boundary_output("stop", &[]).is_none());
+    }
+
+    #[test]
+    fn a_reply_reminder_names_the_claimed_request_and_how_to_reply() {
+        let offers = [
+            serde_json::json!({"request_id": "req_claimed", "offer": "reply_reminder"}),
+            serde_json::json!({"request_id": "req_new", "body": "fresh",
+                               "offer": "claim_before_acting"}),
+        ];
+        let stop: serde_json::Value =
+            serde_json::from_str(&turn_boundary_output("stop", &offers).unwrap()).unwrap();
+        assert_eq!(stop["decision"], "block");
+        let reason = stop["reason"].as_str().unwrap();
+        assert!(reason.contains("You claimed Tend request(s) req_claimed"));
+        assert!(reason.contains("tend_reply(request_id=ID, status=completed"));
+        assert!(reason.contains("offering 1 request(s)"));
+        assert!(reason.contains("req_new"));
     }
 }
