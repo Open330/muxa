@@ -46,8 +46,7 @@ pub(super) async fn handle(
                 // advertised; status stays served regardless.
                 if let Some(capabilities) = r.capabilities.as_mut() {
                     capabilities.push(SWAP_SERVICE_CAPABILITY);
-                    capabilities.push(SWAP_HEALTH_CAPABILITY);
-                    capabilities.push(SWAP_HEALTH_MODULE_CAPABILITY);
+                    capabilities.extend([SWAP_HEALTH_CAPABILITY, SWAP_HEALTH_MODULE_CAPABILITY]);
                     capabilities.push("swap_accounts_v1");
                     if swap.as_ref().is_some_and(|swap| swap.exists()) {
                         capabilities.push(SWAP_CANCEL_CAPABILITY);
