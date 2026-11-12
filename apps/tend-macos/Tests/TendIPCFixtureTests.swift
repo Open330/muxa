@@ -30,8 +30,18 @@ private let checks: [String: (TendIPCResponse) -> Bool] = [
     "ask_list": { $0.askEntries != nil },
     "ask_providers": { $0.askProviders?.isEmpty == false },
     "review_list": { $0.reviewItems?.count == 1 && $0.reviewHasMore != nil },
-    "decision_queue": { $0.decisionQueue?.value != nil },
-    "decision_history": { $0.decisionHistory?.value != nil },
+    // The queue and history decoders skip items they cannot read and count
+    // them in `undecoded`, so check the seeded item came through as a review.
+    "decision_queue": { response in
+        guard let queue = response.decisionQueue?.value, queue.undecoded == 0, queue.items.count == 1,
+              case .review = queue.items[0] else { return false }
+        return true
+    },
+    "decision_history": { response in
+        guard let history = response.decisionHistory?.value, history.undecoded == 0,
+              history.items.count == 1, case .review = history.items[0] else { return false }
+        return true
+    },
     "work_backlog": { ($0.workRecords ?? []).compactMap(\.value).count == 1 },
 ]
 
