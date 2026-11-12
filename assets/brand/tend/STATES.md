@@ -27,6 +27,9 @@ the system tints it; any state that shows colour must use a non-template image f
 
 The app icon (`assets/icon.svg`, copied to `appicon-states.svg`) shows all four rooms lit in their
 state colours on the graphite ground, so the icon itself teaches the rule: coral top left, amber top
-right, green bottom left, paper bottom right. `apps/tend-macos/Scripts/generate-app-icon.sh` renders
-the AppIcon set from it. `appicon-calm.svg` and `appicon-call.svg` are the earlier white and
+right, green bottom left, paper bottom right. The macOS app ships it as an Icon Composer
+bundle, `apps/tend-macos/Resources/AppIcon.icon`: one SVG layer per room over an automatic graphite
+gradient, so macOS 26 and later draw it at full size in the system squircle instead of shrinking a
+pre-rounded image into a grey plate. Edit it in Xcode's Icon Composer, or change the room SVGs and
+`icon.json` by hand; keep `assets/icon.svg` in step. `appicon-calm.svg` and `appicon-call.svg` are the earlier white and
 single-amber versions, kept for reference.
