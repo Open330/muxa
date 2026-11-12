@@ -22918,6 +22918,16 @@
           }
         }
       }
+    },
+    "What it's asking about": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "질문의 맥락"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

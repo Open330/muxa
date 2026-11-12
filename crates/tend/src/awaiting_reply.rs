@@ -25,6 +25,11 @@
 const CLOSING_PARAGRAPHS: usize = 3;
 /// Longest question text kept for display.
 const MAX_QUESTION_CHARS: usize = 200;
+/// A question of this many words or fewer ("진행할까요?", "그냥 진행할까요?",
+/// "Shall I go ahead?") names nothing on its own; the sentence before it on
+/// the same line says what. Counted in words, not characters: a dense Korean
+/// question ("레이블 정리 PR을 만들어서 배포까지 진행할까요?") stands alone.
+const BARE_QUESTION_WORDS: usize = 4;
 
 /// Phrases that name a decision for the person, wherever they appear.
 const DECISION_CUES: &[&str] = &[
@@ -137,17 +142,18 @@ pub fn classify(response: &str) -> Option<String> {
         return None;
     }
     let closing_start = paragraphs.len().saturating_sub(CLOSING_PARAGRAPHS);
-    let sentences: Vec<(bool, String)> = paragraphs
+    // (closing, where: paragraph and line, sentence)
+    let sentences: Vec<(bool, (usize, usize), String)> = paragraphs
         .iter()
         .enumerate()
         .flat_map(|(index, paragraph)| {
             sentences(paragraph)
                 .into_iter()
-                .map(move |sentence| (index >= closing_start, sentence))
+                .map(move |(line, sentence)| (index >= closing_start, (index, line), sentence))
         })
         .collect();
-    let mut found: Option<&str> = None;
-    for (position, (closing, sentence)) in sentences.iter().enumerate() {
+    let mut found: Option<usize> = None;
+    for (position, (closing, _, sentence)) in sentences.iter().enumerate() {
         let lower = sentence.to_lowercase();
         let decision = DECISION_CUES.iter().any(|c| lower.contains(c));
         if !decision
@@ -162,14 +168,41 @@ pub fn classify(response: &str) -> Option<String> {
         let last_question = (sentence.ends_with('?') || sentence.ends_with('？'))
             && sentences[position + 1..]
                 .iter()
-                .all(|(_, after)| is_follow_up(after));
+                .all(|(_, _, after)| is_follow_up(after));
         if decision || request || last_question {
             // The last asking sentence wins: it is the one the turn closes
             // on, or the latest decision named.
-            found = Some(sentence);
+            found = Some(position);
         }
     }
-    found.map(truncate)
+    let position = found?;
+    let (_, place, question) = &sentences[position];
+    // "진행할까요?" alone says nothing; lead with what it asks about, from
+    // the same line only (a list item above belongs to something else).
+    let context = position
+        .checked_sub(1)
+        .map(|before| &sentences[before])
+        .filter(|(_, before, _)| before == place)
+        .filter(|_| question.split_whitespace().count() <= BARE_QUESTION_WORDS);
+    Some(match context {
+        Some((_, _, before)) => truncate_front(before, question),
+        None => truncate(question),
+    })
+}
+
+/// `context question`, cutting the context's start when the pair is too
+/// long so the question itself always survives.
+fn truncate_front(context: &str, question: &str) -> String {
+    let budget = MAX_QUESTION_CHARS.saturating_sub(question.chars().count() + 1);
+    let count = context.chars().count();
+    if count <= budget {
+        return format!("{context} {question}");
+    }
+    let tail: String = context
+        .chars()
+        .skip(count - budget.saturating_sub(1))
+        .collect();
+    format!("…{tail} {question}")
 }
 
 fn is_follow_up(sentence: &str) -> bool {
@@ -240,9 +273,9 @@ fn strip_inline_code(line: &str) -> String {
 /// Sentences of a paragraph: each line (list items stand alone), split after
 /// `.`, `!`, `?` and their full-width forms. Markdown emphasis and list
 /// markers are dropped.
-fn sentences(paragraph: &str) -> Vec<String> {
+fn sentences(paragraph: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
-    for line in paragraph.lines() {
+    for (index, line) in paragraph.lines().enumerate() {
         let line = line
             .trim_start_matches(|c: char| matches!(c, '-' | '*' | '+' | '#') || c.is_whitespace());
         let line = line.replace("**", "");
@@ -250,19 +283,19 @@ fn sentences(paragraph: &str) -> Vec<String> {
         for c in line.chars() {
             current.push(c);
             if matches!(c, '.' | '!' | '?' | '。' | '！' | '？') {
-                push_sentence(&mut out, &mut current);
+                push_sentence(&mut out, index, &mut current);
             }
         }
-        push_sentence(&mut out, &mut current);
+        push_sentence(&mut out, index, &mut current);
     }
     out
 }
 
-fn push_sentence(out: &mut Vec<String>, current: &mut String) {
+fn push_sentence(out: &mut Vec<(usize, String)>, line: usize, current: &mut String) {
     let sentence = current.trim();
     // A lone "?" or a numbered marker like "1." is not a sentence.
     if sentence.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
-        out.push(sentence.to_owned());
+        out.push((line, sentence.to_owned()));
     }
     current.clear();
 }
@@ -289,6 +322,36 @@ mod tests {
             - PR #12(macOS CI 수정)는 아직 열려 있습니다.\n- 설계 리뷰 전문은 위 Codex 회신에 있습니다.";
         let question = classify(response).expect("asks for a decision");
         assert!(question.contains("Touch ID"), "{question}");
+    }
+
+    #[test]
+    fn a_bare_question_keeps_the_sentence_that_says_what_it_asks() {
+        // The crest card that showed only "진행할까요?".
+        let response =
+            "네, 모두 끝났습니다.\n\n- 정식 수정 커밋:\n  - Command-L 주소 수정 (0.9.4)\n\n\
+            정식 수정 두 개만 따로 PR로 올려 머지할 수 있습니다. 진행할까요?";
+        assert_eq!(
+            classify(response).as_deref(),
+            Some("정식 수정 두 개만 따로 PR로 올려 머지할 수 있습니다. 진행할까요?")
+        );
+        // A list item above a lone question belongs to something else.
+        assert_eq!(
+            classify("- MBP 디스크는 보지 않았습니다.\n\n진행할까요?").as_deref(),
+            Some("진행할까요?")
+        );
+        // A question that already names its subject stands alone.
+        assert_eq!(
+            classify("PR을 열었습니다. 레이블 정리 PR을 만들어서 배포까지 진행할까요?").as_deref(),
+            Some("레이블 정리 PR을 만들어서 배포까지 진행할까요?")
+        );
+        // A long context is cut from the front; the question survives whole.
+        let long = format!("{}. 진행할까요?", "가".repeat(300));
+        let question = classify(&long).expect("asks");
+        assert!(
+            question.starts_with('…') && question.ends_with("진행할까요?"),
+            "{question}"
+        );
+        assert_eq!(question.chars().count(), 200);
     }
 
     #[test]

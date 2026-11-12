@@ -810,6 +810,9 @@ private struct FleetWorkInspector: View {
                 .font(.system(size: 13.5, weight: work.lane == .needsYou ? .semibold : .regular))
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+            if work.lane == .needsYou, let focus = work.focus {
+                FleetAskedContext(agent: focus.agent)
+            }
             if work.handledLimit {
                 Label("Rate limited · the limit policy will resume it", systemImage: "arrow.triangle.2.circlepath")
                     .font(TendType.meta)
