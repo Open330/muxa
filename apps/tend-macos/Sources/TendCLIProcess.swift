@@ -93,3 +93,26 @@ private final class CollectedOutput: @unchecked Sendable {
         lock.unlock()
     }
 }
+
+
+/// Reads a pipe to EOF on a background queue, so a caller draining another
+/// pipe of the same child cannot stall on this one filling up.
+final class DrainedPipe: @unchecked Sendable {
+    private let done = DispatchSemaphore(value: 0)
+    // Written once on the reader queue before `done` is signalled, read only
+    // after `wait()` returns; the semaphore orders the two.
+    private var data = Data()
+
+    init(_ handle: FileHandle) {
+        DispatchQueue.global(qos: .utility).async {
+            self.data = handle.readDataToEndOfFile()
+            self.done.signal()
+        }
+    }
+
+    /// Blocks until the pipe reaches EOF and returns everything read.
+    func wait() -> Data {
+        done.wait()
+        return data
+    }
+}

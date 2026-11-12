@@ -157,8 +157,12 @@ enum TendModuleProcess {
                 }
                 DispatchQueue.global(qos: .utility)
                     .asyncAfter(deadline: .now() + timeout, execute: deadline)
+                // Drain stderr alongside stdout: a child that fills the
+                // stderr pipe while stdout is read to EOF would block until
+                // the deadline and be misreported as a timeout.
+                let errDrain = DrainedPipe(err.fileHandleForReading)
                 let outData = out.fileHandleForReading.readDataToEndOfFile()
-                let errData = err.fileHandleForReading.readDataToEndOfFile()
+                let errData = errDrain.wait()
                 process.waitUntilExit()
                 let timedOut = deadline.isCancelled == false && process.terminationReason == .uncaughtSignal
                 deadline.cancel()

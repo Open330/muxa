@@ -30,16 +30,10 @@ struct DaemonSocketOwner: Equatable, Sendable {
                 throw TendIPCError.server("refusing to replace a socket not owned by this user")
             }
 
-            let process = Process()
-            let output = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-            process.arguments = ["-nP", "-Fpcu", "-a", "-U", socketPath]
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-
-            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let data = try TendCLIProcess.run(
+                executable: URL(fileURLWithPath: "/usr/sbin/lsof"),
+                arguments: ["-nP", "-Fpcu", "-a", "-U", socketPath]
+            ).standardOutput
             let records = parseLsof(String(decoding: data, as: UTF8.self))
             let candidates = records.compactMap { record -> Int32? in
                 guard record.command == "tendd", record.uid == getuid() else { return nil }
@@ -131,16 +125,12 @@ struct DaemonSocketOwner: Equatable, Sendable {
 
     private static func stopHomebrewService(brew: String) async throws {
         try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            let errors = Pipe()
-            process.executableURL = URL(fileURLWithPath: brew)
-            process.arguments = ["services", "stop", "open330/tap/tend"]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = errors
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                let data = errors.fileHandleForReading.readDataToEndOfFile()
+            let result = try TendCLIProcess.run(
+                executable: URL(fileURLWithPath: brew),
+                arguments: ["services", "stop", "open330/tap/tend"]
+            )
+            guard result.terminationStatus == 0 else {
+                let data = result.standardError
                 let detail = String(decoding: data, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 throw TendIPCError.server(
