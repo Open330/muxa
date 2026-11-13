@@ -602,7 +602,46 @@ impl ReviewStore {
             bounded("note", note, MAX_NOTE_BYTES, Text::Prose)?;
         }
         self.with(move |connection| {
-            dispose(connection, &id, kind, by, note, OffsetDateTime::now_utc())
+            dispose(
+                connection,
+                &id,
+                kind,
+                by,
+                note,
+                false,
+                OffsetDateTime::now_utc(),
+            )
+            .map(|(item, _)| item)
+        })
+        .await
+    }
+
+    /// [`Self::dispose`] for a caller that must not be told a different
+    /// decision was recorded: an existing disposition matches only when its
+    /// kind **and** note are the same, checked in the same transaction.
+    /// Returns the item and whether it was already decided this way (a
+    /// replay); anything else already recorded is a conflict.
+    pub async fn dispose_exact(
+        &self,
+        id: String,
+        kind: DispositionKind,
+        by: ReviewActor,
+        note: Option<String>,
+    ) -> Result<(ReviewItem, bool), ReviewError> {
+        by.validate_client()?;
+        if let Some(note) = &note {
+            bounded("note", note, MAX_NOTE_BYTES, Text::Prose)?;
+        }
+        self.with(move |connection| {
+            dispose(
+                connection,
+                &id,
+                kind,
+                by,
+                note,
+                true,
+                OffsetDateTime::now_utc(),
+            )
         })
         .await
     }
@@ -833,19 +872,27 @@ fn record(
     Ok(item)
 }
 
+#[allow(clippy::too_many_arguments)] // one transaction over the item and its event log
 fn dispose(
     connection: &mut Connection,
     id: &str,
     kind: DispositionKind,
     by: ReviewActor,
     note: Option<String>,
+    exact: bool,
     now: OffsetDateTime,
-) -> Result<ReviewItem, ReviewError> {
+) -> Result<(ReviewItem, bool), ReviewError> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut item = load(&tx, id)?.ok_or_else(|| ReviewError::NotFound(id.to_owned()))?;
     if let Some(existing) = &item.disposition {
+        if existing.kind == kind && (!exact || existing.note == note) {
+            return Ok((item, true));
+        }
         if existing.kind == kind {
-            return Ok(item);
+            return Err(ReviewError::Conflict(format!(
+                "review {id} is already {} with a different note",
+                existing.kind.as_str()
+            )));
         }
         return Err(ReviewError::Conflict(format!(
             "review {id} is already {}",
@@ -868,7 +915,7 @@ fn dispose(
         params![id, nanos(now), kind.as_str(), actor_kind.as_str()],
     )?;
     tx.commit()?;
-    Ok(item)
+    Ok((item, false))
 }
 
 #[cfg(test)]

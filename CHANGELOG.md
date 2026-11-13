@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Decide from the web: the "Needs you" page answers questions (an option
+  or your own words, or decline) and accepts, sends back or withdraws
+  results, through the same daemon paths as the Mac app. Operator-only with
+  the session CSRF proof; repeats change nothing; each decision names who
+  made it (`web:<email>`) and is audited to `dashboard-decisions.jsonl`.
+  Dashboard pages can no longer be framed by other sites.
 - The web dashboard has a "Needs you" page (`/needs`, linked from the top
   bar): the decision queue and its history, phone-first, from the same daemon
   reads as `tend review queue` and the Mac app. Operator-only:

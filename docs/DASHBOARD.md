@@ -364,6 +364,29 @@ an anonymous visitor 401, and `public_read` or `auth = "none"` never expose
 them. They are GETs, so they need no CSRF proof. The queue covers the host
 whose tendd serves the dashboard; the response says so (`covers`).
 
+Each card can be decided from the page, through the same daemon paths as
+the Mac app:
+
+- a question (human request): pick an option or write an answer, then
+  **Send answer** or **Decline** — `POST /api/decisions/requests/{id}`
+  with `{"answer": "…", "declined": false}`. Only requests addressed to the
+  operator console can be answered, once.
+- a result to review: an option button, **Looks good**, **Send back** (needs
+  a note) or **Withdraw** — `POST /api/decisions/reviews/{id}` with
+  `{"disposition": "accepted" | "returned" | "withdrawn", "note": "…",
+  "option": "…"}`; a chosen option is recorded in the note. Dispositions are
+  final.
+
+Both are control routes: the token, or an operator session with the CSRF
+proof (`Origin` = the public URL and `X-Tend-Operator: 1`); a viewer gets
+403. A repeated identical request changes nothing; a different decision on
+something already decided (another disposition, option or note) is a 409. The review disposition records
+`web:<email>` (or `web:token`) as its actor, and every web decision is
+written as one JSON line, with the signed-in account's issuer and subject,
+to `$XDG_DATA_HOME/tend/dashboard-decisions.jsonl`
+(owner-only, rotated at 4 MiB) and logged. No dashboard page or static asset can
+be framed by another site (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
+
 ## Collaboration graph and history API
 
 The collaboration panel projects retained requests into two linked views. The

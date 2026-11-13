@@ -88,16 +88,24 @@ fn unversioned(path: &str) -> &str {
 /// Serve an HTML page with its `/static/` links moved under this build's
 /// path. Relative module imports inside those scripts resolve under the
 /// same prefix, so one new build id changes every asset URL the page uses.
+/// No dashboard page may be framed by another site.
+const FRAME_POLICY: &str = "frame-ancestors 'none'";
+
 pub(super) fn serve_page(path: &str) -> Response {
     let Some(file) = WebAssets::get(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let html = String::from_utf8_lossy(&file.data)
         .replace("/static/", &format!("/static/v/{}/", asset_build_id()));
+    // Every page holds controls (prompts, decisions), so none may be framed
+    // by another site: a frame could trick a signed-in operator into a
+    // click that carries the page's own Origin and header.
     (
         [
             (header::CONTENT_TYPE, mime_for(path)),
             (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+            (header::CONTENT_SECURITY_POLICY, FRAME_POLICY),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         html,
     )
@@ -109,9 +117,13 @@ pub(super) fn serve_asset(path: &str) -> Response {
         Some(file) => {
             let mime = mime_for(path);
             (
+                // Framing headers on every asset, not just the canonical
+                // pages: `/static/needs.html` is the same page.
                 [
                     (header::CONTENT_TYPE, mime),
                     (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+                    (header::CONTENT_SECURITY_POLICY, FRAME_POLICY),
+                    (header::X_FRAME_OPTIONS, "DENY"),
                 ],
                 file.data.into_owned(),
             )

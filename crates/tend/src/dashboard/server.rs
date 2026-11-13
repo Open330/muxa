@@ -169,6 +169,8 @@ pub struct AppState {
     pane_streams: Arc<super::pane_stream::PaneStreamHub>,
     /// The daemon's review items, for the "Needs you" decision queue.
     pub(in crate::dashboard) reviews: crate::review::ReviewStore,
+    /// Where decisions made from the web are audited, one JSON line each.
+    pub(in crate::dashboard) decision_audit: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -185,6 +187,8 @@ pub struct DashboardRuntimeConfig {
     pub work_store: Option<crate::dashboard::work_store::SharedWorkStore>,
     /// The daemon's review store, shared with IPC.
     pub reviews: Option<crate::review::ReviewStore>,
+    /// Audit file for decisions made from the web; `None` logs them only.
+    pub decision_audit_path: Option<PathBuf>,
     pub stats_config: StatsConfig,
     pub fleet: Option<FleetRuntime>,
 }
@@ -213,6 +217,7 @@ impl AppState {
             session_activity_path: None,
             stats_config: StatsConfig::default(),
             fleet: None,
+            decision_audit: None,
             reviews: crate::review::ReviewStore::unavailable("review items are served by tendd"),
             work_store: Arc::new(tokio::sync::Mutex::new(WorkStore::memory())),
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
@@ -237,6 +242,12 @@ impl AppState {
         limits: super::pane_stream::PaneStreamLimits,
     ) -> Self {
         self.pane_streams = Arc::new(super::pane_stream::PaneStreamHub::new(limits));
+        self
+    }
+
+    #[must_use]
+    pub fn with_decision_audit(mut self, path: Option<PathBuf>) -> Self {
+        self.decision_audit = path;
         self
     }
 
@@ -355,6 +366,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
         .route("/api/work-metadata", put(work_metadata_put_handler))
+        .route(
+            "/api/decisions/reviews/{id}",
+            post(super::decisions::review_handler),
+        )
+        .route(
+            "/api/decisions/requests/{id}",
+            post(super::decisions::answer_handler),
+        )
         .route("/api/work-control/prompt", post(work_prompt_handler))
         .route("/api/work-control/up", post(work_up_handler))
         .route("/api/work-control/abort", post(work_abort_handler))
@@ -474,6 +493,7 @@ pub async fn serve(
         .with_reviews(runtime.reviews.unwrap_or_else(|| {
             crate::review::ReviewStore::unavailable("review items are served by tendd")
         }))
+        .with_decision_audit(runtime.decision_audit_path)
         .with_stats_config(runtime.stats_config)
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
@@ -4067,6 +4087,20 @@ mod tests {
         let response = get(app.clone(), "/api/decisions/history", Some("s3cret")).await;
         assert_eq!(response.status(), StatusCode::OK);
         // The page itself is a static asset, like `/`.
+        for uri in [
+            "/",
+            "/static/needs.html",
+            "/static/v/any/needs.html",
+            "/static/index.html",
+        ] {
+            let page = get(app.clone(), uri, None).await;
+            assert_eq!(page.headers()[header::X_FRAME_OPTIONS], "DENY", "{uri}");
+            assert_eq!(
+                page.headers()[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'none'",
+                "{uri}"
+            );
+        }
         let page = get(app, "/needs", None).await;
         assert_eq!(page.status(), StatusCode::OK);
         assert_eq!(page.headers()[header::X_FRAME_OPTIONS], "DENY");
