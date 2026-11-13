@@ -89,7 +89,7 @@ pub struct WorkContext {
 1. **Move** (#502). The modules live in `crates/tend-work`; the CLI keeps
    its views.
 2. **Context.** Thread `WorkContext` through `work_up`, `agent_launch` and
-   reconcile, replacing items 1–6.
+   reconcile, replacing items 1–7.
    - Mux commands take the endpoint explicitly. `with_endpoint` stays only
      as a CLI convenience.
    - Synchronous mux and `git` work either moves to `tokio::process` or
