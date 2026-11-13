@@ -1919,11 +1919,7 @@ fn swap_one(
         && request.allow_direct_respawn
         && request.relaunch == tend::swap_api::RelaunchMode::Respawn
         && !cfg!(windows)
-        && shell_runs_only(
-            &pane_processes(pane.pane_pid),
-            pane.pane_pid,
-            launch.top_pid,
-        );
+        && shell_runs_only(direct_children(pane.pane_pid).as_deref(), launch.top_pid);
     // The relaunch runs through the user's login shell, the one checked and
     // the one respawned with.
     if direct || respawn_shell_pane {
@@ -2574,16 +2570,52 @@ impl Target {
     }
 }
 
-/// Whether the pane's shell `pane_pid` runs nothing but `top` (the agent, or
-/// the wrapper that leads to it). A listing without `top` in it cannot rule
-/// other jobs out.
-fn shell_runs_only(processes: &[ProcessInfo], pane_pid: u32, top: u32) -> bool {
-    let children: Vec<u32> = processes
-        .iter()
-        .filter(|process| process.parent_pid == pane_pid && process.pid != pane_pid)
-        .map(|process| process.pid)
-        .collect();
-    children == [top]
+/// Whether the pane's shell, whose direct `children` were enumerated, runs
+/// nothing but `top` (the agent, or the wrapper that leads to it). A
+/// listing that could not be made, or without `top`, rules nothing out.
+fn shell_runs_only(children: Option<&[u32]>, top: u32) -> bool {
+    children == Some(&[top][..])
+}
+
+/// Every direct child of `pid`, enumerated on its own rather than read off
+/// a process tree that skips what it cannot read: `None` when the listing
+/// itself could not be made.
+#[cfg(target_os = "linux")]
+fn direct_children(pid: u32) -> Option<Vec<u32>> {
+    let mut children = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+        let listed = std::fs::read_to_string(task.ok()?.path().join("children")).ok()?;
+        for word in listed.split_whitespace() {
+            children.push(word.parse().ok()?);
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    Some(children)
+}
+
+/// Every direct child of `pid`, from `pgrep -P`, which reads the kernel's
+/// process table (exit 1: none). `None` when it cannot run or fails.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn direct_children(pid: u32) -> Option<Vec<u32>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0 | 1) => String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .map(|word| word.parse().ok())
+            .collect(),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn direct_children(_pid: u32) -> Option<Vec<u32>> {
+    None
 }
 
 /// A fresh launch id for one relaunch. Not on Windows, whose relaunch runs
@@ -3985,19 +4017,38 @@ mod tests {
     /// would end the job.
     #[test]
     fn only_a_shell_running_just_the_agent_is_respawned() {
-        let process = |pid: u32, parent_pid: u32| ProcessInfo {
-            pid,
-            parent_pid,
-            depth: 1,
-            comm: String::new(),
-            cmdline: String::new(),
-        };
-        assert!(shell_runs_only(&[process(10, 1), process(11, 10)], 1, 10));
-        // A background job next to the agent.
-        assert!(!shell_runs_only(&[process(10, 1), process(12, 1)], 1, 10));
-        // A listing that does not show the agent rules nothing out.
-        assert!(!shell_runs_only(&[], 1, 10));
-        assert!(!shell_runs_only(&[process(12, 1)], 1, 10));
+        assert!(shell_runs_only(Some(&[10]), 10));
+        // A background job next to the agent, even one whose own details
+        // could not be read: it is counted by pid alone.
+        assert!(!shell_runs_only(Some(&[10, 12]), 10));
+        // No listing, or one without the agent, rules nothing out.
+        assert!(!shell_runs_only(None, 10));
+        assert!(!shell_runs_only(Some(&[]), 10));
+        assert!(!shell_runs_only(Some(&[12]), 10));
+    }
+
+    /// The enumeration itself, on this host: a shell with two children
+    /// lists both.
+    #[cfg(unix)]
+    #[test]
+    fn a_shells_children_are_all_listed() {
+        let mut shell = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = direct_children(shell.id());
+        while seen.as_ref().is_none_or(|c| c.len() < 2) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            seen = direct_children(shell.id());
+        }
+        let children = seen.clone().unwrap_or_default();
+        let _ = std::process::Command::new("kill")
+            .args(children.iter().map(u32::to_string))
+            .status();
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert_eq!(children.len(), 2, "{seen:?}");
     }
 
     #[test]
