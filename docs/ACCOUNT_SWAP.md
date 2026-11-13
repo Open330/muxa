@@ -624,8 +624,20 @@ like every guarded delivery, so its hook comes back as tend's receipt.
   it (`--resume <id>` / `resume <id>`).
 - On macOS, `ps` reports a command line joined, so a flag value containing a
   space (`--append-system-prompt "be brief"`) is relaunched split.
+- A Codex relaunch adds `-c check_for_update_on_startup=false -c
+  tui.resume_cwd="session"` before `resume <id>`, so it never stops on
+  Codex's update menu or asks which directory to resume in (the session's,
+  as the swap always answered). Of the other startup dialogs, the swap
+  answers only these, within an already authorized swap: folder trust
+  (Claude and Codex), bypass-permissions acceptance (only when the stopped
+  agent ran with it and the bound relaunch does too), a paused Codex goal,
+  and a thread another app still holds (retried, at most five times).
+  Claude's folder-settings trust and its auto-mode tour are recognized and
+  left to the user: the swap stops there and says so.
 - Codex keeps its thread index per account (`CODEX_HOME`), but `codex resume <id>`
   finds the thread's rollout in the shared `sessions/`, so it resumes under an
   account that never ran it. If the pane's shell is no longer in the thread's
-  directory, Codex first asks which directory to use; tend keeps the
-  session's directory.
+  directory, Codex would ask which directory to use; a swap relaunch sets
+  `tui.resume_cwd="session"`, so it resumes in the session's directory
+  without asking (an older relaunch line still gets the question, answered
+  the same way).

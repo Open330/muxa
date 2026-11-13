@@ -96,6 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names a program to run instead. Agent start, snapshot restore and Fleet
   commands still use the child for now (see
   `docs/proposals/WORK_IN_CORE.md`).
+- A Codex swap relaunch starts with `-c check_for_update_on_startup=false
+  -c tui.resume_cwd="session"`, so a relaunched pane never stops on Codex's
+  "Update available" menu or its session-directory question; both were
+  answered by keystroke before, the directory the same way (the session's).
+  Worker launches still meet them, so the dialog entries stay as their
+  fallback.
 - Account swap binds the conversation it resumes from the provider's own
   record for the exact process on macOS and for Codex too, not only for
   Claude on Linux. On macOS Claude's `sessions/<pid>.json` `procStart`
