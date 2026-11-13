@@ -578,7 +578,27 @@ pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String
         let accounts = tend::Config::load_or_default(config).ok()?.accounts;
         let codex = trust::find_codex()?;
         let homes = trust::known_homes(accounts.for_provider("codex"));
-        let audits = trust::audit(&codex, &homes);
+        // Each home asked with the codex its launches run: aas's for an aas
+        // profile, the one on PATH for a configured account or ~/.codex.
+        let aas_profiles: Vec<std::path::PathBuf> = [
+            dirs::data_dir().map(|data| data.join("aas/profiles")),
+            dirs::data_dir().map(|data| data.join("asx/profiles")),
+            dirs::home_dir().map(|home| home.join(".config/aas/profiles")),
+            dirs::home_dir().map(|home| home.join(".config/asx/profiles")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let audits = trust::audit(
+            |home| {
+                if aas_profiles.iter().any(|base| home.starts_with(base)) {
+                    Some(codex.clone())
+                } else {
+                    trust::path_codex()
+                }
+            },
+            &homes,
+        );
         Some(
             audits
                 .iter()

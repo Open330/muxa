@@ -99,7 +99,7 @@ pub fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     // menu a swap would: carry over trust the user gave elsewhere first.
     if route.provider == "codex" {
         if let Some(note) =
-            crate::codex_hook_trust::prepare_launch(&route.profiles, &routed.account, &route.aas)
+            crate::codex_hook_trust::prepare_launch(&route.profiles, &routed, &route.aas)
         {
             eprintln!("tend: {note}");
         }

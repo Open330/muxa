@@ -36,7 +36,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long `aas export` may take.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The whole of one swap's or one audit's trust work.
-const BUDGET: Duration = Duration::from_secs(60);
+pub const BUDGET: Duration = Duration::from_secs(60);
 
 /// One hook as `hooks/list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,16 +121,22 @@ pub fn vouched_by(hooks: &[Hook], home: &Path) -> Vec<Trusted> {
 pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, Vec<Hook>) {
     let mut copies = Vec::new();
     let mut left = Vec::new();
-    // Only the home's own user hooks: a project's hooks belong to that
-    // repository, not to the account, and are never tend's to trust.
-    for hook in hooks.iter().filter(|hook| {
-        hook.needs_review()
-            && hook.source == "user"
-            && own_key_event(&hook.key, home) == Some(hook.event.as_str())
-    }) {
-        let vouched = trusted.iter().any(|entry| {
-            entry.key != hook.key && entry.hash == hook.current_hash && entry.event == hook.event
-        });
+    // A project's hooks belong to its repository, not to the account: they
+    // are neither trusted nor reported here. Everything else the home loads
+    // (its user hooks, installed plugins) that waits on review is reported;
+    // only its own user hooks can have trust carried to them.
+    for hook in hooks
+        .iter()
+        .filter(|hook| hook.needs_review() && hook.source != "project")
+    {
+        let own =
+            hook.source == "user" && own_key_event(&hook.key, home) == Some(hook.event.as_str());
+        let vouched = own
+            && trusted.iter().any(|entry| {
+                entry.key != hook.key
+                    && entry.hash == hook.current_hash
+                    && entry.event == hook.event
+            });
         if vouched {
             copies.push(Trusted {
                 key: hook.key.clone(),
@@ -323,13 +329,16 @@ struct AppServer {
     writer: Option<mpsc::Sender<String>>,
     lines: mpsc::Receiver<String>,
     next: u64,
+    /// No request outlives this.
+    deadline: Instant,
 }
 
 impl AppServer {
-    fn open(codex: &Path, home: &Path) -> Result<Self, String> {
+    fn open(codex: &Path, home: &Path, cwd: &Path, deadline: Instant) -> Result<Self, String> {
         let mut child = Command::new(codex)
             .arg("app-server")
             .env("CODEX_HOME", home)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -361,6 +370,7 @@ impl AppServer {
             writer: Some(writer),
             lines,
             next: 0,
+            deadline,
         };
         server.call(
             "initialize",
@@ -385,7 +395,7 @@ impl AppServer {
     ) -> Result<serde_json::Value, String> {
         self.next += 1;
         let id = self.next;
-        let deadline = Instant::now() + RPC_TIMEOUT;
+        let deadline = (Instant::now() + RPC_TIMEOUT).min(self.deadline);
         self.send(
             &serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         )?;
@@ -411,8 +421,11 @@ impl AppServer {
     }
 
     /// The hooks Codex loads under this home for a session in `cwd`.
-    fn hooks(&mut self, cwd: &str) -> Result<Vec<Hook>, String> {
-        let result = self.call("hooks/list", serde_json::json!({"cwds": [cwd]}))?;
+    fn hooks(&mut self, cwd: &Path) -> Result<Vec<Hook>, String> {
+        let cwd = cwd
+            .to_str()
+            .ok_or("the directory to ask from is not UTF-8")?;
+        let result = self.call("hooks/list", serde_json::json!({ "cwds": [cwd] }))?;
         Ok(parse_hooks(&result))
     }
 }
@@ -426,8 +439,13 @@ impl Drop for AppServer {
 }
 
 /// The hooks `codex` loads under `home` for a session in `cwd`.
-fn list_hooks(codex: &Path, home: &Path, cwd: &str) -> Result<Vec<Hook>, String> {
-    AppServer::open(codex, home)?.hooks(cwd)
+fn list_hooks(
+    codex: &Path,
+    home: &Path,
+    cwd: &Path,
+    deadline: Instant,
+) -> Result<Vec<Hook>, String> {
+    AppServer::open(codex, home, cwd, deadline)?.hooks(cwd)
 }
 
 /// `hooks/list`'s result as hooks.
@@ -515,11 +533,16 @@ impl Prepared {
 /// are asked one at a time, only while something still waits, within
 /// [`BUDGET`]. Errors leave the file as it was (the relaunch then shows the
 /// menu, and says so).
-pub fn prepare(codex: &Path, home: &Path, homes: &[PathBuf]) -> Result<Prepared, String> {
+pub fn prepare(
+    codex: &Path,
+    home: &Path,
+    homes: &[PathBuf],
+    budget: Duration,
+) -> Result<Prepared, String> {
     let neutral = Neutral::new()?;
     let cwd = neutral.path();
-    let started = Instant::now();
-    let mut target = AppServer::open(codex, home)?;
+    let deadline = Instant::now() + budget;
+    let mut target = AppServer::open(codex, home, cwd, deadline)?;
     let hooks = target.hooks(cwd)?;
     let resolved = resolved_home(home);
     if !hooks.iter().any(Hook::needs_review) {
@@ -531,14 +554,14 @@ pub fn prepare(codex: &Path, home: &Path, homes: &[PathBuf]) -> Result<Prepared,
     let mut trusted = Vec::new();
     let (mut copies, mut left) = plan(&hooks, home, &trusted);
     for donor in homes.iter().filter(|donor| *donor != home) {
-        if left.is_empty() || started.elapsed() >= BUDGET {
+        if left.is_empty() || Instant::now() >= deadline {
             break;
         }
         if !donor.join("config.toml").exists() {
             continue;
         }
         // A home that cannot be read vouches for nothing.
-        if let Ok(donor_hooks) = list_hooks(codex, donor, cwd) {
+        if let Ok(donor_hooks) = list_hooks(codex, donor, cwd, deadline) {
             trusted.extend(vouched_by(&donor_hooks, donor));
             (copies, left) = plan(&hooks, home, &trusted);
         }
@@ -583,7 +606,7 @@ pub struct Audit {
 /// cannot be checked, within [`BUDGET`] (homes past it are reported as not
 /// checked). Read-only: nothing is written.
 #[must_use]
-pub fn audit(codex: &Path, homes: &[PathBuf]) -> Vec<Audit> {
+pub fn audit(codex_for: impl Fn(&Path) -> Option<PathBuf>, homes: &[PathBuf]) -> Vec<Audit> {
     let neutral = match Neutral::new() {
         Ok(neutral) => neutral,
         Err(error) => {
@@ -598,16 +621,18 @@ pub fn audit(codex: &Path, homes: &[PathBuf]) -> Vec<Audit> {
         }
     };
     let cwd = neutral.path();
-    let started = Instant::now();
+    let deadline = Instant::now() + BUDGET;
     let mut listed: Vec<(PathBuf, Result<Vec<Hook>, String>)> = Vec::new();
     for home in homes
         .iter()
         .filter(|home| home.join("config.toml").exists())
     {
-        let hooks = if started.elapsed() >= BUDGET {
+        let hooks = if Instant::now() >= deadline {
             Err("not checked: the check ran out of time".to_owned())
+        } else if let Some(codex) = codex_for(home) {
+            list_hooks(&codex, home, cwd, deadline)
         } else {
-            list_hooks(codex, home, cwd)
+            Err("no codex to ask for this home".to_owned())
         };
         listed.push((home.clone(), hooks));
     }
@@ -649,18 +674,68 @@ pub fn find_codex() -> Option<PathBuf> {
     shims
         .into_iter()
         .find(|path| path.is_file())
-        .or_else(|| crate::account_swap::find_aas("codex").map(PathBuf::from))
+        .or_else(path_codex)
 }
 
-/// The `codex` a running agent `pid` is: its own executable path when its
-/// arguments name one, else [`find_codex`].
+/// `codex` as a plain launch line's shell finds it: `PATH`, then the usual
+/// install places. Not aas's shim.
 #[must_use]
-pub fn codex_of(pid: u32) -> Option<PathBuf> {
-    tend::process_snapshot::process_argv(pid)
-        .and_then(|argv| argv.into_iter().next())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_file())
-        .or_else(find_codex)
+pub fn path_codex() -> Option<PathBuf> {
+    crate::account_swap::find_aas("codex").map(PathBuf::from)
+}
+
+/// The `codex` program a running agent `pid` runs, if that can be told:
+/// its own executable when that is Codex, or the Codex script an
+/// interpreter (`node …/bin/codex`) runs. The process must be the one that
+/// started at `start`, read before and after. `None` otherwise: no other
+/// release is substituted.
+#[must_use]
+pub fn codex_of(pid: u32, start: Option<&str>) -> Option<PathBuf> {
+    let same = || {
+        start.is_none_or(|start| {
+            tend::agent_conversation::process_start(pid).as_deref() == Some(start)
+        })
+    };
+    if !same() {
+        return None;
+    }
+    let is_codex = |path: &Path| {
+        path.is_absolute()
+            && path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "codex" || name == "codex.js")
+    };
+    let found = executable_of(pid).filter(|exe| is_codex(exe)).or_else(|| {
+        // An interpreter: the Codex script is one of its arguments.
+        tend::process_snapshot::process_argv(pid)?
+            .into_iter()
+            .skip(1)
+            .map(PathBuf::from)
+            .find(|path| is_codex(path))
+    });
+    found.filter(|_| same())
+}
+
+/// The executable image of `pid`.
+fn executable_of(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+        system.process(pid)?.exe().map(Path::to_path_buf)
+    }
 }
 
 /// `home` as Codex resolves it: the directory with its symlinks followed
@@ -685,8 +760,8 @@ impl Neutral {
         Ok(Self(dir))
     }
 
-    fn path(&self) -> &str {
-        self.0.to_str().unwrap_or(".")
+    fn path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -696,18 +771,31 @@ impl Drop for Neutral {
     }
 }
 
-/// Before Codex starts on `account` (a launch, not a swap): carry trust to
-/// its home the way a swap does. `None` when there was nothing to say.
+/// How long a launch may spend on hook trust before it starts anyway.
+pub const LAUNCH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Before Codex starts on `routed` (a launch, not a swap): carry trust to
+/// its home the way a swap does, asking the `codex` that launch will run:
+/// aas's for an aas launch, the launch line's own program (an absolute
+/// path, or found on `PATH`) for a configured profile. Bounded by
+/// [`LAUNCH_BUDGET`]. `None` when there was nothing to say.
 #[must_use]
 pub fn prepare_launch(
     profiles: &[tend::accounts::AccountProfile],
-    account: &str,
+    routed: &tend::swap_api::RoutedLaunch,
     aas: &str,
 ) -> Option<String> {
-    let home = account_home(profiles, account, aas)?;
-    let codex = find_codex()?;
+    let home = account_home(profiles, &routed.account, aas)?;
+    let codex = if profiles.is_empty() {
+        find_codex()
+    } else {
+        match routed.launcher.last().map(PathBuf::from) {
+            Some(program) if program.is_absolute() => Some(program),
+            _ => path_codex(),
+        }
+    }?;
     let homes = known_homes(profiles);
-    match prepare(&codex, &home, &homes) {
+    match prepare(&codex, &home, &homes, LAUNCH_BUDGET) {
         Ok(prepared) => prepared.note(),
         Err(error) => Some(format!("Codex hook trust was not checked ({error})")),
     }
@@ -765,11 +853,19 @@ mod tests {
         project.source = "project".into();
         let mut elsewhere = hook(TARGET, "stop", "untrusted");
         elsewhere.key = "/repo/.codex/hooks.json:stop:0:0".into();
-        for other in [project, elsewhere] {
-            let (copies, left) = plan(&[other], target, &[vouch("/h/.codex", "stop", H)]);
-            assert!(copies.is_empty());
-            assert!(left.is_empty());
-        }
+        let (copies, left) = plan(&[project], target, &[vouch("/h/.codex", "stop", H)]);
+        assert!(copies.is_empty() && left.is_empty());
+        let (copies, left) = plan(&[elsewhere], target, &[vouch("/h/.codex", "stop", H)]);
+        assert!(copies.is_empty());
+        assert_eq!(left.len(), 1);
+        // An installed plugin's hook waiting on review is reported, never
+        // trusted for the user (the reviewer's case).
+        let mut plugin = hook(TARGET, "stop", "untrusted");
+        plugin.source = "plugin".into();
+        plugin.key = "demo@test:hooks/hooks.json:stop:0:0".into();
+        let (copies, left) = plan(&[plugin], target, &[vouch("/h/.codex", "stop", H)]);
+        assert!(copies.is_empty());
+        assert_eq!(left.len(), 1);
     }
 
     /// Only a hook Codex reports trusted, from a home's own user config,
@@ -899,13 +995,48 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let mut server = AppServer::open(&fake, dir.path()).unwrap();
+        let mut server =
+            AppServer::open(&fake, dir.path(), dir.path(), Instant::now() + BUDGET).unwrap();
         let started = Instant::now();
         let big = "x".repeat(1024 * 1024);
         assert!(server
             .call("config/value/write", serde_json::json!({ "value": big }))
             .is_err());
         assert!(started.elapsed() < RPC_TIMEOUT + Duration::from_secs(5));
+    }
+
+    /// The codex an agent runs is its own executable, or the script its
+    /// interpreter runs; a process that is not the one planned, or that
+    /// runs no Codex, gives none.
+    #[cfg(unix)]
+    #[test]
+    fn the_codex_an_agent_runs_is_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("codex");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // `sh <codex script>`: an interpreter running Codex.
+        let mut child = Command::new("sh").arg(&script).spawn().unwrap();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(200));
+        let start = tend::agent_conversation::process_start(pid);
+        let found = codex_of(pid, start.as_deref());
+        let other = codex_of(pid, Some("not-its-start"));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            found.and_then(|path| std::fs::canonicalize(path).ok()),
+            std::fs::canonicalize(&script).ok()
+        );
+        assert_eq!(other, None);
+        let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
+        let none = codex_of(sleep.id(), None);
+        let _ = sleep.kill();
+        let _ = sleep.wait();
+        assert_eq!(none, None);
     }
 
     #[test]
@@ -964,10 +1095,10 @@ mod tests {
         .unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(a.join("config.toml"), b.join("config.toml")).unwrap();
-        let cwd = work.to_str().unwrap();
         // Trust it under `a`, the way a person answering the menu would.
-        let mut server = AppServer::open(&codex, &a).unwrap();
-        let hook = server.hooks(cwd).unwrap().remove(0);
+        let deadline = Instant::now() + BUDGET;
+        let mut server = AppServer::open(&codex, &a, &work, deadline).unwrap();
+        let hook = server.hooks(&work).unwrap().remove(0);
         assert!(hook.needs_review());
         server
             .call(
@@ -979,13 +1110,13 @@ mod tests {
         drop(server);
         let homes = [a.clone(), b.clone()];
         // `b` is fixable only because `a`'s own hook is trusted.
-        let audits = audit(&codex, &homes);
+        let audits = audit(|_| Some(codex.clone()), &homes);
         assert_eq!(audits.len(), 1, "{audits:?}");
         assert_eq!(audits[0].result, Ok((1, 0)));
         // `b` shares the file but not the key: carried over once, then trusted.
-        let prepared = prepare(&codex, &b, &homes).unwrap();
+        let prepared = prepare(&codex, &b, &homes, BUDGET).unwrap();
         assert_eq!(prepared.copied, 1, "{prepared:?}");
-        assert!(list_hooks(&codex, &b, cwd)
+        assert!(list_hooks(&codex, &b, &work, deadline)
             .unwrap()
             .iter()
             .all(|h| !h.needs_review()));
@@ -994,13 +1125,13 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(
-            prepare(&codex, &b, &homes).unwrap(),
+            prepare(&codex, &b, &homes, BUDGET).unwrap(),
             Prepared {
                 home: resolved_home(&b),
                 ..Prepared::default()
             }
         );
-        assert!(audit(&codex, &homes).is_empty());
+        assert!(audit(|_| Some(codex.clone()), &homes).is_empty());
         assert_eq!(audits[0].resolved, resolved_home(&b));
     }
 }
