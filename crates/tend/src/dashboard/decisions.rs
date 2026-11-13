@@ -108,17 +108,19 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
 
 /// Who is deciding, as recorded: the signed-in operator's email, else the
 /// bearer token.
-fn operator_label(state: &AppState, headers: &HeaderMap) -> String {
+/// The display label (`web:<email>`, `web:token`) and, for a session, the
+/// identity that authorized it (issuer and subject) for the audit line: an
+/// email is shown, not trusted, and may be absent.
+fn operator_identity(state: &AppState, headers: &HeaderMap) -> (String, serde_json::Value) {
     match super::operator::authenticate(state.config.token.as_deref(), &state.operator, headers) {
-        Some(super::operator::OperatorAuth::Session) => {
-            let email = state
-                .operator
-                .signed_in(headers)
-                .and_then(|(email, _)| email)
-                .unwrap_or_else(|| "operator".into());
-            format!("web:{email}")
-        }
-        _ => "web:token".into(),
+        Some(super::operator::OperatorAuth::Session) => match state.operator.account(headers) {
+            Some((issuer, subject, email)) => (
+                format!("web:{}", email.as_deref().unwrap_or(&subject)),
+                json!({ "issuer": issuer, "subject": subject, "email": email }),
+            ),
+            None => ("web:operator".into(), serde_json::Value::Null),
+        },
+        _ => ("web:token".into(), json!({ "credential": "token" })),
     }
 }
 
@@ -177,7 +179,7 @@ pub(super) async fn review_handler(
     headers: HeaderMap,
     Json(decision): Json<ReviewDecision>,
 ) -> Response {
-    let by = operator_label(&state, &headers);
+    let (by, account) = operator_identity(&state, &headers);
     let item = match state.reviews.get(id.clone()).await {
         Ok(item) => item,
         Err(crate::review::ReviewError::NotFound(_)) => {
@@ -217,7 +219,7 @@ pub(super) async fn review_handler(
     }
     let result = state
         .reviews
-        .dispose(
+        .dispose_exact(
             id.clone(),
             decision.disposition,
             crate::review::ReviewActor {
@@ -228,7 +230,9 @@ pub(super) async fn review_handler(
         )
         .await;
     let (status, outcome) = match &result {
-        Ok(_) => (StatusCode::OK, "recorded".to_owned()),
+        Ok((_, false)) => (StatusCode::OK, "recorded".to_owned()),
+        // The same decision again: nothing changed, and the audit says so.
+        Ok((_, true)) => (StatusCode::OK, "already recorded".to_owned()),
         Err(crate::review::ReviewError::Conflict(message)) => {
             (StatusCode::CONFLICT, message.clone())
         }
@@ -241,14 +245,14 @@ pub(super) async fn review_handler(
         state.decision_audit.as_ref(),
         json!({
             "at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
-            "by": by, "action": "review", "id": id,
+            "by": by, "account": account, "action": "review", "id": id,
             "disposition": decision.disposition, "option": decision.option,
             "outcome": outcome, "status": status.as_u16(),
         }),
     )
     .await;
     match result {
-        Ok(item) => Json(json!({ "review": item })).into_response(),
+        Ok((item, _)) => Json(json!({ "review": item })).into_response(),
         Err(_) => error(status, outcome),
     }
 }
@@ -270,7 +274,7 @@ pub(super) async fn answer_handler(
     headers: HeaderMap,
     Json(answer): Json<HumanAnswer>,
 ) -> Response {
-    let by = operator_label(&state, &headers);
+    let (by, account) = operator_identity(&state, &headers);
     if answer.answer.len() > MAX_ANSWER_BYTES {
         return error(
             StatusCode::BAD_REQUEST,
@@ -307,7 +311,7 @@ pub(super) async fn answer_handler(
         state.decision_audit.as_ref(),
         json!({
             "at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
-            "by": by, "action": "answer", "id": id, "declined": answer.declined,
+            "by": by, "account": account, "action": "answer", "id": id, "declined": answer.declined,
             "outcome": outcome, "status": code.as_u16(),
         }),
     )

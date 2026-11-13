@@ -2481,6 +2481,24 @@ async fn deciding_from_the_web_needs_an_operator_and_csrf_proof() {
     )
     .await;
     assert_eq!(replay.status(), StatusCode::OK);
+    // Accepted again with another option is not "recorded": the stored
+    // decision says ship, so this conflicts and nothing changes.
+    let other_option = call(
+        &state,
+        "POST",
+        &review_uri,
+        Req {
+            body: Some(json!({"disposition": "accepted", "option": "hold"})),
+            ..csrf_req(&owner)
+        },
+    )
+    .await;
+    assert_eq!(other_option.status(), StatusCode::CONFLICT);
+    let stored = state.reviews.get(review.clone()).await.unwrap();
+    assert_eq!(
+        stored.disposition.unwrap().note.as_deref(),
+        Some("chose: ship")
+    );
     let other = call(
         &state,
         "POST",

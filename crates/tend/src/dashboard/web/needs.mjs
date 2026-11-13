@@ -11,6 +11,8 @@ const REFRESH_MS = 10000;
 
 const $ = (id) => document.getElementById(id);
 const state = { tab: "queue", timer: null, generation: 0 };
+/// Unsent answers and notes by card, kept across re-renders.
+const drafts = new Map();
 
 function authHeaders() {
   let token = null;
@@ -32,6 +34,13 @@ async function write(path, body) {
     body: JSON.stringify(body),
   });
   const payload = await resp.json().catch(() => null);
+  // The auth gate answers with a bare status; a handler's own refusal
+  // ("not addressed to you") carries a JSON error and keeps the page.
+  if (resp.status === 401 || (resp.status === 403 && !payload?.error)) {
+    const error = new Error("signed in without operator access");
+    error.auth = true;
+    throw error;
+  }
   if (!resp.ok) throw new Error(payload?.error || `${resp.status}`);
   return payload;
 }
@@ -110,6 +119,11 @@ function actions(card) {
   box.addEventListener("submit", (event) => event.preventDefault());
   const note = el("textarea", "note");
   note.rows = 2;
+  note.value = drafts.get(card.id) || "";
+  note.addEventListener("input", () => {
+    if (note.value) drafts.set(card.id, note.value);
+    else drafts.delete(card.id);
+  });
   note.maxLength = card.kind === "ask" ? 16384 : 1024;
   const message = el("p", "result");
   message.setAttribute("role", "status");
@@ -120,8 +134,10 @@ function actions(card) {
     try {
       await write(path, body);
       message.textContent = done;
+      drafts.delete(card.id);
       setTimeout(refresh, 800);
     } catch (error) {
+      if (error.auth) return lostAccess(error);
       message.textContent = `Not recorded: ${error.message}`;
       busy(false);
     }
@@ -129,7 +145,10 @@ function actions(card) {
   if (card.kind === "ask") {
     note.placeholder = "Your answer";
     const options = el("div", "choices");
-    for (const option of card.options) options.append(button(option, () => (note.value = option)));
+    for (const option of card.options) options.append(button(option, () => {
+      note.value = option;
+      drafts.set(card.id, option);
+    }));
     if (card.options.length) box.append(options);
     box.append(note);
     const path = `/api/decisions/requests/${encodeURIComponent(card.id)}`;
@@ -194,6 +213,18 @@ function forget() {
   $("covers").textContent = "";
 }
 
+/// Signed out, expired or downgraded: nothing private stays on the page,
+/// drafts included, and no older read may bring it back.
+function lostAccess(error) {
+  state.generation += 1;
+  drafts.clear();
+  forget();
+  $("status").textContent = error.message;
+  const login = $("login");
+  login.href = `/auth/login?return_to=${encodeURIComponent("/needs")}`;
+  login.hidden = false;
+}
+
 async function refresh() {
   const status = $("status");
   // A later refresh (or an auth failure) wins over one still in flight.
@@ -203,6 +234,9 @@ async function refresh() {
     if (state.tab === "queue") {
       const data = await read("/api/decisions");
       if (!current()) return;
+      // Fetched (so a lost session shows), but not re-rendered under the
+      // cursor; drafts survive the next render either way.
+      if (composing()) return;
       const cards = (data.queue?.items || []).map((item) => pendingCard(item)).filter(Boolean);
       renderList($("queue"), cards, "Nothing is waiting on you.");
       $("count").textContent = cards.length ? `${cards.length} waiting` : "";
@@ -219,14 +253,8 @@ async function refresh() {
     $("login").hidden = true;
   } catch (error) {
     if (!current()) return;
+    if (error.auth) return lostAccess(error);
     status.textContent = error.message;
-    if (error.auth) {
-      state.generation += 1;
-      forget();
-      const login = $("login");
-      login.href = `/auth/login?return_to=${encodeURIComponent("/needs")}`;
-      login.hidden = false;
-    }
   }
 }
 
@@ -242,15 +270,14 @@ function select(tab) {
 $("tab-queue").addEventListener("click", () => select("queue"));
 $("tab-history").addEventListener("click", () => select("history"));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && !composing()) refresh();
+  if (!document.hidden) refresh();
 });
-/// A refresh rebuilds the cards; never under a half-written answer.
+/// Typing in a card: a re-render now would move the cursor.
 function composing() {
-  return Boolean(document.activeElement?.closest?.(".actions"))
-    || [...document.querySelectorAll(".actions .note")].some((note) => note.value.trim());
+  return Boolean(document.activeElement?.closest?.(".actions"));
 }
 
 state.timer = setInterval(() => {
-  if (!document.hidden && !composing()) refresh();
+  if (!document.hidden) refresh();
 }, REFRESH_MS);
 refresh();

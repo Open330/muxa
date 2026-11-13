@@ -379,12 +379,13 @@ the Mac app:
 
 Both are control routes: the token, or an operator session with the CSRF
 proof (`Origin` = the public URL and `X-Tend-Operator: 1`); a viewer gets
-403. A repeated identical request changes nothing, a different decision on
-something already decided is a 409. The review disposition records
+403. A repeated identical request changes nothing; a different decision on
+something already decided (another disposition, option or note) is a 409. The review disposition records
 `web:<email>` (or `web:token`) as its actor, and every web decision is
-written as one JSON line to `$XDG_DATA_HOME/tend/dashboard-decisions.jsonl`
-(owner-only, rotated at 4 MiB) and logged. No dashboard page can be framed
-by another site (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
+written as one JSON line, with the signed-in account's issuer and subject,
+to `$XDG_DATA_HOME/tend/dashboard-decisions.jsonl`
+(owner-only, rotated at 4 MiB) and logged. No dashboard page or static asset can
+be framed by another site (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
 
 ## Collaboration graph and history API
 

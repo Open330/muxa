@@ -512,6 +512,16 @@ impl OperatorLogin {
             .map(|session| (session.email, session.via))
     }
 
+    /// `(issuer, subject, email)` of the signed-in account: the stable
+    /// identity that authorized it, for audit records.
+    pub(in crate::dashboard) fn account(
+        &self,
+        headers: &HeaderMap,
+    ) -> Option<(String, String, Option<String>)> {
+        self.session(headers)
+            .map(|session| (session.issuer, session.subject, session.email))
+    }
+
     /// Cookie-authorized state changes must prove they come from the
     /// dashboard page itself: an exact `Origin` (a cross-site page cannot
     /// forge it) plus a custom header (a cross-site form cannot set it
