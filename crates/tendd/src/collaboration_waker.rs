@@ -210,6 +210,16 @@ async fn wake_idle_collaboration_peers_with_inflight(
         if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
             continue;
         }
+        // Hook transport: the recipient's own turn-boundary hook is carrying
+        // this request; type a wake only once that offer is a backoff old.
+        if collaboration.hook_transport_enabled()
+            && request
+                .turn_offer
+                .as_ref()
+                .is_some_and(|offer| offer.offered_recently(time::OffsetDateTime::now_utc()))
+        {
+            continue;
+        }
         // Never write into a human primary's terminal for agent work, even
         // user-authorized: its provider hook hands the request over at the
         // next turn boundary instead (`tend hook … --event stop`).
@@ -223,14 +233,15 @@ async fn wake_idle_collaboration_peers_with_inflight(
         let quiet = collaboration.quiet_notices_waiting(recipient).await;
         let direct_wake = direct_collaboration_wake(wake_payload, &request);
         if direct_wake && direct_wake_body_is_terminal_safe(&request.body) {
-            if deliver_full_collaboration_request(
+            // Boxed: keeps the waker pass's future small.
+            if Box::pin(deliver_full_collaboration_request(
                 collaboration,
                 recipient,
                 &request,
                 backends,
                 quiet,
                 wake_payload,
-            )
+            ))
             .await
             {
                 wake_inflight.insert(wake_key);
@@ -512,6 +523,14 @@ pub(super) async fn deliver_full_collaboration_request(
     {
         return false;
     }
+    let reserved_at = if pending.status == tend::collaboration::RequestStatus::Queued {
+        match collaboration.reserve_typed_wake(&pending.id).await {
+            Ok(tend::collaboration::turn_offer::TypedWake::Allowed { reserved_at }) => reserved_at,
+            Ok(tend::collaboration::turn_offer::TypedWake::Refused) | Err(_) => return false,
+        }
+    } else {
+        None
+    };
     let (request, newly_prepared) = if pending.status == tend::collaboration::RequestStatus::Queued
     {
         match collaboration
@@ -519,13 +538,19 @@ pub(super) async fn deliver_full_collaboration_request(
             .await
         {
             Ok(Some(request)) => (request, true),
-            Ok(None) => return false,
-            Err(error) => {
-                tracing::warn!(
-                    request_id = pending.id,
-                    %error,
-                    "failed to reserve direct collaboration wake",
-                );
+            other => {
+                if let Err(error) = other {
+                    tracing::warn!(
+                        request_id = pending.id,
+                        %error,
+                        "failed to reserve direct collaboration wake",
+                    );
+                }
+                if let Some(reserved_at) = reserved_at {
+                    let _ = collaboration
+                        .release_typed_wake(&pending.id, reserved_at)
+                        .await;
+                }
                 return false;
             }
         }
@@ -746,6 +771,12 @@ async fn send_mailbox_wake(
     if !redelivery_still_due(collaboration, &agents, recipient, request).await {
         return false;
     }
+    // Final transport decision under the pane guard: the recipient's own
+    // hook may have been offered this request since the scan.
+    let reserved_at = match collaboration.reserve_typed_wake(&request.id).await {
+        Ok(tend::collaboration::turn_offer::TypedWake::Allowed { reserved_at }) => reserved_at,
+        Ok(tend::collaboration::turn_offer::TypedWake::Refused) | Err(_) => return false,
+    };
     // The unsubmitted-wake check judges the recipient's row against this
     // instant, taken before anything is typed.
     let attempt_started_at = time::OffsetDateTime::now_utc();
@@ -759,6 +790,14 @@ async fn send_mailbox_wake(
         store,
     )
     .await;
+    if !sent {
+        // Nothing typed: release the reservation so the hook may take it.
+        if let Some(reserved_at) = reserved_at {
+            let _ = collaboration
+                .release_typed_wake(&request.id, reserved_at)
+                .await;
+        }
+    }
     if sent {
         if let Err(error) = collaboration
             .mark_wake_notified(&request.id, attempt_started_at)

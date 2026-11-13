@@ -2715,6 +2715,8 @@ pub struct CollaborationStore {
     /// Whether Stop hooks may continue a turn with an offer; see
     /// [`turn_offer`]. Off when collaboration wakes are disabled.
     turn_continuation: std::sync::atomic::AtomicBool,
+    /// `collaboration.hook_transport = "primary"` (see `turn_offer.rs`).
+    hook_transport: std::sync::atomic::AtomicBool,
 }
 
 impl CollaborationStore {
@@ -2748,6 +2750,7 @@ impl CollaborationStore {
             read_revision: AtomicU64::new(0),
             read_validators: Mutex::new(read_validator::ReadValidators::default()),
             turn_continuation: std::sync::atomic::AtomicBool::new(true),
+            hook_transport: std::sync::atomic::AtomicBool::new(false),
             changes,
         })
     }
@@ -2847,6 +2850,7 @@ impl CollaborationStore {
             read_revision: AtomicU64::new(0),
             read_validators: Mutex::new(read_validator::ReadValidators::default()),
             turn_continuation: std::sync::atomic::AtomicBool::new(true),
+            hook_transport: std::sync::atomic::AtomicBool::new(false),
             changes,
         });
         store.apply_retention().await?;
@@ -4453,7 +4457,16 @@ impl CollaborationStore {
             }
             let mut owed: Vec<_> = requests
                 .values()
-                .filter(|request| mine(request) && request.reply_wake_owed())
+                // A reply its sender's hook offered within the backoff is
+                // not also typed (`hook_transport = "primary"`).
+                .filter(|request| {
+                    mine(request)
+                        && request.reply_wake_owed()
+                        && !(self.hook_transport_enabled()
+                            && request.turn_offer.as_ref().is_some_and(|offer| {
+                                offer.reply_offered_recently(OffsetDateTime::now_utc())
+                            }))
+                })
                 .map(|request| {
                     (
                         request.reply.as_ref().map(|reply| reply.at),

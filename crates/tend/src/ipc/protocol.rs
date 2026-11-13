@@ -667,6 +667,10 @@ pub(super) enum RequestBody {
         max_requests: Option<usize>,
         #[serde(default)]
         max_bytes: Option<usize>,
+        /// Offer kinds the calling hook renders (`reply_ready`); absent from
+        /// older hooks.
+        #[serde(default)]
+        supports: Vec<String>,
     },
     #[serde(alias = "collaboration_accept")]
     CollaborationInbox {

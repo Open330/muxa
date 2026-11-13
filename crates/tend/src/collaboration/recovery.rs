@@ -118,8 +118,12 @@ fn close_stale_stop(request: &mut CollaborationRequest, agent: Option<&Agent>) {
     let Some(offer) = request.turn_offer.as_mut() else {
         return;
     };
+    // Only work begun after that Stop ends the episode. The Stop hook asks
+    // for its offers before the stop itself is recorded, so a reconcile in
+    // between still sees the turn that is ending as Working.
     if offer.unanswered_stop_at.is_some_and(|stop| {
-        agent.state == AgentState::Working || agent.last_prompt_at.is_some_and(|at| at > stop)
+        (agent.state == AgentState::Working && agent.state_entered_at > stop)
+            || agent.last_prompt_at.is_some_and(|at| at > stop)
     }) {
         offer.unanswered_stop_at = None;
     }
@@ -1330,5 +1334,49 @@ mod tests {
             .await
             .unwrap()
             .peer_interrupted());
+    }
+
+    /// The Stop hook asks for offers before the stop is recorded: a
+    /// reconcile that runs in between sees the ending turn as Working and
+    /// must keep the Stop marker, so the idle episode can still be judged.
+    #[tokio::test]
+    async fn a_reconcile_between_the_stop_offer_and_the_recorded_stop_keeps_the_marker() {
+        use crate::collaboration::turn_offer::{TurnBoundaryEvent, OFFER_BACKOFF};
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.claim_by_id(&recipient, &request.id).await.unwrap();
+        // The turn began before the Stop: Working, entered earlier.
+        peer.state = AgentState::Working;
+        peer.state_entered_at = OffsetDateTime::now_utc() - time::Duration::seconds(30);
+        mailbox
+            .offer_turn_boundary(&recipient, TurnBoundaryEvent::Stop, None, None)
+            .await
+            .unwrap();
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        // Now the stop is recorded: Idle.
+        peer.state = AgentState::Idle;
+        peer.state_entered_at = OffsetDateTime::now_utc();
+        age_reminders(&mailbox, OFFER_BACKOFF).await;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator, peer])
+            .await
+            .unwrap();
+        let held = mailbox.get_for(&sender, &request.id).await.unwrap();
+        assert_eq!(held.interruption.unwrap().reason, "reply_overdue");
     }
 }

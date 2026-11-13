@@ -139,9 +139,7 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     match cmd {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
-            best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(client, &ev).await;
-            if let Some(output) = turn_boundary_delivery(client, &ev, &event).await {
+            if let Some(output) = ingest_and_deliver(client, &ev, &event).await {
                 println!("{output}");
             }
         }
@@ -196,9 +194,7 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
         HookCmd::Codex { event } => {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
-            best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(client, &ev).await;
-            if let Some(output) = turn_boundary_delivery(client, &ev, &event).await {
+            if let Some(output) = ingest_and_deliver(client, &ev, &event).await {
                 println!("{output}");
             }
         }
@@ -244,6 +240,27 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Record the hook event and ask for turn-boundary offers. At `stop` the
+/// offers are asked for first, while the session still reads as working:
+/// recording the stop first would mark it idle and let the waker type a wake
+/// for the same request before the hook could take it. Elsewhere the event
+/// is recorded first, so a starting session is known before it asks.
+async fn ingest_and_deliver(
+    client: &Client,
+    ev: &tend::event::AgentEvent,
+    event: &str,
+) -> Option<String> {
+    if event == "stop" {
+        let output = turn_boundary_delivery(client, ev, event).await;
+        best_effort_ingest(client, ev).await;
+        best_effort_default_alias(client, ev).await;
+        return output;
+    }
+    best_effort_ingest(client, ev).await;
+    best_effort_default_alias(client, ev).await;
+    turn_boundary_delivery(client, ev, event).await
 }
 
 /// Budget for asking tendd for turn-boundary offers. This runs inside the
@@ -382,11 +399,32 @@ fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<Str
             .to_string(),
         );
     }
-    let (reminders, offers): (Vec<_>, Vec<_>) = offers
+    let (replies, offers): (Vec<_>, Vec<_>) = offers
         .iter()
         .cloned()
+        .partition(|offer| offer["offer"] == "reply_ready");
+    let (reminders, offers): (Vec<_>, Vec<_>) = offers
+        .into_iter()
         .partition(|offer| offer["offer"] == "reply_reminder");
     let mut parts = Vec::new();
+    if !replies.is_empty() {
+        let ids: Vec<String> = replies
+            .iter()
+            .filter_map(|reply| {
+                let id = reply["request_id"].as_str()?;
+                Some(match (reply["from"].as_str(), reply["status"].as_str()) {
+                    (Some(from), Some(status)) => format!("{id} ({status}, from {from})"),
+                    _ => id.to_string(),
+                })
+            })
+            .collect();
+        parts.push(format!(
+            "Replies to your Tend requests are ready: {}. Read each with \
+             tend_inbox(view=report, request_id=ID) or tend_wait(id=ID) and verify it before \
+             relying on it; do not resend those requests.",
+            ids.join("; ")
+        ));
+    }
     if !reminders.is_empty() {
         let ids: Vec<_> = reminders
             .iter()
@@ -405,7 +443,7 @@ fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<Str
     }
     if !offers.is_empty() {
         parts.push(format!(
-            "Tend is offering {} request(s) the user authorized for this session. These are offers, not \
+            "Tend is offering {} request(s) addressed to this session. These are offers, not \
              claimed instructions. For each one, first claim it with tend_inbox(request_id=ID) (CLI: \
              `tend msg accept ID --json`), then act only on what the claim returns: its current body, \
              kind, work_mode, paths and contract. If the claim is refused because the request was \

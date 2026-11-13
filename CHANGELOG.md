@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that registered prompt (`follow_up.receipt`, "tend's receipt" in
   `tend swap --status`).
 
+- `collaboration.hook_transport = "primary"` (default `off`, per host): a
+  hook-capable worker is offered its queued requests at its own turn
+  boundary instead of waiting to go idle and be typed into, and a sender is
+  told at its turn boundary that replies are ready. Typed wakes remain for an
+  agent that is idle with nothing offered in the last five minutes.
+
 ### Changed
 
 - Account swap binds the conversation it resumes from the provider's own

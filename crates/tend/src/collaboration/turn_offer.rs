@@ -27,6 +27,20 @@ use time::OffsetDateTime;
 pub const MAX_STOP_OFFERS: u32 = 3;
 /// Minimum gap between two offers of one request through the same event.
 pub const OFFER_BACKOFF: time::Duration = time::Duration::minutes(5);
+/// The waker's final transport decision for one request (see
+/// [`CollaborationStore::reserve_typed_wake`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedWake {
+    /// Its own hook was offered it within the backoff: type nothing.
+    Refused,
+    /// Type it. `reserved_at` names the reservation to release if the
+    /// attempt types nothing (`None` with the transport off).
+    Allowed { reserved_at: Option<OffsetDateTime> },
+}
+
+/// Offer kind telling a sender its reply is ready. Older hooks render every
+/// unknown offer as work to claim, so it is sent only to hooks that list it.
+pub const REPLY_READY_OFFER: &str = "reply_ready";
 /// Stop continuations reminding a recipient to reply to one claimed request.
 pub const MAX_REPLY_REMINDERS: u32 = MAX_STOP_OFFERS;
 /// Server-side clamps on what one hook response may carry. The byte budget
@@ -87,6 +101,25 @@ pub struct TurnOffer {
         skip_serializing_if = "Option::is_none"
     )]
     pub unanswered_stop_at: Option<OffsetDateTime>,
+    /// `hook_transport = "primary"`: turn-boundary notices that this
+    /// request's reply is ready, offered to its sender.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reply_offers: u32,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_reply_offer_at: Option<OffsetDateTime>,
+    /// When the waker last reserved this request for a typed wake
+    /// (`hook_transport = "primary"`): offers and typed wakes exclude each
+    /// other within the backoff.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub typed_wake_at: Option<OffsetDateTime>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -95,6 +128,37 @@ fn is_zero(value: &u32) -> bool {
 }
 
 impl TurnOffer {
+    fn reply_offer_eligible(&self, event: TurnBoundaryEvent, now: OffsetDateTime) -> bool {
+        let fresh = self
+            .last_reply_offer_at
+            .is_none_or(|at| now - at >= OFFER_BACKOFF);
+        match event {
+            TurnBoundaryEvent::Stop => self.reply_offers < MAX_STOP_OFFERS && fresh,
+            TurnBoundaryEvent::PromptSubmit => fresh,
+            TurnBoundaryEvent::SessionStart => false,
+        }
+    }
+
+    /// Offered at a turn boundary within the backoff: the session's own
+    /// hook is carrying it, so the waker does not also type a wake for it.
+    pub fn offered_recently(&self, now: OffsetDateTime) -> bool {
+        let recent = |at: Option<OffsetDateTime>| at.is_some_and(|at| now - at < OFFER_BACKOFF);
+        recent(self.last_stop_offer_at) || recent(self.last_prompt_offer_at)
+    }
+
+    /// The reply notice was offered within the backoff.
+    pub fn reply_offered_recently(&self, now: OffsetDateTime) -> bool {
+        self.last_reply_offer_at
+            .is_some_and(|at| now - at < OFFER_BACKOFF)
+    }
+
+    /// The waker reserved this request for a typed wake within the
+    /// backoff; a hook must not also offer it.
+    fn typed_wake_recent(&self, now: OffsetDateTime) -> bool {
+        self.typed_wake_at
+            .is_some_and(|at| now - at < OFFER_BACKOFF)
+    }
+
     fn reminder_eligible(&self, now: OffsetDateTime) -> bool {
         self.reply_reminders < MAX_REPLY_REMINDERS
             && self
@@ -146,6 +210,87 @@ impl CollaborationStore {
         self.turn_continuation.store(enabled, Ordering::SeqCst);
     }
 
+    /// Reserve `request_id` for a typed wake now, unless its own hook was
+    /// offered it within the backoff (`hook_transport = "primary"`). Offers
+    /// and typed wakes are chosen under the same transaction lock, so one
+    /// request is never both offered and typed. Always true (and writes
+    /// nothing) with the transport off.
+    pub async fn reserve_typed_wake(
+        &self,
+        request_id: &str,
+    ) -> Result<TypedWake, CollaborationError> {
+        if !self.hook_transport_enabled() {
+            return Ok(TypedWake::Allowed { reserved_at: None });
+        }
+        let _transaction = self.transaction_lock.lock().await;
+        let now = OffsetDateTime::now_utc();
+        let row = {
+            let requests = self.requests.read().await;
+            let Some(request) = requests.get(request_id) else {
+                return Ok(TypedWake::Refused);
+            };
+            if request
+                .turn_offer
+                .as_ref()
+                .is_some_and(|offer| offer.offered_recently(now))
+            {
+                return Ok(TypedWake::Refused);
+            }
+            let mut row = request.clone();
+            row.turn_offer
+                .get_or_insert_with(TurnOffer::default)
+                .typed_wake_at = Some(now);
+            row
+        };
+        self.commit_request_rows(std::slice::from_ref(&row)).await?;
+        Ok(TypedWake::Allowed {
+            reserved_at: Some(now),
+        })
+    }
+
+    /// Undo a typed-wake reservation whose attempt typed nothing, so a
+    /// failing backend cannot keep the hook from offering the request. Only
+    /// the reservation taken at `reserved_at` is released.
+    pub async fn release_typed_wake(
+        &self,
+        request_id: &str,
+        reserved_at: OffsetDateTime,
+    ) -> Result<(), CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let row = {
+            let requests = self.requests.read().await;
+            let Some(request) = requests.get(request_id) else {
+                return Ok(());
+            };
+            if request
+                .turn_offer
+                .as_ref()
+                .and_then(|offer| offer.typed_wake_at)
+                != Some(reserved_at)
+            {
+                return Ok(());
+            }
+            let mut row = request.clone();
+            if let Some(offer) = row.turn_offer.as_mut() {
+                offer.typed_wake_at = None;
+            }
+            row
+        };
+        self.commit_request_rows(std::slice::from_ref(&row)).await
+    }
+
+    /// `collaboration.hook_transport = "primary"`: workers are offered
+    /// queued requests, and senders their ready replies, at their own turn
+    /// boundaries; typed wakes are left for agents idle with nothing
+    /// offered recently.
+    pub fn set_hook_transport(&self, enabled: bool) {
+        self.hook_transport.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn hook_transport_enabled(&self) -> bool {
+        self.hook_transport.load(Ordering::SeqCst)
+    }
+
     /// Select, record and return offers for `caller` at a turn boundary.
     ///
     /// Only queued, user-authorized agent requests addressed to exactly this
@@ -160,6 +305,21 @@ impl CollaborationStore {
         event: TurnBoundaryEvent,
         max_requests: Option<usize>,
         max_bytes: Option<usize>,
+    ) -> Result<Vec<Value>, CollaborationError> {
+        self.offer_turn_boundary_with(caller, event, max_requests, max_bytes, &[])
+            .await
+    }
+
+    /// [`Self::offer_turn_boundary`] for a hook that renders the offer kinds
+    /// in `supports` (for example [`REPLY_READY_OFFER`]). A kind an older
+    /// hook would misread is only offered to a hook that names it.
+    pub async fn offer_turn_boundary_with(
+        &self,
+        caller: &Participant,
+        event: TurnBoundaryEvent,
+        max_requests: Option<usize>,
+        max_bytes: Option<usize>,
+        supports: &[String],
     ) -> Result<Vec<Value>, CollaborationError> {
         self.ensure_enabled()?;
         if event == TurnBoundaryEvent::SessionStart {
@@ -179,32 +339,10 @@ impl CollaborationStore {
             return Ok(Vec::new());
         }
         let now = OffsetDateTime::now_utc();
-        let mut candidates: Vec<_> = {
-            let requests = self.requests.read().await;
-            requests
-                .values()
-                .filter(|request| {
-                    request.status == RequestStatus::Queued
-                        && addresses(&request.to, caller)
-                        // Judged against the session as it is now.
-                        && (request.awaits_turn_boundary(caller)
-                            // A wake that was typed but never submitted also
-                            // rides along with whatever prompt is submitted
-                            // next, as a structured offer.
-                            || (event == TurnBoundaryEvent::PromptSubmit
-                                && request.wake_retry.as_ref().is_some_and(|retry| {
-                                    retry.redeliver
-                                        || retry.attempts >= super::wake_retry::MAX_WAKE_ATTEMPTS
-                                })))
-                        && (event == TurnBoundaryEvent::PromptSubmit || request.should_notify())
-                        && request
-                            .turn_offer
-                            .as_ref()
-                            .is_none_or(|offer| offer.eligible(event, now))
-                })
-                .cloned()
-                .collect()
-        };
+        let hook_transport = self.hook_transport_enabled();
+        let mut candidates = self
+            .queued_offer_candidates(caller, event, now, hook_transport)
+            .await;
         candidates.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
 
         let mut offers = Vec::new();
@@ -258,11 +396,115 @@ impl CollaborationStore {
             offers.push(payload);
             rows.push(request);
         }
+        if hook_transport && supports.iter().any(|kind| kind == REPLY_READY_OFFER) {
+            let budget = (max_requests, max_bytes, used);
+            self.offer_ready_replies(caller, event, now, budget, &mut offers, &mut rows)
+                .await;
+        }
         if !rows.is_empty() {
             self.commit_request_rows(&rows).await?;
             self.publish_change();
         }
         Ok(offers)
+    }
+
+    /// Queued requests `caller` may be offered at this boundary.
+    async fn queued_offer_candidates(
+        &self,
+        caller: &Participant,
+        event: TurnBoundaryEvent,
+        now: OffsetDateTime,
+        hook_transport: bool,
+    ) -> Vec<super::CollaborationRequest> {
+        let requests = self.requests.read().await;
+        requests
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::Queued
+                    && addresses(&request.to, caller)
+                    // Judged against the session as it is now.
+                    && (request.awaits_turn_boundary(caller)
+                        // Hook transport: a worker takes its queued
+                        // requests at its own turn boundary too.
+                        || (hook_transport
+                            && caller.accepts_peer_work()
+                            && request.wake_delivery.is_none())
+                        // A wake that was typed but never submitted also
+                        // rides along with whatever prompt is submitted
+                        // next, as a structured offer.
+                        || (event == TurnBoundaryEvent::PromptSubmit
+                            && request.wake_retry.as_ref().is_some_and(|retry| {
+                                retry.redeliver
+                                    || retry.attempts >= super::wake_retry::MAX_WAKE_ATTEMPTS
+                            })))
+                    && (event == TurnBoundaryEvent::PromptSubmit || request.should_notify())
+                    // Reserved for a typed wake: no candidate mode offers it.
+                    && !(hook_transport
+                        && request
+                            .turn_offer
+                            .as_ref()
+                            .is_some_and(|offer| offer.typed_wake_recent(now)))
+                    && request
+                        .turn_offer
+                        .as_ref()
+                        .is_none_or(|offer| offer.eligible(event, now))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Add `reply_ready` notices for `caller` within the remaining budget
+    /// (`max_requests`, `max_bytes`, bytes already used), recording each.
+    async fn offer_ready_replies(
+        &self,
+        caller: &Participant,
+        event: TurnBoundaryEvent,
+        now: OffsetDateTime,
+        (max_requests, max_bytes, mut used): (usize, usize, usize),
+        offers: &mut Vec<Value>,
+        rows: &mut Vec<super::CollaborationRequest>,
+    ) {
+        for mut request in self.ready_replies_for(caller, event, now).await {
+            if offers.len() >= max_requests {
+                break;
+            }
+            let payload = reply_ready_payload(&request);
+            let len = payload.to_string().len();
+            if used + len > max_bytes && !offers.is_empty() {
+                break;
+            }
+            used += len;
+            let offer = request.turn_offer.get_or_insert_with(TurnOffer::default);
+            offer.reply_offers += 1;
+            offer.last_reply_offer_at = Some(now);
+            offers.push(payload);
+            rows.push(request);
+        }
+    }
+
+    /// Replies owed a wake to `caller`, oldest first, not mid-wake and not
+    /// offered within the backoff.
+    async fn ready_replies_for(
+        &self,
+        caller: &Participant,
+        event: TurnBoundaryEvent,
+        now: OffsetDateTime,
+    ) -> Vec<super::CollaborationRequest> {
+        let requests = self.requests.read().await;
+        let mut ready: Vec<_> = requests
+            .values()
+            .filter(|request| {
+                request.from.same_session(caller)
+                    && request.reply_wake_owed()
+                    && request
+                        .turn_offer
+                        .as_ref()
+                        .is_none_or(|offer| offer.reply_offer_eligible(event, now))
+            })
+            .cloned()
+            .collect();
+        ready.sort_by_key(|request| request.reply.as_ref().map(|reply| reply.at));
+        ready
     }
 }
 
@@ -327,6 +569,15 @@ fn reminder_payload(request: &super::CollaborationRequest, full: bool) -> Value 
         "kind": request.kind,
         "offer": "reply_reminder",
         "note": "you claimed this request and ended your turn without replying",
+    })
+}
+
+fn reply_ready_payload(request: &super::CollaborationRequest) -> Value {
+    json!({
+        "request_id": request.id,
+        "from": request.to.label(),
+        "status": request.reply.as_ref().map(|reply| reply.status),
+        "offer": REPLY_READY_OFFER,
     })
 }
 
@@ -770,6 +1021,192 @@ mod tests {
         assert!(
             row.turn_offer.is_none(),
             "an offer cut by the budget is not recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_transport_offers_a_workers_queued_requests_and_holds_the_typed_wake() {
+        let store = store();
+        let id = store
+            .create(
+                sender(),
+                worker(),
+                NewRequest {
+                    body: "review".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        // Off (the default): a worker's request waits for its typed wake.
+        assert!(stop(&store, &worker()).await.is_empty());
+        store.set_hook_transport(true);
+        let offers = stop(&store, &worker()).await;
+        assert_eq!(ids(&offers), vec![id.clone()]);
+        assert_eq!(offers[0]["offer"], "claim_before_acting");
+        let row = store.peek_for(&worker(), &id).await.unwrap();
+        assert_eq!(row.status, RequestStatus::Queued, "an offer claims nothing");
+        let now = OffsetDateTime::now_utc();
+        assert!(row.turn_offer.as_ref().unwrap().offered_recently(now));
+        assert!(!row
+            .turn_offer
+            .unwrap()
+            .offered_recently(now + OFFER_BACKOFF));
+    }
+
+    #[tokio::test]
+    async fn hook_transport_tells_a_sender_its_reply_is_ready_and_holds_the_reply_wake() {
+        let store = store();
+        store.set_hook_transport(true);
+        let reviewer = participant("reviewer", "%6");
+        let mut reviewer = reviewer;
+        reviewer.launch_purpose = LaunchPurpose::Worker;
+        let id = store
+            .create(
+                worker(),
+                reviewer.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        store.claim_by_id(&reviewer, &id).await.unwrap();
+        store
+            .reply(
+                &reviewer,
+                &id,
+                RequestStatus::Completed,
+                "lgtm".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        // An older hook does not name reply_ready: it would render the
+        // entry as work to claim, so it gets none and the wake stays typed.
+        assert!(stop(&store, &worker()).await.is_empty());
+        let reserved = store.reserve_reply_wakes(&worker()).await.unwrap().unwrap();
+        store.complete_reply_wakes(&reserved, false).await.unwrap();
+        let offers = stop_supporting(&store, &worker()).await;
+        assert_eq!(ids(&offers), vec![id.clone()]);
+        assert_eq!(offers[0]["offer"], "reply_ready");
+        assert_eq!(offers[0]["status"], "completed");
+        // The typed reply wake waits out the backoff...
+        assert!(store
+            .reserve_reply_wakes(&worker())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            stop_supporting(&store, &worker()).await.is_empty(),
+            "once per backoff"
+        );
+        // ...and the reply stays owed (an offer is not a read).
+        assert!(store
+            .peek_for(&worker(), &id)
+            .await
+            .unwrap()
+            .reply_wake_owed());
+        age_offers(&store, OFFER_BACKOFF).await;
+        {
+            let mut requests = store.requests.write().await;
+            let offer = requests.get_mut(&id).unwrap().turn_offer.as_mut().unwrap();
+            offer.last_reply_offer_at = offer.last_reply_offer_at.map(|at| at - OFFER_BACKOFF);
+        }
+        assert!(store
+            .reserve_reply_wakes(&worker())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    async fn stop_supporting(store: &CollaborationStore, caller: &Participant) -> Vec<Value> {
+        store
+            .offer_turn_boundary_with(
+                caller,
+                TurnBoundaryEvent::Stop,
+                None,
+                None,
+                &[REPLY_READY_OFFER.to_string()],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// One request is never both offered and typed: whichever is chosen
+    /// first under the transaction lock excludes the other for the backoff.
+    #[tokio::test]
+    async fn a_typed_wake_reservation_and_a_hook_offer_exclude_each_other() {
+        let store = store();
+        store.set_hook_transport(true);
+        let create = |body: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .create(
+                        sender(),
+                        worker(),
+                        NewRequest {
+                            body: body.into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            }
+        };
+        // Offered first: the waker's final reservation is refused.
+        let offered = create("offered").await;
+        assert_eq!(ids(&stop(&store, &worker()).await), vec![offered.clone()]);
+        assert_eq!(
+            store.reserve_typed_wake(&offered).await.unwrap(),
+            TypedWake::Refused
+        );
+        // Reserved first: the hook does not offer it.
+        let typed = create("typed").await;
+        let TypedWake::Allowed {
+            reserved_at: Some(reserved_at),
+        } = store.reserve_typed_wake(&typed).await.unwrap()
+        else {
+            panic!("reserved");
+        };
+        age_offers(&store, OFFER_BACKOFF).await;
+        assert!(
+            !ids(&stop(&store, &worker()).await).contains(&typed),
+            "a request reserved for a typed wake is not also offered"
+        );
+        // A wake-retry request is excluded too, whichever mode would offer it.
+        {
+            let mut requests = store.requests.write().await;
+            requests.get_mut(&typed).unwrap().wake_retry =
+                Some(crate::collaboration::wake_retry::WakeRetry {
+                    attempt_started_at: OffsetDateTime::now_utc(),
+                    attempts: 2,
+                    redeliver: false,
+                });
+        }
+        assert!(!ids(&store
+            .offer_turn_boundary(&worker(), TurnBoundaryEvent::PromptSubmit, None, None)
+            .await
+            .unwrap())
+        .contains(&typed));
+        // A typed attempt that typed nothing releases its reservation, and
+        // the hook may offer the request again.
+        store.release_typed_wake(&typed, reserved_at).await.unwrap();
+        assert!(ids(&store
+            .offer_turn_boundary(&worker(), TurnBoundaryEvent::PromptSubmit, None, None)
+            .await
+            .unwrap())
+        .contains(&typed));
+        // With the transport off nothing is reserved or written.
+        store.set_hook_transport(false);
+        assert_eq!(
+            store.reserve_typed_wake(&offered).await.unwrap(),
+            TypedWake::Allowed { reserved_at: None }
         );
     }
 }

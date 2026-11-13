@@ -878,6 +878,19 @@ pub struct CollaborationConfig {
     /// removes pending delivery or unread reply state.
     #[serde(default = "default_collaboration_retention_days")]
     pub retention_days: Option<u64>,
+    /// `primary` hands requests and reply notices to a hook-capable session
+    /// at its own turn boundaries (`Stop` / `UserPromptSubmit` hooks), and types
+    /// a wake only into an agent that is Idle with nothing offered recently.
+    /// `off` (default) keeps typed wakes as the transport. Per host.
+    pub hook_transport: CollaborationHookTransport,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationHookTransport {
+    #[default]
+    Off,
+    Primary,
 }
 
 impl Default for CollaborationConfig {
@@ -892,6 +905,7 @@ impl Default for CollaborationConfig {
             scope: CollaborationScope::default(),
             max_message_bytes: default_collaboration_max_message_bytes(),
             retention_days: default_collaboration_retention_days(),
+            hook_transport: CollaborationHookTransport::Off,
         }
     }
 }
