@@ -865,6 +865,24 @@ metadata; observed Codex prompt/tool or rollout activity can also clear a
 prior Codex cap. Consumers should use scope/source as well as the reset time
 rather than treating a missing `rate_limited_until` as proof of no cap.
 
+## Verified results (`work_verify_v1`)
+
+A Work's plan may carry `acceptance` (criteria) and `checks`
+(`[{command, name?, timeout_secs?}]`); `work_edit` sets them, recording the
+declarer tendd observes (`declared_by`) and pinning them to the plan's
+`cwd` (`verify_cwd`). A `work_edit` may also re-pin `verify_cwd`, which,
+like the checks, is held to the declarer rule (the person always; an agent
+only where nobody has declared or it declared itself). When an agent's
+`review_create` or `review_record` targets such a Work (or a request naming
+one), or `pipeline_done` completes it, tendd runs the checks first and
+refuses with `checks_failed …` when any fails; "an agent's" is the caller
+tendd observes, not the record's `requested_by`. A filed item then carries `verification`
+`{passed, ran_at, checks: [{command, name?, passed, exit_code?, timed_out?, tail}]}`,
+set only by tendd and meant to be shown before the agent's `summary` and
+`decision`; the same results also lead `decision.evidence` as
+`{"kind":"test", …, "verified": true}`. A client's `verified` claim is
+cleared. Both calls can take up to the verification budget (1,200 s).
+
 ## `HistoryEntry` schema (in `recent_prompts` responses)
 
 Prompt-history entries are a retained audit log, not the live agent row:

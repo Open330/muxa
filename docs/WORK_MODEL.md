@@ -116,6 +116,12 @@ Every result and every completion runs the checks afresh: a pass from an
 earlier call cannot show that what is completed now is what was checked, so
 `tend work done --summary` (file, then complete) runs them twice.
 
+The filed record keeps tend's results apart from the agent's account
+(`verification` on the review item), and every surface shows them first:
+`tend review queue` prefixes the item with `[3/3 checks passed]`, and
+`tend review show` prints "checked by tend" with each check's output before
+the agent's summary, decision and evidence.
+
 ### External issues
 
 ```sh

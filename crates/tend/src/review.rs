@@ -217,6 +217,11 @@ pub struct ReviewItem {
     /// 1-based, per target. A retry with the same idempotency key returns
     /// the existing item; every new claim takes the next generation.
     pub generation: u64,
+    /// What tend checked itself before the item reached the person (the
+    /// Work's declared checks), ahead of the claimer's own account below.
+    /// Set only by tendd (`work_verify_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::work_verify::Verification>,
     /// What to inspect, in the claimer's words.
     pub summary: String,
     /// Optional caller-supplied pointer to the evidence (a commit, a log
@@ -445,9 +450,20 @@ impl ReviewStore {
     /// Record a claim. A retry with the same idempotency key and target
     /// returns the original item; the same key for another target conflicts.
     pub async fn create(&self, new: NewReview) -> Result<ReviewItem, ReviewError> {
+        self.create_verified(new, None).await
+    }
+
+    /// [`Self::create`], recording what tendd verified itself.
+    pub async fn create_verified(
+        &self,
+        new: NewReview,
+        verification: Option<crate::work_verify::Verification>,
+    ) -> Result<ReviewItem, ReviewError> {
         new.validate()?;
-        self.with(move |connection| create(connection, new, OffsetDateTime::now_utc()))
-            .await
+        self.with(move |connection| {
+            create(connection, new, verification, OffsetDateTime::now_utc())
+        })
+        .await
     }
 
     pub async fn get(&self, id: String) -> Result<ReviewItem, ReviewError> {
@@ -714,6 +730,7 @@ fn load(connection: &Connection, id: &str) -> Result<Option<ReviewItem>, ReviewE
 fn create(
     connection: &mut Connection,
     new: NewReview,
+    verification: Option<crate::work_verify::Verification>,
     now: OffsetDateTime,
 ) -> Result<ReviewItem, ReviewError> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -746,6 +763,7 @@ fn create(
         id: format!("rv_{}", uuid::Uuid::new_v4().simple()),
         target: new.target,
         generation: u64::try_from(previous).unwrap_or(0) + 1,
+        verification,
         summary: new.summary,
         anchor: new.anchor,
         idempotency_key: new.idempotency_key,
@@ -824,6 +842,7 @@ fn record(
             id: format!("rv_{}", uuid::Uuid::new_v4().simple()),
             target: new.target,
             generation: u64::try_from(previous).unwrap_or(0) + 1,
+            verification: None,
             summary: new.summary,
             anchor: new.anchor,
             idempotency_key: new.idempotency_key,

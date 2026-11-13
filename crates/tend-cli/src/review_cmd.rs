@@ -541,9 +541,14 @@ fn render_queue(queue: &PendingQueue, now: OffsetDateTime) -> String {
                     .as_ref()
                     .and_then(|d| d.needed.as_deref())
                     .unwrap_or(&item.summary);
+                // What tend checked comes before the agent's own words.
+                let checked = item
+                    .verification
+                    .as_ref()
+                    .map_or_else(String::new, |v| format!("[{}]  ", v.headline()));
                 let _ = writeln!(
                     out,
-                    "  ◇ review  {}  {:>4}  {}  {}",
+                    "  ◇ review  {}  {:>4}  {}  {checked}{}",
                     item.id,
                     crate::attend::humanize_since(item.requested_at, now),
                     describe_target(&item.target),
@@ -774,11 +779,34 @@ fn render_item(item: &ReviewItem, now: OffsetDateTime) -> String {
             }
         }
     }
+    if let Some(verification) = &item.verification {
+        render_verification(&mut out, verification, now);
+        out.push_str("\nthe agent's account:\n");
+    }
     let _ = writeln!(out, "\n{}", item.summary);
     if let Some(decision) = &item.decision {
         render_decision(&mut out, decision);
     }
     out
+}
+
+/// What tend ran itself, ahead of anything the agent says.
+fn render_verification(
+    out: &mut String,
+    verification: &tend::work_verify::Verification,
+    now: OffsetDateTime,
+) {
+    let _ = writeln!(
+        out,
+        "\nchecked by tend: {} ({} ago)",
+        verification.headline(),
+        crate::attend::humanize_since(verification.ran_at, now)
+    );
+    for check in &verification.checks {
+        for line in check.report().lines() {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
 }
 
 /// The decision block of `tend review show`: question, options,
@@ -997,5 +1025,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(describe_target(&t), "work tend/review @impl");
+    }
+
+    #[test]
+    fn tends_checks_are_shown_before_the_agents_account() {
+        let now = OffsetDateTime::now_utc();
+        let item: ReviewItem = serde_json::from_value(serde_json::json!({
+            "id": "rv_1", "generation": 1, "summary": "I fixed it",
+            "target": {"kind": "work", "workspace": "web", "work": "ENG-1"},
+            "requested_at": "2026-11-12T11:00:00Z", "requested_by": {"kind": "agent"},
+            "verification": {
+                "passed": true, "ran_at": "2026-11-12T11:00:00Z",
+                "checks": [{"command": "cargo test", "passed": true, "exit_code": 0, "tail": "ok"}]
+            }
+        }))
+        .unwrap();
+        let text = render_item(&item, now);
+        let checked = text.find("checked by tend: 1/1 check passed").expect(&text);
+        assert!(text.contains("PASS cargo test (exit 0)"), "{text}");
+        assert!(checked < text.find("I fixed it").unwrap(), "{text}");
+        let queue = PendingQueue {
+            items: vec![PendingItem::Review(Box::new(item))],
+            ..PendingQueue::default()
+        };
+        assert!(render_queue(&queue, now).contains("[1/1 check passed]  I fixed it"));
     }
 }
