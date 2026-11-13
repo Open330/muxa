@@ -304,3 +304,20 @@ test("only a clean turn end delivers, and only when tend offers", async () => {
   await quiet.settle();
   assert.deepEqual(quiet.prompted, []);
 });
+
+test("only a clean execution end is flagged as a boundary for the hook", async () => {
+  const { sent, emit, show, prompt, settle } = await harness();
+  show("s");
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  emit("session.execution.interrupted", { sessionID: "s", reason: "user" });
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  emit("session.execution.failed", { sessionID: "s", error: { type: "api", message: "x" } });
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  emit("session.execution.succeeded", { sessionID: "s" });
+  await settle();
+  const flags = sent.filter((p) => p.type === "session.idle").map((p) => p.tend.boundary === true);
+  assert.deepEqual(flags, [false, false, true]);
+});

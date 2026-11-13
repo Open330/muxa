@@ -81,6 +81,11 @@ export const TendPlugin = async ({ client, directory }) => {
   let owner = null; // the session the pane's user last prompted
   const incomplete = new Set(); // sessionIDs whose current turn failed or was aborted
   let prompts = 0; // prompts seen, so an offer never lands after the user typed
+  // sessionIDs whose current turn already reported its idle. opencode sends
+  // `session.idle` again after an abort's cleanup; only the first idle of a
+  // turn may be a boundary, and a failed turn stays failed until the next
+  // prompt starts a new one.
+  const settled = new Set();
 
   const remember = (map, key, value, cap = 512) => {
     map.set(key, value);
@@ -133,7 +138,8 @@ export const TendPlugin = async ({ client, directory }) => {
       queue.push({ payload: { type: "tend.session.active", properties: { sessionID }, tend: { directory } }, seq: prompts });
     }
     if (!sessionID || sessionID !== owner) return;
-    queue.push({ payload: { type, properties, tend: { directory, ...extra } }, seq: prompts, boundary });
+    const tend = boundary ? { directory, ...extra, boundary: true } : { directory, ...extra };
+    queue.push({ payload: { type, properties, tend }, seq: prompts, boundary });
     if (queue.length > 256) queue.shift();
     setTimeout(flush, 0);
   };
@@ -163,6 +169,7 @@ export const TendPlugin = async ({ client, directory }) => {
       // A new turn: nothing captured earlier belongs to it.
       replies.delete(input.sessionID);
       incomplete.delete(input.sessionID);
+      settled.delete(input.sessionID);
       prompts += 1;
       send("tend.prompt", { sessionID: input.sessionID, text });
     },
@@ -183,11 +190,13 @@ export const TendPlugin = async ({ client, directory }) => {
           send(event.type, { sessionID });
           if (sessionID === owner) owner = null;
           return;
-        case "session.idle":
-          send(event.type, { sessionID }, { response: replyText(sessionID) }, !incomplete.has(sessionID));
+        case "session.idle": {
+          const clean = !incomplete.has(sessionID) && !settled.has(sessionID);
+          send(event.type, { sessionID }, { response: replyText(sessionID) }, clean);
           replies.delete(sessionID);
-          incomplete.delete(sessionID);
+          if (sessionID) settled.add(sessionID);
           return;
+        }
         case "session.error":
           if (sessionID) incomplete.add(sessionID);
           send(event.type, p);
@@ -357,7 +366,9 @@ export default {
     // `boundary`: a turn that ended cleanly, where tend may offer requests.
     // Esc and failures are not: the user stopped it, or it needs them.
     const send = (type, properties, extra, boundary = false) => {
-      queue.push({ payload: { type, properties, tend: { directory: directory(), ...extra } }, seq: prompts, boundary });
+      const tend = { directory: directory(), ...extra };
+      if (boundary) tend.boundary = true;
+      queue.push({ payload: { type, properties, tend }, seq: prompts, boundary });
       if (queue.length > 256) queue.shift();
       setTimeout(flush, 0);
     };

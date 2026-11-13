@@ -239,3 +239,30 @@ test("an aborted or failed turn gets no offer", async () => {
   await settle();
   assert.deepEqual(prompted, []);
 });
+
+// From the #514 review (Codex): opencode 1.x sends session.idle again after an
+// abort's cleanup; that idle must not turn the aborted turn into a boundary.
+test("a repeated idle after an abort or a failure is never a boundary", async () => {
+  for (const error of [{ name: "MessageAbortedError" }, { name: "APIError", data: { message: "overloaded" } }]) {
+    const { sent, prompted, hooks, emit, settle } = await harness(offer);
+    await bind(hooks, "s");
+    await emit("session.error", { sessionID: "s", error });
+    await emit("session.idle", { sessionID: "s" });
+    await emit("session.idle", { sessionID: "s" });
+    await settle();
+    assert.deepEqual(prompted, [], error.name);
+    assert.ok(sent.filter((p) => p.type === "session.idle").every((p) => p.tend.boundary !== true), error.name);
+  }
+});
+
+test("only the first idle of a clean turn is flagged as a boundary", async () => {
+  const { sent, hooks, emit, settle } = await harness();
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  await emit("session.idle", { sessionID: "s" });
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  await settle();
+  const flags = sent.filter((p) => p.type === "session.idle").map((p) => p.tend.boundary === true);
+  assert.deepEqual(flags, [true, false, true]);
+});

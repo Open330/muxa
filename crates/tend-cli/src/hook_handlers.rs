@@ -233,8 +233,13 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                     let ev = place.bind(ev);
                     best_effort_ingest(client, &ev).await;
                     best_effort_default_alias(client, &ev).await;
-                    if let Some(output) = opencode_turn_delivery(client, &ev).await {
-                        println!("{output}");
+                    // Only the plugin knows a turn ended cleanly; asking
+                    // tendd after Esc or a failure would spend the
+                    // request's limited Stop offers on output it discards.
+                    if tend::adapters::opencode::is_turn_boundary(&text) {
+                        if let Some(output) = opencode_turn_delivery(client, &ev).await {
+                            println!("{output}");
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -307,8 +312,10 @@ pub(super) async fn turn_boundary_delivery(
 /// plugin). The offers Claude Code's Stop hook would carry in `reason` are
 /// printed as `{"prompt": TEXT}`, and the plugin hands TEXT to opencode's
 /// own prompt API for this session, so nothing is typed into the terminal.
-/// Nothing is consumed until the model claims a request by id, so a plugin
-/// that drops the prompt (the user typed first) loses nothing.
+/// A request is not claimed until the model claims it by id, so a prompt
+/// the plugin drops (the user typed first) leaves it queued; the attempt
+/// still counts toward the request's Stop offers, which is why the caller
+/// asks only at a boundary the plugin flagged as clean.
 async fn opencode_turn_delivery(client: &Client, ev: &tend::event::AgentEvent) -> Option<String> {
     if !matches!(
         ev,
