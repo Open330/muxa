@@ -145,40 +145,53 @@ pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, 
 
 /// The `CODEX_HOME` a profile launches with, read without running
 /// anything: its explicit `env` wins (the launch line sets it after the
-/// file is sourced); otherwise a plain `CODEX_HOME=…` assignment in its
-/// `env_file`. A value the shell would compute (`$`, backticks) is not
-/// guessed: `None`.
+/// file is sourced); otherwise [`assigned_home`] of its `env_file`.
 fn profile_home(profile: &tend::accounts::AccountProfile) -> Option<PathBuf> {
-    let value = if let Some(value) = profile.env.get("CODEX_HOME") {
-        value.clone()
-    } else {
-        let file = expand_home(profile.env_file.as_deref()?);
-        assigned_home(&std::fs::read_to_string(file).ok()?)?
-    };
-    let path = expand_home(&value);
-    path.is_absolute().then_some(path)
+    if let Some(value) = profile.env.get("CODEX_HOME") {
+        let path = expand_home(value);
+        return path.is_absolute().then_some(path);
+    }
+    let file = expand_home(profile.env_file.as_deref()?);
+    assigned_home(&std::fs::read_to_string(file).ok()?).map(PathBuf::from)
 }
 
-/// The last plain `CODEX_HOME=<value>` (optionally `export`ed, optionally
-/// quoted) in an env file. `None` if it is absent or computed.
+/// The `CODEX_HOME` an env file sets, when the whole file is nothing but
+/// blank lines, comments and plain `[export ]NAME=value` assignments, and
+/// that value is a literal absolute path. Anything else (control flow, a
+/// command, a computed or `~` value) is not guessed at: `None`.
 fn assigned_home(text: &str) -> Option<String> {
     let mut found = None;
     for line in text.lines().map(str::trim) {
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        let Some(value) = line.strip_prefix("CODEX_HOME=").map(str::trim) else {
+        if line.is_empty() || line.starts_with('#') {
             continue;
-        };
-        found = if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
-            // Single quotes are literal.
-            Some(inner.to_owned())
-        } else if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-            (!inner.contains(['$', '`', '\\', '"'])).then(|| inner.to_owned())
-        } else {
-            (!value.contains(['$', '`', '\\', '"', '\'', ' ', ';', '&', '|']))
-                .then(|| value.to_owned())
-        };
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let (name, value) = line.split_once('=')?;
+        let plain_name = !name.is_empty()
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            && !name.starts_with(|c: char| c.is_ascii_digit());
+        let value = literal(value)?;
+        if !plain_name {
+            return None;
+        }
+        if name == "CODEX_HOME" {
+            found = Some(value);
+        }
     }
-    found.filter(|value| !value.is_empty())
+    found.filter(|value| value.starts_with('/'))
+}
+
+/// A shell word that means exactly its text: single-quoted, double-quoted
+/// with nothing the shell expands, or bare with no special character.
+fn literal(word: &str) -> Option<String> {
+    if let Some(inner) = word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
+        return (!inner.contains('\'')).then(|| inner.to_owned());
+    }
+    if let Some(inner) = word.strip_prefix('"').and_then(|w| w.strip_suffix('"')) {
+        return (!inner.contains(['$', '`', '\\', '"'])).then(|| inner.to_owned());
+    }
+    let special = |c: char| c.is_whitespace() || "$`\\\"'~;&|<>(){}*?[]!#".contains(c);
+    (!word.contains(special)).then(|| word.to_owned())
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -717,11 +730,14 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             ..profile
         };
+        // A file with a command in it is not guessed at, and never run.
+        assert_eq!(profile_home(&file_only), None);
+        assert!(!marker.exists(), "the env file must not be run");
+        std::fs::write(&file, "export CODEX_HOME=\"/tmp/from-env-file\"\n").unwrap();
         assert_eq!(
             profile_home(&file_only),
             Some(PathBuf::from("/tmp/from-env-file"))
         );
-        assert!(!marker.exists(), "the env file must not be run");
         assert_eq!(
             assigned_home("CODEX_HOME=/a\nCODEX_HOME='/b c'\n").as_deref(),
             Some("/b c")
