@@ -880,6 +880,7 @@ async fn build_collaboration(cfg: &Config) -> Result<Arc<CollaborationStore>> {
                     path = ?options.path,
                     wake = ?cfg.collaboration.wake,
                     wake_payload = ?cfg.collaboration.wake_payload,
+                    hook_transport = ?cfg.collaboration.hook_transport,
                     "agent collaboration enabled",
                 );
             }

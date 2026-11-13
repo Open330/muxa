@@ -139,9 +139,7 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     match cmd {
         HookCmd::Claude { event } => {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
-            best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(client, &ev).await;
-            if let Some(output) = turn_boundary_delivery(client, &ev, &event).await {
+            if let Some(output) = ingest_and_deliver(client, &ev, &event).await {
                 println!("{output}");
             }
         }
@@ -196,9 +194,7 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
         HookCmd::Codex { event } => {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
-            best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(client, &ev).await;
-            if let Some(output) = turn_boundary_delivery(client, &ev, &event).await {
+            if let Some(output) = ingest_and_deliver(client, &ev, &event).await {
                 println!("{output}");
             }
         }
@@ -244,6 +240,27 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Record the hook event and ask for turn-boundary offers. At `stop` the
+/// offers are asked for first, while the session still reads as working:
+/// recording the stop first would mark it idle and let the waker type a wake
+/// for the same request before the hook could take it. Elsewhere the event
+/// is recorded first, so a starting session is known before it asks.
+async fn ingest_and_deliver(
+    client: &Client,
+    ev: &tend::event::AgentEvent,
+    event: &str,
+) -> Option<String> {
+    if event == "stop" {
+        let output = turn_boundary_delivery(client, ev, event).await;
+        best_effort_ingest(client, ev).await;
+        best_effort_default_alias(client, ev).await;
+        return output;
+    }
+    best_effort_ingest(client, ev).await;
+    best_effort_default_alias(client, ev).await;
+    turn_boundary_delivery(client, ev, event).await
 }
 
 /// Budget for asking tendd for turn-boundary offers. This runs inside the
