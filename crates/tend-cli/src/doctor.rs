@@ -547,31 +547,25 @@ async fn check_codex_hook_trust(config: Option<&Path>) -> Option<CheckResult> {
     let lines = tokio::task::spawn_blocking(move || codex_hook_trust_lines(config.as_deref()))
         .await
         .ok()??;
-    // Which Codex answered: an older release hashes hooks differently.
-    let asked = {
-        #[cfg(feature = "aas")]
-        {
-            tend_aas::codex_hook_trust::find_codex()
-                .map(|codex| format!(" (asked {})", tilde(&codex.display())))
-                .unwrap_or_default()
-        }
-        #[cfg(not(feature = "aas"))]
-        {
-            String::new()
-        }
+    let (lines, asked) = lines;
+    let asked = if asked.is_empty() {
+        String::new()
+    } else {
+        format!(" (asked {})", asked.join(", "))
     };
     Some(if lines.is_empty() {
         CheckResult::Ok(format!(
             "Codex hook trust: every account home trusts the current hooks{asked}"
         ))
     } else {
-        CheckResult::Warn(format!("{}{asked}", lines.join("; ")))
+        CheckResult::Warn(lines.join("; "))
     })
 }
 
 /// One line per Codex home with hooks waiting on review; `None` when it
 /// cannot be checked here. Shared with `tend init`.
-pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String>> {
+/// Also the distinct Codex commands the homes were asked with.
+pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<(Vec<String>, Vec<String>)> {
     #[cfg(feature = "aas")]
     {
         use tend_aas::codex_hook_trust as trust;
@@ -605,44 +599,55 @@ pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String
             },
             &homes,
         );
-        Some(
-            audits
-                .iter()
-                .map(|audit| {
-                    // The path Codex resolves is the one its trust keys use;
-                    // say where it was found when that differs.
-                    let home = if audit.resolved == audit.home {
-                        tilde(&audit.resolved.display().to_string())
-                    } else {
-                        tilde(&format!(
-                            "{} (found as {})",
-                            audit.resolved.display(),
-                            audit.home.display()
-                        ))
-                    };
-                    let (fixable, unvouched) = match &audit.result {
-                        Ok(counts) => *counts,
-                        Err(error) => {
-                            return format!("Codex home {home}: could not check ({error})")
-                        }
-                    };
-                    let mut parts = Vec::new();
-                    if fixable > 0 {
-                        parts.push(format!(
-                            "{fixable} hook(s) trusted under another home but stale here (a \
+        let mut asked: Vec<String> = audits
+            .iter()
+            .filter_map(|audit| audit.asked.as_deref().map(tilde))
+            .collect();
+        asked.sort();
+        asked.dedup();
+        let lines = audits
+            .iter()
+            .filter(|audit| audit.result != Ok((0, 0)))
+            .map(|audit| {
+                let by = audit
+                    .asked
+                    .as_deref()
+                    .map(|codex| format!(" (asked {})", tilde(codex)))
+                    .unwrap_or_default();
+                // The path Codex resolves is the one its trust keys use;
+                // say where it was found when that differs.
+                let home = if audit.resolved == audit.home {
+                    tilde(&audit.resolved.display().to_string())
+                } else {
+                    tilde(&format!(
+                        "{} (found as {})",
+                        audit.resolved.display(),
+                        audit.home.display()
+                    ))
+                };
+                let (fixable, unvouched) = match &audit.result {
+                    Ok(counts) => *counts,
+                    Err(error) => {
+                        return format!("Codex home {home}: could not check ({error}){by}")
+                    }
+                };
+                let mut parts = Vec::new();
+                if fixable > 0 {
+                    parts.push(format!(
+                        "{fixable} hook(s) trusted under another home but stale here (a \
                              swap carries the trust over)"
-                        ));
-                    }
-                    if unvouched > 0 {
-                        parts.push(format!(
-                            "{unvouched} hook(s) not trusted under any home (open Codex under \
+                    ));
+                }
+                if unvouched > 0 {
+                    parts.push(format!(
+                        "{unvouched} hook(s) not trusted under any home (open Codex under \
                              this home and review them)"
-                        ));
-                    }
-                    format!("Codex home {home}: {}", parts.join(", "))
-                })
-                .collect(),
-        )
+                    ));
+                }
+                format!("Codex home {home}: {}{by}", parts.join(", "))
+            })
+            .collect();
+        Some((lines, asked))
     }
     #[cfg(not(feature = "aas"))]
     {

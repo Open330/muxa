@@ -188,8 +188,7 @@ pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, 
 /// The `CODEX_HOME` a profile launches with (see [`profile_var`]), when it
 /// is an absolute path.
 fn profile_home(profile: &tend::accounts::AccountProfile) -> Option<PathBuf> {
-    let value = profile_var(profile, "CODEX_HOME").ok()??;
-    let path = expand_home(&value);
+    let path = PathBuf::from(profile_var(profile, "CODEX_HOME").ok()??);
     path.is_absolute().then_some(path)
 }
 
@@ -199,9 +198,12 @@ fn profile_home(profile: &tend::accounts::AccountProfile) -> Option<PathBuf> {
 /// `Ok(None)`: the launch leaves it as the launching process has it.
 /// `Err`: the file is more than plain literal assignments, so it cannot be
 /// told without running it.
+/// The value is what the launch sees: an explicit `env` value with a
+/// leading `~/` expanded, exactly as the launch line writes it
+/// (`accounts::expand_home` on the whole value); a file value as written.
 fn profile_var(profile: &tend::accounts::AccountProfile, name: &str) -> Result<Option<String>, ()> {
     if let Some(value) = profile.env.get(name) {
-        return Ok(Some(value.clone()));
+        return Ok(Some(tend::accounts::expand_home(value)));
     }
     let Some(file) = profile.env_file.as_deref() else {
         return Ok(None);
@@ -663,6 +665,8 @@ pub fn prepare(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audit {
     pub home: PathBuf,
+    /// The Codex command this home was asked with, if any.
+    pub asked: Option<String>,
     /// The home as Codex resolves it, the path its trust keys use.
     pub resolved: PathBuf,
     /// `(fixable, unvouched)`: hooks a swap would carry trust to, and ones
@@ -670,18 +674,26 @@ pub struct Audit {
     pub result: Result<(usize, usize), String>,
 }
 
-/// [`Audit`] each home in `homes` that has hooks waiting on review or
-/// cannot be checked, within [`BUDGET`] (homes past it are reported as not
-/// checked). Read-only: nothing is written.
+/// One home's hooks, or why they could not be read.
+type Listed = Result<Vec<Hook>, String>;
+
+/// [`Audit`] each home in `homes` (`Ok((0, 0))` for one with nothing
+/// waiting), within [`BUDGET`] (homes past it are reported as not checked).
+/// Read-only: nothing is written.
 #[must_use]
 pub fn audit(codex_for: impl Fn(&Path) -> Option<Codex>, homes: &[PathBuf]) -> Vec<Audit> {
+    let homes: Vec<&PathBuf> = homes
+        .iter()
+        .filter(|home| home.join("config.toml").exists())
+        .collect();
     let neutral = match Neutral::new() {
         Ok(neutral) => neutral,
         Err(error) => {
             return homes
                 .iter()
                 .map(|home| Audit {
-                    home: home.clone(),
+                    home: (*home).clone(),
+                    asked: None,
                     resolved: resolved_home(home),
                     result: Err(error.clone()),
                 })
@@ -690,43 +702,59 @@ pub fn audit(codex_for: impl Fn(&Path) -> Option<Codex>, homes: &[PathBuf]) -> V
     };
     let cwd = neutral.path();
     let deadline = Instant::now() + BUDGET;
-    let mut listed: Vec<(PathBuf, Result<Vec<Hook>, String>)> = Vec::new();
-    for home in homes
-        .iter()
-        .filter(|home| home.join("config.toml").exists())
-    {
-        let hooks = if Instant::now() >= deadline {
-            Err("not checked: the check ran out of time".to_owned())
-        } else if let Some(codex) = codex_for(home) {
-            list_hooks(&codex, home, cwd, deadline)
-        } else {
-            Err("no codex to ask for this home".to_owned())
-        };
-        listed.push((home.clone(), hooks));
+    // Hashes are compared only within one Codex release: every home is
+    // listed with each release some home is asked with, once.
+    let asked: Vec<Option<Codex>> = homes.iter().map(|home| codex_for(home)).collect();
+    let mut releases: Vec<Codex> = asked.iter().flatten().cloned().collect();
+    releases.dedup();
+    releases.sort_by_key(Codex::display);
+    releases.dedup();
+    let mut listings: Vec<(Codex, PathBuf, Listed)> = Vec::new();
+    for codex in &releases {
+        for home in &homes {
+            let hooks = if Instant::now() >= deadline {
+                Err("not checked: the check ran out of time".to_owned())
+            } else {
+                list_hooks(codex, home, cwd, deadline)
+            };
+            listings.push((codex.clone(), (*home).clone(), hooks));
+        }
     }
-    let trusted: Vec<Trusted> = listed
+    homes
         .iter()
-        .filter_map(|(home, hooks)| hooks.as_ref().ok().map(|hooks| vouched_by(hooks, home)))
-        .flatten()
-        .collect();
-    listed
-        .into_iter()
-        .filter_map(|(home, hooks)| {
-            let result = match hooks {
-                Err(error) => Err(error),
-                Ok(hooks) => {
-                    let (copies, left) = plan(&hooks, &home, &trusted);
-                    if copies.is_empty() && left.is_empty() {
-                        return None;
-                    }
-                    Ok((copies.len(), left.len()))
+        .zip(asked)
+        .map(|(home, codex)| {
+            let result = match &codex {
+                None => Err("no codex to ask for this home".to_owned()),
+                Some(codex) => {
+                    let trusted: Vec<Trusted> = listings
+                        .iter()
+                        .filter(|(by, _, _)| by == codex)
+                        .filter_map(|(_, donor, hooks)| {
+                            hooks.as_ref().ok().map(|hooks| vouched_by(hooks, donor))
+                        })
+                        .flatten()
+                        .collect();
+                    listings
+                        .iter()
+                        .find(|(by, listed, _)| by == codex && listed == *home)
+                        .map_or_else(
+                            || Err("not listed".to_owned()),
+                            |(_, _, hooks)| {
+                                hooks.clone().map(|hooks| {
+                                    let (copies, left) = plan(&hooks, home, &trusted);
+                                    (copies.len(), left.len())
+                                })
+                            },
+                        )
                 }
             };
-            Some(Audit {
-                resolved: resolved_home(&home),
-                home,
+            Audit {
+                home: (*home).clone(),
+                asked: codex.as_ref().map(Codex::display),
+                resolved: resolved_home(home),
                 result,
-            })
+            }
         })
         .collect()
 }
@@ -769,10 +797,18 @@ pub fn profile_codex(profile: &tend::accounts::AccountProfile, program: &str) ->
     }
     match profile_var(profile, "PATH").ok()? {
         None => path_codex(),
-        Some(path) => std::env::split_paths(&path)
-            .map(|dir| expand_home(&dir.display().to_string()).join(program))
-            .find(|candidate| candidate.is_file())
-            .map(Codex::program),
+        Some(path) => {
+            // A relative or `~` entry depends on where and how the shell
+            // runs it: not reproduced, so not guessed.
+            let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+            if dirs.iter().any(|dir| !dir.is_absolute()) {
+                return None;
+            }
+            dirs.into_iter()
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+                .map(Codex::program)
+        }
     }
 }
 
@@ -1187,6 +1223,36 @@ mod tests {
         );
     }
 
+    /// Explicit env values are expanded the way the launch line expands
+    /// them; file values are taken as written, so a quoted `~` path or a
+    /// relative `PATH` entry is not guessed at (the reviewer's cases).
+    #[test]
+    fn profile_values_keep_their_launch_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("acct.env");
+        let profile = |env: &[(&str, &str)], file: Option<&Path>| tend::accounts::AccountProfile {
+            name: "work".into(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            env_file: file.map(|f| f.display().to_string()),
+        };
+        std::fs::write(&file, "export CODEX_HOME='~/codex'\n").unwrap();
+        assert_eq!(account_home(&[profile(&[], Some(&file))], "work", ""), None);
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            account_home(&[profile(&[("CODEX_HOME", "~/codex")], None)], "work", ""),
+            Some(PathBuf::from(format!("{home}/codex")))
+        );
+        std::fs::write(&file, "PATH='~/bin:/usr/bin:/bin'\n").unwrap();
+        assert_eq!(profile_codex(&profile(&[], Some(&file)), "codex"), None);
+        assert_eq!(
+            profile_codex(&profile(&[("PATH", "bin:/usr/bin")], None), "codex"),
+            None
+        );
+    }
+
     #[test]
     fn hooks_list_results_are_read() {
         let result = serde_json::json!({"data": [{"cwd": "/w", "hooks": [{
@@ -1259,7 +1325,10 @@ mod tests {
         drop(server);
         let homes = [a.clone(), b.clone()];
         // `b` is fixable only because `a`'s own hook is trusted.
-        let audits = audit(|_| Some(Codex::program(codex_path.clone())), &homes);
+        let audits: Vec<Audit> = audit(|_| Some(Codex::program(codex_path.clone())), &homes)
+            .into_iter()
+            .filter(|audit| audit.result != Ok((0, 0)))
+            .collect();
         assert_eq!(audits.len(), 1, "{audits:?}");
         assert_eq!(audits[0].result, Ok((1, 0)));
         // `b` shares the file but not the key: carried over once, then trusted.
@@ -1280,7 +1349,9 @@ mod tests {
                 ..Prepared::default()
             }
         );
-        assert!(audit(|_| Some(Codex::program(codex_path.clone())), &homes).is_empty());
+        assert!(audit(|_| Some(Codex::program(codex_path.clone())), &homes)
+            .iter()
+            .all(|audit| audit.result == Ok((0, 0))));
         assert_eq!(audits[0].resolved, resolved_home(&b));
     }
 }

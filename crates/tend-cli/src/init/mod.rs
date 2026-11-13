@@ -377,7 +377,8 @@ fn manages_daemon(components: &[Component]) -> bool {
 /// trusted the old ones: say which homes will ask for a review.
 fn warn_codex_hook_trust(mode: Mode, plan: &plan::Plan) {
     if plan.components.contains(&Component::CodexHooks) {
-        for line in crate::doctor::codex_hook_trust_lines(None).unwrap_or_default() {
+        let lines = crate::doctor::codex_hook_trust_lines(None).map(|(lines, _)| lines);
+        for line in lines.unwrap_or_default() {
             ui::warn_line(mode, &line);
         }
     }
