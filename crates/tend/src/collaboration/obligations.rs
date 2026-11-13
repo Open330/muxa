@@ -31,8 +31,31 @@ impl CollaborationStore {
         let requests = self.requests.read().await;
         let (mut owed, mut queued, mut waiting, mut human, mut replies) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut human_ids = std::collections::HashSet::new();
         for request in requests.values() {
             let mine = request.from.same_session(caller);
+            // A recovery question Tend opened for a request this session
+            // sent or received is also waiting on the person; name that
+            // exact action so it is reused rather than asked again.
+            if (mine || addresses(&request.to, caller)) && request.peer_interrupted() {
+                if let Some(action) = request
+                    .interruption
+                    .as_ref()
+                    .and_then(|info| info.action_request_id.as_ref())
+                    .and_then(|id| requests.get(id))
+                    .filter(|action| {
+                        action.needs_human_response()
+                            && action.parent_request_id.as_deref() == Some(request.id.as_str())
+                    })
+                {
+                    if human_ids.insert(action.id.clone()) {
+                        human.push((
+                            action.created_at,
+                            json!({"request_id": action.id, "about": request.id}),
+                        ));
+                    }
+                }
+            }
             if addresses(&request.to, caller) {
                 if request.status == RequestStatus::Claimed
                     && request.expects_reply
@@ -46,7 +69,9 @@ impl CollaborationStore {
                     queued.push((request.created_at, entry(request, &request.from)));
                 }
             } else if mine && request.to.console && request.needs_human_response() {
-                human.push((request.created_at, json!({"request_id": request.id})));
+                if human_ids.insert(request.id.clone()) {
+                    human.push((request.created_at, json!({"request_id": request.id})));
+                }
             } else if mine && request.expects_reply && !request.status.is_terminal() {
                 waiting.push((request.created_at, entry(request, &request.to)));
             } else if mine && request.reply.is_some() && request.reply_read_at.is_none() {
@@ -175,5 +200,53 @@ mod tests {
         let summary = store.obligations(&me).await.unwrap();
         assert_eq!(summary["waiting_on"]["total"], 8);
         assert_eq!(summary["waiting_on"]["listed"].as_array().unwrap().len(), 5);
+    }
+
+    /// A recovery question Tend opened (from `tend:peer-recovery`) for this
+    /// session's own request is listed as waiting on the person, so a
+    /// compacted coordinator reuses it instead of asking again.
+    #[tokio::test]
+    async fn a_recovery_question_for_my_request_is_waiting_on_the_person() {
+        use crate::{AgentKind, AgentState};
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let me = participant("me", "%1");
+        let peer = participant("peer", "%2");
+        let id = send(&store, &me, &peer).await;
+        store.claim_by_id(&peer, &id).await.unwrap();
+        let registry = crate::state::Store::shared();
+        for (session, pane) in [("me", "%1"), ("peer", "%2")] {
+            registry
+                .apply(&crate::event::AgentEvent::Started {
+                    id: crate::event::AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: session.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        tmux_socket: Some("default".into()),
+                        cwd: None,
+                    },
+                    at: time::OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+        let mut agents = registry.snapshot().await;
+        for agent in &mut agents {
+            // Both are in error, so the coordinator cannot act: Tend escalates at once.
+            agent.state = AgentState::Error;
+        }
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        let action = store.pending_human_notifications().await.remove(0);
+        assert_eq!(action.from.agent_session_id, "tend:peer-recovery");
+        let summary = store.obligations(&me).await.unwrap();
+        let human = summary["waiting_on_person"]["listed"].as_array().unwrap();
+        assert_eq!(human.len(), 1);
+        assert_eq!(human[0]["request_id"], action.id.as_str());
+        assert_eq!(human[0]["about"], id.as_str());
+        // The interrupted peer sees the same action.
+        let theirs = store.obligations(&peer).await.unwrap();
+        assert_eq!(
+            theirs["waiting_on_person"]["listed"][0]["request_id"],
+            action.id.as_str()
+        );
     }
 }

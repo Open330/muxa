@@ -361,7 +361,9 @@ fn obligations_text(summary: &serde_json::Value) -> String {
         }
     }
     lines.push(
-        "Finish owed work with one tend_reply each; do not resend requests you are waiting on."
+        "Re-read an owed request with tend_inbox(view=all, request_id, include_body=true) before \
+         acting; finish each with one tend_reply. Do not resend requests you are waiting on, and \
+         reuse an existing question to the person instead of asking again."
             .into(),
     );
     lines.join("\n")
