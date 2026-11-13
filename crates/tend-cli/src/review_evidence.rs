@@ -116,6 +116,7 @@ mod tests {
                 command: "cargo test".into(),
                 passed: Some(false),
                 tail: Some("boom".into()),
+                verified: false,
             },
             Evidence::Commit {
                 sha: "abc123".into(),

@@ -191,7 +191,7 @@ pub(crate) fn definitions() -> Vec<Value> {
     }
     vec![serde_json::json!({
         "name": FILE_RESULT_TOOL,
-        "description": "File the durable result record for finished work: what you did, the decision the person needs to make (if any), the options, your recommendation and evidence (commits, PR, tests). It becomes an open review item the person decides from (`tend review show`); it does not wait for an answer and is not approval. The record targets your managed Work alias when you run in one, else your session. Call it once when you finish a result someone must look at; inside a pipeline, `tend work done --summary ...` files the same record and completes the alias.",
+        "description": "File the durable result record for finished work: what you did, the decision the person needs to make (if any), the options, your recommendation and evidence (commits, PR, tests). It becomes an open review item the person decides from (`tend review show`); it does not wait for an answer and is not approval. The record targets your managed Work alias when you run in one, else your session. If your Work declares checks, tend runs them first: a failure returns checks_failed with each check's output and files nothing, so fix and call again. Call it once when you finish a result someone must look at; inside a pipeline, `tend work done --summary ...` files the same record and completes the alias.",
         "inputSchema": {
             "type": "object",
             "properties": properties,
@@ -361,7 +361,8 @@ mod tests {
             Evidence::Test {
                 command: "cargo test".into(),
                 passed: Some(true),
-                tail: Some("ok".into())
+                tail: Some("ok".into()),
+                verified: false,
             }
         );
         assert_eq!(args["body"], "Merge #12?");

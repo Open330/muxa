@@ -71,6 +71,11 @@ pub enum Evidence {
         /// The last lines of its output, cleaned by [`clean_tail`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tail: Option<String>,
+        /// tend itself ran this check (a Work's declared check) rather
+        /// than the agent reporting it. Set only by tendd: a client's claim
+        /// is cleared on the way in.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        verified: bool,
     },
     /// A file or directory.
     Path { path: String },
@@ -147,11 +152,7 @@ impl Evidence {
                 }
                 repo.as_deref().map_or(Ok(()), check_repo)
             }
-            Self::Test {
-                command,
-                passed: _,
-                tail,
-            } => {
+            Self::Test { command, tail, .. } => {
                 check("test command", command, MAX_LOCATOR_BYTES, Text::Line)?;
                 tail.as_deref().map_or(Ok(()), |t| {
                     check("test tail", t, MAX_TAIL_BYTES, Text::Prose)
@@ -188,6 +189,7 @@ impl Evidence {
                         _ => None,
                     },
                     tail: None,
+                    verified: false,
                 },
                 "path" => Self::Path { path: value },
                 other => return Err(format!("unknown evidence kind {other:?}")),
@@ -218,12 +220,22 @@ impl Evidence {
                 None => format!("diff {range}"),
             },
             Self::Test {
-                command, passed, ..
-            } => match passed {
-                Some(true) => format!("test passed: {command}"),
-                Some(false) => format!("test FAILED: {command}"),
-                None => format!("test: {command}"),
-            },
+                command,
+                passed,
+                verified,
+                ..
+            } => {
+                let by = if *verified {
+                    "check (run by tend)"
+                } else {
+                    "test"
+                };
+                match passed {
+                    Some(true) => format!("{by} passed: {command}"),
+                    Some(false) => format!("{by} FAILED: {command}"),
+                    None => format!("{by}: {command}"),
+                }
+            }
             Self::Path { path } => format!("path {path}"),
         }
     }

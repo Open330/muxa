@@ -3932,6 +3932,15 @@ impl CollaborationStore {
         self.read_for(caller, request_id, true).await
     }
 
+    /// The Work a request was sent for (`workspace_id`, `work_id`), if it
+    /// names one. Used to verify a result filed against the request with
+    /// that Work's declared checks.
+    pub async fn request_work(&self, request_id: &str) -> Option<(String, String)> {
+        let requests = self.requests.read().await;
+        let request = requests.get(request_id)?;
+        Some((request.workspace_id.clone()?, request.work_id.clone()?))
+    }
+
     /// Observe instructions/progress without acknowledging an unseen reply.
     pub async fn peek_for(
         &self,

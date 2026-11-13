@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the session CSRF proof; repeats change nothing; each decision names who
   made it (`web:<email>`) and is audited to `dashboard-decisions.jsonl`.
   Dashboard pages can no longer be framed by other sites.
+- tendd verifies a result before the person sees it. When an agent files a
+  result (`tend_file_result`, `tend work done --summary`) on a Work with
+  declared checks, or on a request sent for one, or completes it with
+  `tend work done`, tendd runs the checks in the Work's directory (time limit
+  per check and in total, last 40 lines of output kept). All passing: the
+  record carries each as evidence marked as run by tend (`"verified": true`).
+  Any failing: nothing is filed, the Work stays in progress, and the agent
+  gets `checks_failed` with the output.
 - The web dashboard has a "Needs you" page (`/needs`, linked from the top
   bar): the decision queue and its history, phone-first, from the same daemon
   reads as `tend review queue` and the Mac app. Operator-only:

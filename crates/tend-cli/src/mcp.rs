@@ -3768,6 +3768,19 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
         Ok(value) => value,
         Err(error) => return error_result(&format!("tend_start_work failed: {error}")),
     };
+    if !up.dry_run {
+        if let Err(error) = crate::work_backlog::bind_verification(
+            client,
+            &tend::work::WorkIdentity::new(resolved.workspace.clone(), resolved.work.clone()),
+            acceptance,
+            checks,
+            &resolved.cwd,
+        )
+        .await
+        {
+            return error_result(&format!("tend_start_work: {error:#}"));
+        }
+    }
     let result = if up.dry_run {
         match tokio::task::spawn_blocking(move || {
             crate::mux_control::with_endpoint(endpoint, || crate::work_up::apply(resolved, true))
@@ -3793,21 +3806,6 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
             Err(error) => return error_result(&format!("tend_start_work worker failed: {error}")),
         }
     };
-    if !result.dry_run {
-        if let Err(error) = crate::work_backlog::declare_verification(
-            client,
-            &tend::work::WorkIdentity::new(result.workspace.clone(), result.work.clone()),
-            acceptance,
-            checks,
-            &result.cwd,
-        )
-        .await
-        {
-            return error_result(&format!(
-                "tend_start_work started the Work but could not record its acceptance or checks: {error:#}"
-            ));
-        }
-    }
     match serde_json::to_value(&result) {
         Ok(value) => json_result(&value),
         Err(error) => error_result(&format!("tend_start_work could not serialize: {error}")),

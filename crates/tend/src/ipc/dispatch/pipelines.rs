@@ -30,9 +30,19 @@ pub(super) async fn handle(
             generation,
         } => {
             *kind = "pipeline_done";
-            match pipeline_runs.done(&identity, &alias, generation).await {
-                Ok(run) => Response::with_pipeline_run(run),
-                Err(error) => Response::err(error.to_string()),
+            // A Work with declared checks completes only once they pass,
+            // run now: a pass from before cannot show the work being
+            // completed is the work that was checked.
+            match Box::pin(crate::work_verify::verify(&ctx.work_store, &identity)).await {
+                crate::work_verify::Gate::Failed(outcomes) => {
+                    Response::err(crate::work_verify::refusal(&outcomes))
+                }
+                crate::work_verify::Gate::NoChecks | crate::work_verify::Gate::Passed(_) => {
+                    match pipeline_runs.done(&identity, &alias, generation).await {
+                        Ok(run) => Response::with_pipeline_run(run),
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
             }
         }
         RequestBody::PipelineInvalidate {
