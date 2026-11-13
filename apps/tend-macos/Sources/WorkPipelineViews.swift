@@ -715,7 +715,6 @@ func agentProgramTint(_ program: String) -> Color {
     switch program.lowercased() {
     case "claude": .orange
     case "codex": .green
-    case "gemini": .blue
     case "opencode": .purple
     case "agy": .teal
     default: .secondary

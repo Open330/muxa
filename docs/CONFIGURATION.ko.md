@@ -229,16 +229,15 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 `timeout_secs` 기본값은 persistent worker를 준비하는 skill을 고려해 30분입니다.
 이 제한에 도달하면 headless agent 프로세스가 종료됩니다. inactivity timeout이 아닌
 전체 wall-clock 안전 제한입니다. `plan`은 읽기 전용 모드입니다(claude
-`--permission-mode plan`, codex `--sandbox read-only`, gemini `--approval-mode
-plan`). `tend work compose`는 항상 이 모드로 초안을 만듭니다.
+`--permission-mode plan`, codex `--sandbox read-only`). `tend work compose`는
+항상 이 모드로 초안을 만듭니다.
 
 ### Provider
 
 **engine**은 provider를 구동하는 코드입니다. CLI가 받는 argv, API가 돌려주는
-JSON, 키가 담긴 환경 변수가 여기에 있습니다. 여섯 개로 고정되어 있습니다.
-`claude`, `codex`, `gemini`는 agent CLI를 print 모드(`claude -p`, `codex exec
---json`, `gemini -p --output-format json`)로 실행하고 질문 사이에 자체 세션을
-resume합니다. `anthropic`과 `openai`는 Messages API와 Chat Completions API를
+JSON, 키가 담긴 환경 변수가 여기에 있습니다. 다섯 개로 고정되어 있습니다.
+`claude`, `codex`는 agent CLI를 print 모드(`claude -p`, `codex exec --json`)로
+실행하고 질문 사이에 자체 세션을 resume합니다. `anthropic`과 `openai`는 Messages API와 Chat Completions API를
 HTTPS로 직접 호출합니다. `apple`은 Mac 자체의 Foundation Models를 실행합니다.
 API engine은 resume할 세션이 없으므로 tendd가 자기 이력에서 그 대화의 이전
 턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
@@ -278,7 +277,7 @@ host가 함께 쓸 수 있고, 실행할 수 없는 host에서 턴을 보내면 
 실행됩니다"라는 명확한 오류로 실패합니다.
 
 **provider**는 직접 구성하는 `[ask.providers.<id>]` 테이블입니다. id는 원하는
-대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 여섯 중 무엇으로
+대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 다섯 중 무엇으로
 구동할지 정합니다. 여러 provider가 같은 engine을 공유할 수 있어 업무용과 개인용
 OpenAI 계정, Anthropic 키 두 개, 두 번째 `claude` 바이너리를 나란히 둘 수
 있습니다. 각각 자기 대화를 따로 유지하므로 provider를 바꿔도 새로 시작하지 않고
@@ -292,8 +291,14 @@ engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어�
 `[ask.providers.anthropic] model = "…"`이 지금도 같은 의미인 이유입니다. 그런
 테이블을 제거하면 설정만 지워지고 내장 provider는 그대로 남습니다.
 
+`gemini` engine(Gemini CLI, `gemini -p`)은 제거되었습니다. 이 engine을 가리키는
+설정도 그대로 로드됩니다. `[ask] agent = "gemini"`이면 `claude`로 시작하고,
+이 engine을 쓰는 `[ask.providers.<id>]` 테이블은 provider 목록에 나오지 않습니다.
+tendd가 해당 항목마다 경고를 남기니 지우거나 `tend ask provider remove <id>`로
+테이블을 제거하세요. 예전 Gemini 답변은 Ask 기록에 남습니다.
+
 API 키는 순서대로 client가 보낸 1회용 키, tendd 환경의 engine 고유 변수
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; CLI는 `CODEX_API_KEY`, `GEMINI_API_KEY`),
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; Codex CLI는 `CODEX_API_KEY`),
 그다음 그 provider의 `api_key_env`가 가리키는 변수에서 읽습니다. 키 자체는
 config.toml에 절대 쓰지 않습니다. 같은 engine을 쓰는 provider 둘은 engine 변수를
 공유하므로, 서로 다른 계정을 써야 한다면 각각 `api_key_env`를 지정하세요(또는
@@ -319,7 +324,7 @@ tend ask provider set anthropic --clear-model         # 생략한 플래그의 �
 tend ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
 ```
 
-`add`는 이미 있는 id, TOML bare key가 아닌 id, 여섯 중에 없는 engine, 그리고 다른
+`add`는 이미 있는 id, TOML bare key가 아닌 id, 다섯 중에 없는 engine, 그리고 다른
 engine을 쓰려는 내장 id를 거부합니다. engine은 추가 시점에 고정됩니다. `set`은
 title·model·키 변수·바이너리를 바꾸고, engine을 바꾸려면 provider를 제거한 뒤 다시
 추가해야 합니다. 진행 중인 대화가 `claude` 세션 id를 `codex`에서 resume할 수는

@@ -23,9 +23,9 @@ import Testing
     #expect(TendAgentLogoAsset(kind: "claude_code") == .claude)
     #expect(TendAgentLogoAsset(kind: "claude") == .claude)
     #expect(TendAgentLogoAsset(kind: "codex") == .openai)
-    // Gemini CLI is no longer an agent kind; only the Ask engine keeps the sparkle.
+    // Neither the Gemini CLI agent kind nor its Ask engine exists any more.
     #expect(TendAgentLogoAsset(kind: "gemini_cli") == nil)
-    #expect(AskProviderEngine.gemini.logo == .gemini)
+    #expect(TendAgentLogoAsset(rawValue: "gemini") == nil)
     #expect(TendAgentLogoAsset(kind: "antigravity") == .antigravity)
     #expect(TendAgentLogoAsset(kind: "agy") == .antigravity)
     #expect(TendAgentLogoAsset(kind: "opencode") == .opencode)

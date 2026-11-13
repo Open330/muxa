@@ -126,6 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagrees with them leaves the agent alone, and so does a verified plan
   whose record cannot be read again right before the stop.
 
+### Removed
+
+- The `gemini` engine for `tend ask` (headless `gemini -p`, `GEMINI_API_KEY`),
+  the last use of the Gemini CLI. A config written for it still loads with a
+  warning: `[ask] agent = "gemini"` starts on `claude`, and an
+  `[ask.providers.<id>]` table on the engine lists as no provider and can be
+  removed with `tend ask provider remove <id>`. Earlier Gemini answers stay in
+  Ask history; asking in one of those conversations says the provider was
+  retired. Tend for Mac drops the engine from its provider list.
+
 ### Fixed
 
 - opencode works with tend on macOS and with opencode 2.x, checked against

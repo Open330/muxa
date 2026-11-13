@@ -526,7 +526,7 @@ pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
 pub struct AskConfig {
     pub enabled: bool,
     /// Provider instance the next question goes to. Either one of the
-    /// built-in ids — `claude`, `codex`, `gemini` (agent CLIs),
+    /// built-in ids — `claude`, `codex` (agent CLIs),
     /// `anthropic`, `openai` (HTTPS APIs), or `apple` (the Mac's own
     /// Foundation Models) — or the id of an
     /// `[ask.providers.<id>]` instance the operator added. See
@@ -558,6 +558,27 @@ pub struct AskConfig {
     pub providers: BTreeMap<String, AskProviderConfig>,
 }
 
+impl AskConfig {
+    /// Config paths that name a removed ask engine: `ask.agent` when it
+    /// selects such a provider, and each `ask.providers.<id>` table built on
+    /// one. They load, drive nothing, and are reported by
+    /// `Config::warn_soft_issues`.
+    #[must_use]
+    pub fn retired_entries(&self) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        if crate::ask::startup_agent(&self.agent, &self.providers) != self.agent {
+            paths.push("ask.agent".into());
+        }
+        paths.extend(
+            self.providers
+                .iter()
+                .filter(|(id, provider)| crate::ask::is_retired_provider(id, Some(provider)))
+                .map(|(id, _)| format!("ask.providers.{id}")),
+        );
+        paths
+    }
+}
+
 impl Default for AskConfig {
     fn default() -> Self {
         Self {
@@ -578,8 +599,7 @@ impl Default for AskConfig {
 ///
 /// The table id is the instance's name on the wire, in `[ask] agent`, and
 /// in `tend ask --agent`. `engine` names the closed set of code that
-/// drives it (`claude`, `codex`, `gemini`, `anthropic`, `openai`,
-/// `apple`), so the
+/// drives it (`claude`, `codex`, `anthropic`, `openai`, `apple`), so the
 /// operator can keep several instances of one engine side by side — a
 /// work and a personal `OpenAI` account, two Anthropic keys, a second
 /// `claude` binary — each with its own key.
@@ -1774,6 +1794,14 @@ impl Config {
                 crate::agent_control::RETIRED_GEMINI_NOTE,
             );
         }
+        for path in self.ask.retired_entries() {
+            tracing::warn!(
+                path = %path,
+                "config.toml: the Gemini CLI ask engine was removed; this entry no longer applies \
+                 and can be removed (tend ask uses `{}` instead until another provider is chosen)",
+                AskConfig::default().agent,
+            );
+        }
         if !self.unknown.is_empty() {
             // A newer tend wrote a section this build does not know, or a
             // top-level table is misspelled. Either way, running on the
@@ -1920,6 +1948,11 @@ fn validate_ask(cfg: &AskConfig) -> std::result::Result<(), ConfigError> {
             return Err(invalid(
                 "a provider id must be a TOML bare key: letters, digits, `-`, or `_`".into(),
             ));
+        }
+        if crate::ask::is_retired_provider(id, Some(provider)) {
+            // Written for a tend that still shipped the Gemini CLI engine.
+            // Loads with a warning (`warn_soft_issues`) and drives nothing.
+            continue;
         }
         let builtin = crate::ask::builtin_engine(id);
         match provider.engine.as_deref() {
@@ -2783,6 +2816,53 @@ options = ["--model", "gpt-5-codex"]
         // Written back unchanged, so the rule never widens to "any agent".
         let back = toml::to_string(&cfg.automation).unwrap();
         assert!(back.contains("\"gemini_cli\""), "{back}");
+    }
+
+    #[test]
+    fn an_ask_config_naming_the_removed_gemini_engine_still_loads() {
+        // `[ask] agent = "gemini"` plus a tuned built-in table and a
+        // composed instance on the engine: all three were valid before the
+        // engine went away, and none may stop the daemon now.
+        let cfg: Config = toml::from_str(
+            "[ask]\nagent = \"gemini\"\n\
+             [ask.providers.gemini]\nmodel = \"gemini-2.5-pro\"\n\
+             [ask.providers.gem-work]\nengine = \"gemini\"\n\
+             [ask.providers.codex]\nmodel = \"gpt-5-codex\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        cfg.warn_soft_issues();
+        assert_eq!(
+            cfg.ask.retired_entries(),
+            [
+                "ask.agent",
+                "ask.providers.gem-work",
+                "ask.providers.gemini"
+            ]
+        );
+        let ids: Vec<String> = crate::ask::provider_instances(&cfg.ask.providers)
+            .into_iter()
+            .map(|instance| instance.id)
+            .collect();
+        assert!(!ids.iter().any(|id| id.starts_with("gem")), "{ids:?}");
+        assert!(ids.contains(&"codex".to_string()));
+        assert_eq!(
+            crate::ask::startup_agent(&cfg.ask.agent, &cfg.ask.providers),
+            "claude"
+        );
+
+        // A composed instance merely *called* gemini but on another engine
+        // is an ordinary provider now that the id is no longer built in.
+        let cfg: Config = toml::from_str(
+            "[ask]\nagent = \"gemini\"\n[ask.providers.gemini]\nengine = \"codex\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.ask.retired_entries().is_empty());
+        assert_eq!(
+            crate::ask::startup_agent(&cfg.ask.agent, &cfg.ask.providers),
+            "gemini"
+        );
     }
 
     #[test]

@@ -413,7 +413,6 @@ extension AppModel {
         case "claude", "anthropic": "ANTHROPIC_API_KEY"
         case "codex": "CODEX_API_KEY"
         case "openai": "OPENAI_API_KEY"
-        case "gemini": "GEMINI_API_KEY"
         default: nil
         }
     }

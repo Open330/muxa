@@ -420,7 +420,7 @@ which release a user is running.
 
 ## Headless providers and API keys
 
-Global Ask uses the installed `claude`, `codex`, and `gemini` CLIs in their
+Global Ask uses the installed `claude` and `codex` CLIs in their
 structured non-interactive modes, the Anthropic and OpenAI APIs with a key, or
 Apple Intelligence through the bundled `tend-afm` helper on macOS 26 or later
 (see [Configuration](CONFIGURATION.md)). The app augments a GUI-launched tendd PATH with

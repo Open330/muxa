@@ -91,7 +91,7 @@ If a task has disappeared from live metadata, use historical search below,
 then look up the resulting agent session ID. An empty live result does not mean
 the historical work never happened.
 
-New `tend ask` conversations using Claude, Codex or Gemini are guided to this
+New `tend ask` conversations using Claude or Codex are guided to this
 lookup first. Existing conversations retain their original guidance; start with
 `tend ask --new 'ENG-8226 작업하던 에이전트 위치 찾아줘'` after updating tendd.
 Direct API providers do not have shell/MCP workspace tools; this change does not

@@ -199,7 +199,7 @@ enum Cmd {
         action: MsgCmd,
     },
     /// Ask a headless provider and print the durable reply. The built-ins
-    /// are claude, codex, gemini, anthropic, and openai — plus apple on a
+    /// are claude, codex, anthropic, and openai — plus apple on a
     /// Mac; add your own with `tend ask provider add`, and `tend ask
     /// providers` lists every one the daemon can drive.
     #[command(args_conflicts_with_subcommands = true)]
@@ -823,7 +823,6 @@ enum MsgCmd {
 enum AskEngineArg {
     Claude,
     Codex,
-    Gemini,
     Anthropic,
     #[value(name = "openai")]
     OpenAi,
@@ -836,7 +835,6 @@ impl AskEngineArg {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::Apple => "apple",

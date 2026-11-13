@@ -6,7 +6,7 @@ runs or asks. They are third-party trademarks:
 - Claude and the Claude logo, and Anthropic and the Anthropic symbol, are
   trademarks of Anthropic, PBC.
 - OpenAI, Codex and the OpenAI blossom are trademarks of OpenAI.
-- Gemini, Antigravity and their logos are trademarks of Google LLC.
+- Antigravity and its logo are trademarks of Google LLC.
 - OpenCode and the OpenCode logo are trademarks of Anomaly.
 
 **These marks are not covered by Tend's software licence** (MIT OR
@@ -34,7 +34,7 @@ drawn on its own, with no coloured disc behind it.
   side. It grows in 4×5 steps. In smaller slots, Tend shows the name
   "OpenCode" or a terminal symbol instead of the mark. No current slot in
   the app is that large, so OpenCode always appears as its name.
-- **No mono variants.** Claude, Gemini and Antigravity publish no
+- **No mono variants.** Claude and Antigravity publish no
   one-colour version. They appear in their colours everywhere, including
   the menu bar.
 
@@ -45,7 +45,6 @@ All files were fetched on 2026-11-12.
 | `claude` | `claude.svg` | Anthropic press kit (https://www.anthropic.com/press-kit, ZIP): `Anthropic media resources/Anthropic logos/Claude logos/3 Claude Spark/SVG/Claude Spark - Clay.svg`, the Clay spark. |
 | `anthropic` | `anthropic.svg` (light), `anthropic-dark.svg` (dark) | Same press kit: `Anthropic logos/Anthropic logos/2 Anthropic symbol/SVG/Anthropic symbol - Slate.svg` and `Anthropic symbol - Ivory.svg`. |
 | `openai` | `openai.svg` (template; drawn black or white) | OpenAI's `OpenAI-black-monoblossom.svg`, as published in OpenAI's own repository: https://github.com/openai/build-hours/blob/47516cc96e653b9383b38ddc4358044f281c3b8d/13-image-gen/imagegen-demo/public/OpenAI-black-monoblossom.svg. Used for Codex and for the OpenAI API engine. |
-| `gemini` | `gemini.svg` | The Gemini sparkle served by gemini.google.com: https://www.gstatic.com/lamda/images/gemini_sparkle_aurora_33f86dc0c0257da337c63.svg. Used only for the Gemini Ask engine. Gemini CLI is no longer an agent kind. |
 | `antigravity` | `antigravity.png` | https://antigravity.google/assets/image/antigravity-logo.png (276×276, uncropped). It is a PNG because the vector mark on the same site gets its colours from blur filters that the asset catalog's SVG renderer cannot draw. |
 | `opencode` | `opencode.svg` (light), `opencode-dark.svg` (dark) | https://opencode.ai/brand/files/opencode-logo-transparent-light.svg and https://opencode.ai/brand/files/opencode-logo-transparent-dark.svg, the "Default" logo, light version for light grounds and dark version for dark ones. |
 
@@ -55,7 +54,7 @@ All files were fetched on 2026-11-12.
   alterations of our trademarks (changes to color, font, proportion, or
   otherwise) are permitted."
 - OpenAI: https://openai.com/brand
-- Google (Gemini, Antigravity):
+- Google (Antigravity):
   https://about.google/brand-resource-center/rules/. "Don't remove,
   distort, or alter any element of a Google Brand Feature."
 - OpenCode: https://opencode.ai/brand. The minimum size, scaling steps and

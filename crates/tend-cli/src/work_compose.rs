@@ -43,7 +43,7 @@ pub async fn run(args: ComposeArgs, config: &Config) -> Result<()> {
     let agent = args
         .agent
         .clone()
-        .unwrap_or_else(|| config.ask.agent.clone());
+        .unwrap_or_else(|| tend::ask::startup_agent(&config.ask.agent, &config.ask.providers));
     let cwd = config
         .ask
         .cwd

@@ -5,9 +5,9 @@
 //! `claude`/`codex` TUI alive and typing into it is the obvious shape, and
 //! it does not work: a TUI gives no machine-readable "the answer ends
 //! here", so reading a reply back means screen-scraping a moving target.
-//! Print mode (`claude -p --output-format stream-json`, `codex exec --json`,
-//! `gemini -p --output-format json`) answers with structured output and an
-//! exit code — completion is a fact, not a guess.
+//! Print mode (`claude -p --output-format stream-json`, `codex exec --json`)
+//! answers with structured output and an exit code — completion is a fact,
+//! not a guess.
 //!
 //! **Resumable turns.** The CLIs resume a prior conversation by id rather
 //! than rediscovering it from scratch. This does not bound model/tool latency;
@@ -30,7 +30,7 @@
 //! engine, with its own title, model, key variable, and binary. Two
 //! instances can share an engine — a work and a personal `OpenAI` account,
 //! two Anthropic keys, a second `claude` binary — and each keeps its own
-//! conversation. The six engine ids are also instances of themselves, so
+//! conversation. The five engine ids are also instances of themselves, so
 //! a fresh install works with no `[ask.providers]` at all and an existing
 //! `[ask.providers.anthropic] model = "…"` keeps overriding the built-in.
 //!
@@ -96,7 +96,10 @@ pub enum AskError {
     ConversationNotFound(String),
     #[error("ask provider {0:?} is not configured; `tend ask providers` lists the ones that are")]
     UnsupportedAgent(String),
-    #[error("ask engine {0:?} is not supported (use claude, codex, gemini, anthropic, or openai)")]
+    /// The id names the Gemini CLI engine, which tend no longer drives.
+    #[error("ask provider {0:?} ran on the Gemini CLI, which tend no longer supports; pick another with `tend ask providers`")]
+    RetiredProvider(String),
+    #[error("ask engine {0:?} is not supported (use claude, codex, anthropic, openai, or apple)")]
     UnknownEngine(String),
     #[error("ask provider id {0:?} must be a TOML bare key: letters, digits, `-`, or `_`")]
     InvalidProviderId(String),
@@ -548,11 +551,10 @@ impl AskStore {
     /// than starting over, and two instances of one engine stay two
     /// separate conversations.
     pub async fn set_agent(&self, agent: &str) -> Result<String, AskError> {
-        let label = self
-            .instance(agent)
-            .await
-            .ok_or_else(|| AskError::UnsupportedAgent(agent.to_string()))?
-            .id;
+        let Some(instance) = self.instance(agent).await else {
+            return Err(self.unsupported(agent).await);
+        };
+        let label = instance.id;
         let mut selected = self.agent.write().await;
         let changed = *selected != label;
         selected.clone_from(&label);
@@ -570,10 +572,9 @@ impl AskStore {
         &self,
         provider: &str,
     ) -> Result<Vec<AskProviderInfo>, AskError> {
-        let instance = self
-            .instance(provider)
-            .await
-            .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
+        let Some(instance) = self.instance(provider).await else {
+            return Err(self.unsupported(provider).await);
+        };
         let path = self
             .opts
             .config_path
@@ -602,6 +603,11 @@ impl AskStore {
         provider_instances(&providers)
     }
 
+    /// Why no instance answers to `id`.
+    async fn unsupported(&self, id: &str) -> AskError {
+        unsupported_agent(id, &*self.providers.read().await)
+    }
+
     /// The instance `id` names, or `None` when nothing answers to it.
     pub async fn instance(&self, id: &str) -> Option<AskProviderInstance> {
         let instances = self.instances().await;
@@ -624,10 +630,9 @@ impl AskStore {
         provider: &str,
         edit: AskProviderEdit,
     ) -> Result<Vec<AskProviderInfo>, AskError> {
-        let instance = self
-            .instance(provider)
-            .await
-            .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
+        let Some(instance) = self.instance(provider).await else {
+            return Err(self.unsupported(provider).await);
+        };
         let path = self
             .opts
             .config_path
@@ -689,12 +694,25 @@ impl AskStore {
     /// first usable provider, in config too when `[ask] agent` named it: a
     /// daemon left selecting a provider that no longer exists would refuse
     /// every question with nothing on screen saying why.
+    ///
+    /// A table on a removed engine lists as no provider, yet it is still in
+    /// the file; it can be removed by its exact id, so a client can clear
+    /// what the load warning names.
     pub async fn remove_provider(&self, provider: &str) -> Result<Vec<AskProviderInfo>, AskError> {
-        let instance = self
-            .instance(provider)
+        let retired = self
+            .providers
+            .read()
             .await
-            .ok_or_else(|| AskError::UnsupportedAgent(provider.to_string()))?;
-        let id = instance.id.clone();
+            .get(provider.trim())
+            .is_some_and(|config| is_retired_provider(provider.trim(), Some(config)));
+        let id = if retired {
+            provider.trim().to_string()
+        } else {
+            let Some(instance) = self.instance(provider).await else {
+                return Err(self.unsupported(provider).await);
+            };
+            instance.id
+        };
         if !self.providers.read().await.contains_key(&id) {
             return Err(AskError::BuiltinProviderRemoval(id));
         }
@@ -705,21 +723,28 @@ impl AskStore {
             .ok_or_else(|| AskError::NoConfigPath(id.clone()))?;
         let _guard = self.write_lock.lock().await;
         let selected = self.agent.read().await.clone();
-        let fallback = if selected == id {
-            let mut remaining = self.providers.read().await.clone();
-            remaining.remove(&id);
-            Some(provider_instances(&remaining).first().map_or_else(
+        let mut remaining = self.providers.read().await.clone();
+        remaining.remove(&id);
+        let usable = provider_instances(&remaining);
+        // The selection survives only if it still names a usable instance.
+        // Otherwise (it named the removed table, or a retired id resumed from
+        // history) it falls back to the first usable provider. A retired
+        // table may also be what `[ask] agent` names in the file even though
+        // the daemon started on the default, so that is repointed too.
+        let next = if selected != id && find_instance(&usable, &selected).is_some() {
+            selected.clone()
+        } else {
+            usable.first().map_or_else(
                 || AskEngine::Claude.id().to_string(),
                 |first| first.id.clone(),
-            ))
-        } else {
-            None
+            )
         };
+        let fallback = (retired || selected == id || next != selected).then(|| next.clone());
         let config =
             remove_provider_config(&path, &id, fallback.as_deref()).map_err(AskError::Io)?;
         *self.providers.write().await = config.ask.providers;
-        if let Some(fallback) = fallback {
-            self.agent.write().await.clone_from(&fallback);
+        if next != selected {
+            self.agent.write().await.clone_from(&next);
         }
         self.publish_change();
         Ok(self.providers().await)
@@ -852,7 +877,7 @@ impl AskStore {
         let selected = self.agent.read().await.clone();
         let instances = self.instances().await;
         let Some(provider) = find_instance(&instances, &selected).cloned() else {
-            return Err(AskError::UnsupportedAgent(selected));
+            return Err(unsupported_agent(&selected, &*self.providers.read().await));
         };
         let credential_key = take_credential(&instances, &provider, credential)?;
 
@@ -925,12 +950,7 @@ impl AskStore {
         let store = Arc::clone(self);
         let id = entry.id.clone();
         let mut prompt = prompt.to_string();
-        if resume.is_none()
-            && matches!(
-                engine,
-                AskEngine::Claude | AskEngine::Codex | AskEngine::Gemini
-            )
-        {
+        if resume.is_none() && matches!(engine, AskEngine::Claude | AskEngine::Codex) {
             prompt.insert_str(0, FIRST_TURN_GUIDANCE);
         }
         if resume.is_none()
@@ -1045,9 +1065,9 @@ impl AskStore {
             None => self.agent.read().await.clone(),
         };
         let instances = self.instances().await;
-        let provider = find_instance(&instances, &selected)
-            .cloned()
-            .ok_or_else(|| AskError::UnsupportedAgent(selected.clone()))?;
+        let Some(provider) = find_instance(&instances, &selected).cloned() else {
+            return Err(unsupported_agent(&selected, &*self.providers.read().await));
+        };
         let credential_key = take_credential(&instances, &provider, credential)?;
         let api_key = resolve_api_key(&provider, credential_key, |name| std::env::var(name).ok());
         provider
@@ -1431,7 +1451,7 @@ pub struct OneShot<'a> {
 /// built on them are not: a new instance is config, a new engine is code.
 #[must_use]
 pub fn supported_agents() -> &'static [&'static str] {
-    &["claude", "codex", "gemini", "anthropic", "openai", "apple"]
+    &["claude", "codex", "anthropic", "openai", "apple"]
 }
 
 /// The engine a built-in provider id drives, or `None` for an id the
@@ -1555,7 +1575,9 @@ pub fn resolve_instance(id: &str, config: &AskProviderConfig) -> Option<AskProvi
 /// end as the floor a fresh install runs on. An entry that resolves to
 /// nothing is skipped rather than dropped silently — `Config::validate`
 /// refuses to load one, so reaching here means the file was edited under
-/// a running daemon.
+/// a running daemon. The exception is an entry on a removed engine
+/// ([`is_retired_provider`]): config loads it with a warning, and it is
+/// left out here.
 #[must_use]
 pub fn provider_instances(
     providers: &BTreeMap<String, AskProviderConfig>,
@@ -1564,7 +1586,9 @@ pub fn provider_instances(
     for (id, config) in providers {
         if let Some(instance) = resolve_instance(id, config) {
             instances.push(instance);
-        } else {
+        } else if !is_retired_provider(id, Some(config)) {
+            // A retired engine's entry is warned about once, at config
+            // load; this runs on every listing.
             tracing::warn!(
                 provider = %id,
                 "[ask.providers] entry names no usable engine — skipping it",
@@ -1605,6 +1629,61 @@ pub fn find_instance<'a>(
                 .iter()
                 .find(|instance| instance.id.eq_ignore_ascii_case(wanted))
         })
+}
+
+/// Engine name of the removed headless Gemini CLI engine (`gemini -p`).
+/// A config or history written before the removal may still name it.
+pub const RETIRED_GEMINI_ENGINE: &str = "gemini";
+
+/// Whether `name` is an ask engine tend used to ship and has removed.
+#[must_use]
+pub fn is_retired_engine(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(RETIRED_GEMINI_ENGINE)
+}
+
+/// Whether `[ask.providers.<id>]` (or a bare id with no table) describes a
+/// provider on a removed engine: it names one, or it is the removed
+/// engine's own built-in id and names none. Such an entry still loads, with
+/// a warning, and is left out of the provider list.
+#[must_use]
+pub fn is_retired_provider(id: &str, config: Option<&AskProviderConfig>) -> bool {
+    match config.and_then(|config| config.engine.as_deref()) {
+        Some(engine) => is_retired_engine(engine),
+        None => is_retired_engine(id),
+    }
+}
+
+/// The error for an id no instance answers to: a plain "not configured",
+/// or, when the id is a provider on a removed engine, one that says so.
+fn unsupported_agent(id: &str, providers: &BTreeMap<String, AskProviderConfig>) -> AskError {
+    let id = id.trim();
+    let config = providers.get(id).or_else(|| {
+        providers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(id))
+            .map(|(_, config)| config)
+    });
+    if is_retired_provider(id, config) {
+        AskError::RetiredProvider(id.to_string())
+    } else {
+        AskError::UnsupportedAgent(id.to_string())
+    }
+}
+
+/// The provider a daemon starts selecting for `[ask] agent`. A retired
+/// provider would refuse every question until someone picked another, so
+/// the daemon starts on the default instead; `Config` warns about the
+/// entry at load.
+#[must_use]
+pub fn startup_agent(agent: &str, providers: &BTreeMap<String, AskProviderConfig>) -> String {
+    if matches!(
+        unsupported_agent(agent, providers),
+        AskError::RetiredProvider(_)
+    ) {
+        crate::config::AskConfig::default().agent
+    } else {
+        agent.to_string()
+    }
 }
 
 /// `anthropic-work` -> `Anthropic Work`. What a composed instance is called
@@ -1652,8 +1731,12 @@ pub async fn one_shot_configured(
         return Err(AskError::EmptyPrompt);
     }
     let settings = provider_config.cloned().unwrap_or_default();
-    let instance = resolve_instance(request.agent.trim(), &settings)
-        .ok_or_else(|| AskError::UnsupportedAgent(request.agent.to_string()))?;
+    let Some(instance) = resolve_instance(request.agent.trim(), &settings) else {
+        return Err(unsupported_agent(
+            request.agent,
+            &BTreeMap::from([(request.agent.trim().to_string(), settings)]),
+        ));
+    };
     let api_key = resolve_api_key(&instance, None, |name| std::env::var(name).ok());
     instance
         .engine
@@ -1779,7 +1862,6 @@ fn instance_info(
 pub enum AskEngine {
     Claude,
     Codex,
-    Gemini,
     Anthropic,
     OpenAi,
     /// Apple's Foundation Models — the on-device model, or Private Cloud
@@ -1790,10 +1872,9 @@ pub enum AskEngine {
 
 impl AskEngine {
     /// Every provider, in the order clients list them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Claude,
         Self::Codex,
-        Self::Gemini,
         Self::Anthropic,
         Self::OpenAi,
         Self::Apple,
@@ -1804,7 +1885,6 @@ impl AskEngine {
         match name.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
-            "gemini" => Some(Self::Gemini),
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::OpenAi),
             "apple" => Some(Self::Apple),
@@ -1818,7 +1898,6 @@ impl AskEngine {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::Apple => "apple",
@@ -1830,7 +1909,6 @@ impl AskEngine {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
-            Self::Gemini => "Gemini CLI",
             Self::Anthropic => "Anthropic API",
             Self::OpenAi => "OpenAI API",
             Self::Apple => "Apple Intelligence",
@@ -1842,7 +1920,7 @@ impl AskEngine {
         match self {
             // `apple` is a CLI as far as a client can tell: a binary that
             // is either there or not, and no key to ask for.
-            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => AskProviderKind::Cli,
+            Self::Claude | Self::Codex | Self::Apple => AskProviderKind::Cli,
             Self::Anthropic | Self::OpenAi => AskProviderKind::Api,
         }
     }
@@ -1856,7 +1934,7 @@ impl AskEngine {
     pub fn runs_on_this_host(self) -> bool {
         match self {
             Self::Apple => cfg!(target_os = "macos"),
-            Self::Claude | Self::Codex | Self::Gemini | Self::Anthropic | Self::OpenAi => true,
+            Self::Claude | Self::Codex | Self::Anthropic | Self::OpenAi => true,
         }
     }
 
@@ -1867,7 +1945,7 @@ impl AskEngine {
     pub fn replays_history(self) -> bool {
         match self {
             Self::Anthropic | Self::OpenAi | Self::Apple => true,
-            Self::Claude | Self::Codex | Self::Gemini => false,
+            Self::Claude | Self::Codex => false,
         }
     }
 
@@ -1877,7 +1955,6 @@ impl AskEngine {
         match self {
             Self::Claude => Some("claude"),
             Self::Codex => Some("codex"),
-            Self::Gemini => Some("gemini"),
             Self::Apple => Some(APPLE_HELPER),
             Self::Anthropic | Self::OpenAi => None,
         }
@@ -1891,7 +1968,6 @@ impl AskEngine {
         match self {
             Self::Claude | Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::Codex => "CODEX_API_KEY",
-            Self::Gemini => "GEMINI_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Apple => "",
         }
@@ -1912,7 +1988,7 @@ impl AskEngine {
             Self::Anthropic => Some("claude-sonnet-5"),
             Self::OpenAi => Some("gpt-5"),
             Self::Apple => Some("on-device"),
-            Self::Claude | Self::Codex | Self::Gemini => None,
+            Self::Claude | Self::Codex => None,
         }
     }
 
@@ -1920,7 +1996,7 @@ impl AskEngine {
         match self {
             Self::Anthropic => ANTHROPIC_MESSAGES_URL,
             Self::OpenAi => OPENAI_CHAT_URL,
-            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => "",
+            Self::Claude | Self::Codex | Self::Apple => "",
         }
     }
 
@@ -1996,44 +2072,6 @@ impl AskEngine {
                 args.push(prompt.to_string());
                 ("codex", args)
             }
-            Self::Gemini => {
-                // `-p` is gemini's headless mode; `--resume <session id>`
-                // continues a session from the same project directory.
-                let mut args = vec![
-                    "-p".to_string(),
-                    prompt.to_string(),
-                    "--output-format".into(),
-                    "json".into(),
-                ];
-                match permission_mode {
-                    AskPermissionMode::Default => {}
-                    AskPermissionMode::Plan => {
-                        args.push("--approval-mode".into());
-                        args.push("plan".into());
-                    }
-                    AskPermissionMode::Edit => {
-                        args.push("--approval-mode".into());
-                        args.push("auto_edit".into());
-                    }
-                    AskPermissionMode::Bypass => {
-                        args.push("--approval-mode".into());
-                        args.push("yolo".into());
-                    }
-                }
-                for dir in additional_dirs {
-                    args.push("--include-directories".into());
-                    args.push(dir.display().to_string());
-                }
-                if let Some(model) = model {
-                    args.push("--model".into());
-                    args.push(model.to_string());
-                }
-                if let Some(id) = resume {
-                    args.push("--resume".into());
-                    args.push(id.to_string());
-                }
-                ("gemini", args)
-            }
             // `apple` takes its turn as JSON on stdin; see `run_apple`.
             Self::Anthropic | Self::OpenAi | Self::Apple => ("", Vec::new()),
         }
@@ -2050,9 +2088,7 @@ impl AskEngine {
         observer: Option<&ExecutionObserver>,
     ) -> Result<AskAnswer, String> {
         match self {
-            Self::Claude | Self::Codex | Self::Gemini => {
-                self.run_cli(&turn, progress, observer).await
-            }
+            Self::Claude | Self::Codex => self.run_cli(&turn, progress, observer).await,
             Self::Anthropic | Self::OpenAi => self.call_api(self.api_url(), &turn).await,
             Self::Apple => run_apple(&turn).await,
         }
@@ -2119,7 +2155,6 @@ impl AskEngine {
         let answer = match self {
             Self::Claude => parse_claude_json(&stdout),
             Self::Codex => parse_codex_jsonl(&stdout),
-            Self::Gemini => parse_gemini_json(&stdout),
             Self::Anthropic | Self::OpenAi => unreachable!("API providers do not spawn"),
             Self::Apple => unreachable!("the apple engine runs through run_apple"),
         }?;
@@ -2181,7 +2216,7 @@ impl AskEngine {
                 .post(url)
                 .bearer_auth(api_key)
                 .json(&openai_body(model, &messages)),
-            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => {
+            Self::Claude | Self::Codex | Self::Apple => {
                 unreachable!("CLI providers spawn")
             }
         };
@@ -2203,7 +2238,7 @@ impl AskEngine {
         match self {
             Self::Anthropic => parse_anthropic_response(status, &body),
             Self::OpenAi => parse_openai_response(status, &body),
-            Self::Claude | Self::Codex | Self::Gemini | Self::Apple => {
+            Self::Claude | Self::Codex | Self::Apple => {
                 unreachable!("CLI providers spawn")
             }
         }
@@ -2763,40 +2798,6 @@ fn parse_codex_jsonl(stdout: &str) -> Result<AskAnswer, String> {
     })
 }
 
-/// `gemini -p --output-format json` answers with one object:
-/// `{"session_id", "response", "stats"}`, or `{"session_id", "error":
-/// {"type", "message"}}` when the turn failed. Anything printed ahead of
-/// the object (an extension banner, say) is skipped.
-fn parse_gemini_json(stdout: &str) -> Result<AskAnswer, String> {
-    let trimmed = stdout.trim();
-    let candidate = match trimmed.find('{') {
-        Some(0) | None => trimmed,
-        Some(start) => &trimmed[start..],
-    };
-    let value: serde_json::Value =
-        serde_json::from_str(candidate).map_err(|e| format!("parsing gemini JSON: {e}"))?;
-    if let Some(error) = value.get("error") {
-        let detail = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("gemini reported an error");
-        return Err(detail.to_string());
-    }
-    let text = value
-        .get("response")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("gemini JSON has no response field")?
-        .to_string();
-    Ok(AskAnswer {
-        text,
-        session_id: value
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        cost_usd: None,
-    })
-}
-
 /// First string value for `key` anywhere in `value`. Codex nests its
 /// payloads differently per event, and a recursive lookup is cheaper than
 /// tracking every shape.
@@ -3103,29 +3104,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_json_yields_text_and_session_and_skips_a_banner() {
-        // The shape `JsonFormatter.format` in gemini-cli 0.33 emits.
-        let raw = concat!(
-            "Loaded 2 extensions.\n",
-            r#"{"session_id":"7d0e2f6c-1111-4d2c-9d1e-000000000000","response":"PONG","stats":{"models":{}}}"#,
-        );
-        let answer = parse_gemini_json(raw).unwrap();
-        assert_eq!(answer.text, "PONG");
-        assert_eq!(
-            answer.session_id.as_deref(),
-            Some("7d0e2f6c-1111-4d2c-9d1e-000000000000")
-        );
-        assert_eq!(answer.cost_usd, None);
-    }
-
-    #[test]
-    fn gemini_error_object_turns_into_an_error() {
-        let raw = r#"{"session_id":"s","error":{"type":"FatalAuthenticationError","message":"no key","code":41}}"#;
-        assert_eq!(parse_gemini_json(raw).unwrap_err(), "no key");
-        assert!(parse_gemini_json("not json").is_err());
-    }
-
-    #[test]
     fn claude_argv_only_resumes_when_there_is_a_thread() {
         let (bin, fresh) =
             AskEngine::Claude.argv("hi", None, AskPermissionMode::Default, &[], None);
@@ -3194,36 +3172,6 @@ mod tests {
         let (_, codex) = AskEngine::Codex.argv("draft", None, AskPermissionMode::Plan, &[], None);
         assert!(codex.contains(&"--sandbox=read-only".to_string()));
         assert!(!codex.iter().any(|arg| arg.contains("bypass")));
-
-        let (_, gemini) = AskEngine::Gemini.argv("draft", None, AskPermissionMode::Plan, &[], None);
-        let at = gemini.iter().position(|a| a == "--approval-mode").unwrap();
-        assert_eq!(gemini[at + 1], "plan");
-        assert!(!gemini.contains(&"--yolo".to_string()));
-    }
-
-    #[test]
-    fn gemini_argv_is_headless_json_with_directories_model_and_resume() {
-        let dirs = [PathBuf::from("/srv/shared")];
-        let (bin, args) = AskEngine::Gemini.argv(
-            "hi",
-            Some("sess-1"),
-            AskPermissionMode::Bypass,
-            &dirs,
-            Some("gemini-2.5-pro"),
-        );
-        assert_eq!(bin, "gemini");
-        assert_eq!(&args[..4], ["-p", "hi", "--output-format", "json"]);
-        let mode = args.iter().position(|a| a == "--approval-mode").unwrap();
-        assert_eq!(args[mode + 1], "yolo");
-        let dir = args
-            .iter()
-            .position(|a| a == "--include-directories")
-            .unwrap();
-        assert_eq!(args[dir + 1], "/srv/shared");
-        let model = args.iter().position(|a| a == "--model").unwrap();
-        assert_eq!(args[model + 1], "gemini-2.5-pro");
-        let resume = args.iter().position(|a| a == "--resume").unwrap();
-        assert_eq!(args[resume + 1], "sess-1");
     }
 
     #[test]
@@ -3259,7 +3207,7 @@ mod tests {
     fn every_provider_id_round_trips_in_the_documented_order() {
         assert_eq!(
             supported_agents(),
-            &["claude", "codex", "gemini", "anthropic", "openai", "apple"]
+            &["claude", "codex", "anthropic", "openai", "apple"]
         );
         for (provider, id) in AskEngine::ALL.iter().zip(supported_agents()) {
             assert_eq!(provider.id(), *id);
@@ -3267,13 +3215,16 @@ mod tests {
             assert_eq!(AskEngine::parse(&id.to_uppercase()), Some(*provider));
         }
         assert_eq!(AskEngine::parse("bard"), None);
+        // The Gemini CLI engine was removed; its id no longer parses.
+        assert_eq!(AskEngine::parse("gemini"), None);
+        assert_eq!(builtin_engine("gemini"), None);
         assert_eq!(builtin_engine("anthropic"), Some(AskEngine::Anthropic));
         // Exact match only: a config table key is not case-folded.
         assert_eq!(builtin_engine("Anthropic"), None);
         assert_eq!(builtin_engine("anthropic-work"), None);
         assert_eq!(AskEngine::Claude.kind(), AskProviderKind::Cli);
         assert_eq!(AskEngine::OpenAi.kind(), AskProviderKind::Api);
-        assert_eq!(AskEngine::Gemini.credential_env(), "GEMINI_API_KEY");
+        assert_eq!(AskEngine::Codex.credential_env(), "CODEX_API_KEY");
         assert_eq!(AskEngine::Anthropic.credential_env(), "ANTHROPIC_API_KEY");
         assert_eq!(AskEngine::OpenAi.credential_env(), "OPENAI_API_KEY");
     }
@@ -3296,10 +3247,10 @@ mod tests {
                 ..AskProviderConfig::default()
             },
         );
-        // The daemon's environment holds a Gemini key and the variable the
+        // The daemon's environment holds a Codex key and the variable the
         // openai override names; nothing for anthropic.
         let env = |name: &str| match name {
-            "GEMINI_API_KEY" => Some("g".to_string()),
+            "CODEX_API_KEY" => Some("c".to_string()),
             "WORK_OPENAI" => Some("o".to_string()),
             _ => None,
         };
@@ -3309,7 +3260,7 @@ mod tests {
         let ids: Vec<&str> = infos.iter().map(|info| info.id.as_str()).collect();
         assert_eq!(
             ids,
-            with_host_builtins(&["codex", "openai", "claude", "gemini", "anthropic"])
+            with_host_builtins(&["codex", "openai", "claude", "anthropic"])
         );
         assert!(
             infos.iter().all(|info| info.builtin),
@@ -3348,9 +3299,8 @@ mod tests {
         assert!(!claude.credential_required);
         assert!(!claude.credential_present);
         assert_eq!(claude.model, None);
-        let gemini = infos.iter().find(|info| info.id == "gemini").unwrap();
-        assert!(gemini.credential_present, "GEMINI_API_KEY is set");
         let codex = infos.iter().find(|info| info.id == "codex").unwrap();
+        assert!(codex.credential_present, "CODEX_API_KEY is set");
         assert_eq!(codex.model.as_deref(), Some("gpt-5-codex"));
         // The list survives a JSON round trip for native clients.
         let text = serde_json::to_string(&infos).unwrap();
@@ -4337,7 +4287,7 @@ mod tests {
         let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(
             ids,
-            with_host_builtins(&["anthropic", "claude", "codex", "gemini", "openai"])
+            with_host_builtins(&["anthropic", "claude", "codex", "openai"])
         );
         assert!(instances.iter().all(|i| i.builtin));
         // A tuned built-in is both built in and configured; the three with
@@ -4446,7 +4396,6 @@ mod tests {
                 "anthropic_personal",
                 "claude",
                 "codex",
-                "gemini",
                 "anthropic",
                 "openai",
             ])
@@ -4995,10 +4944,128 @@ mod tests {
 
         // A config with no `[ask]` table gains one.
         std::fs::write(&path, "").unwrap();
-        store.set_default_agent("gemini").await.unwrap();
+        store.set_default_agent("openai").await.unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let config: Config = toml::from_str(&text).unwrap();
-        assert_eq!(config.ask.agent, "gemini", "{text}");
+        assert_eq!(config.ask.agent, "openai", "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_retired_gemini_selection_says_why_and_old_history_still_loads() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ask.json");
+        // A turn answered by the removed engine, as an older tendd wrote it.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "entries": [{
+                    "id": "a1", "prompt": "hi", "answer": "PONG",
+                    "status": "answered", "agent": "gemini",
+                    "agent_session_id": "g-1", "cwd": "/tmp",
+                    "asked_at": "2026-10-01T00:00:00Z",
+                    "answered_at": "2026-10-01T00:00:05Z",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = AskStore::load(AskOptions {
+            enabled: true,
+            agent: "codex".into(),
+            path: Some(path.clone()),
+            ..AskOptions::default()
+        })
+        .await;
+        let entries = store.list().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "gemini");
+        assert_eq!(entries[0].answer, "PONG");
+
+        // Resuming that conversation selects the old id; asking then
+        // explains instead of answering "not configured".
+        let conversation = store.list_conversations().await.remove(0);
+        store.select_conversation(&conversation.id).await.unwrap();
+        assert!(matches!(
+            store.ask("again").await.unwrap_err(),
+            AskError::RetiredProvider(id) if id == "gemini"
+        ));
+        assert!(matches!(
+            store.set_agent("gemini").await.unwrap_err(),
+            AskError::RetiredProvider(_)
+        ));
+        assert!(matches!(
+            store.set_agent("bard").await.unwrap_err(),
+            AskError::UnsupportedAgent(_)
+        ));
+        assert!(!store
+            .providers()
+            .await
+            .iter()
+            .any(|info| info.id == "gemini"));
+    }
+
+    #[tokio::test]
+    async fn a_retired_gemini_table_can_be_removed_and_unpoints_ask_agent() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ask]\nenabled = true\nagent = \"gemini\"\n\n\
+             [ask.providers.gemini]\nmodel = \"gemini-2.5-pro\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: startup_agent(&config.ask.agent, &config.ask.providers),
+            providers: config.ask.providers.clone(),
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+        assert_eq!(store.agent().await, "claude");
+        store.remove_provider("gemini").await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let config: Config = toml::from_str(&text).unwrap();
+        assert!(config.ask.providers.is_empty(), "{text}");
+        assert_eq!(config.ask.agent, "claude", "{text}");
+        assert!(config.ask.retired_entries().is_empty());
+        assert_eq!(store.agent().await, "claude");
+        // Nothing is left to remove the second time.
+        assert!(matches!(
+            store.remove_provider("gemini").await.unwrap_err(),
+            AskError::RetiredProvider(_)
+        ));
+    }
+
+    /// Selecting an old Gemini conversation points the live selection at the
+    /// retired id; removing the table must leave both it and `[ask] agent`
+    /// on a provider that can answer.
+    #[tokio::test]
+    async fn removing_a_retired_table_after_resuming_its_history_repoints_the_selection() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ask]\nenabled = true\nagent = \"gemini\"\n\n\
+             [ask.providers.gemini]\nmodel = \"gemini-2.5-pro\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: startup_agent(&config.ask.agent, &config.ask.providers),
+            providers: config.ask.providers.clone(),
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+        // What `select_conversation` does for an old Gemini thread.
+        *store.agent.write().await = "gemini".into();
+        store.remove_provider("gemini").await.unwrap();
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(config.ask.retired_entries().is_empty(), "{config:?}");
+        let instances = store.instances().await;
+        assert!(find_instance(&instances, &config.ask.agent).is_some());
+        assert!(find_instance(&instances, &store.agent().await).is_some());
     }
 
     #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order

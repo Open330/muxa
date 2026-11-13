@@ -827,7 +827,7 @@ async fn build_ask(
 ) -> Arc<AskStore> {
     let options = AskOptions {
         enabled: cfg.ask.enabled,
-        agent: cfg.ask.agent.clone(),
+        agent: tend::ask::startup_agent(&cfg.ask.agent, &cfg.ask.providers),
         cwd: cfg
             .ask
             .cwd
