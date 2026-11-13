@@ -53,6 +53,10 @@ become explicit before the daemon can call it in-process.
    ask `cliclack` confirmations and `println!` results. Popup helpers use
    `current_exe()`, which inside the daemon names `tendd`.
 6. **The working directory** for relative paths in `work up`.
+7. **Blocking subprocesses inside async entry points.** `work up` runs
+   synchronous mux discovery and `git` through `std::process::Command`
+   (`work_up.rs` `apply`, `branch_exists`, `git`). Today the child process
+   absorbs those waits. Inside tendd they would stall an executor thread.
 
 ## Target shape
 
@@ -88,6 +92,8 @@ pub struct WorkContext {
    reconcile, replacing items 1–6.
    - Mux commands take the endpoint explicitly. `with_endpoint` stays only
      as a CLI convenience.
+   - Synchronous mux and `git` work either moves to `tokio::process` or
+     runs in bounded `spawn_blocking` sections, decided per call (item 7).
    - Unit tests per entry point use a fake mux and an in-memory daemon.
    - No call site changes yet.
 3. **Daemon call sites**, one PR each, in this order: `work up`,
@@ -96,7 +102,9 @@ pub struct WorkContext {
      Once the in-process path has started mutating tmux, it never retries
      as a child.
    - Each is proven on a scratch daemon (`XDG_DATA_HOME`/`XDG_STATE_HOME`
-     in a temp dir) against a scratch tmux server before merge.
+     in a temp dir) against a scratch tmux server before merge. The proof
+     includes a responsiveness check: other IPC requests keep answering
+     while a slow `work up` runs.
 4. **Remove the fallback** for a call site after one release with no
    fallback use in the logs.
 
