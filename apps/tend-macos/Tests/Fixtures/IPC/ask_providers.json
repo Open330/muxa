@@ -1,0 +1,90 @@
+{
+  "ask_providers": [
+    {
+      "builtin": true,
+      "configured": false,
+      "credential_env": "ANTHROPIC_API_KEY",
+      "credential_present": false,
+      "credential_required": false,
+      "engine": "claude",
+      "executable": "claude",
+      "id": "claude",
+      "kind": "cli",
+      "model": null,
+      "selected": true,
+      "title": "Claude Code"
+    },
+    {
+      "builtin": true,
+      "configured": false,
+      "credential_env": "CODEX_API_KEY",
+      "credential_present": false,
+      "credential_required": false,
+      "engine": "codex",
+      "executable": "codex",
+      "id": "codex",
+      "kind": "cli",
+      "model": null,
+      "selected": false,
+      "title": "Codex CLI"
+    },
+    {
+      "builtin": true,
+      "configured": false,
+      "credential_env": "GEMINI_API_KEY",
+      "credential_present": false,
+      "credential_required": false,
+      "engine": "gemini",
+      "executable": "gemini",
+      "id": "gemini",
+      "kind": "cli",
+      "model": null,
+      "selected": false,
+      "title": "Gemini CLI"
+    },
+    {
+      "builtin": true,
+      "configured": false,
+      "credential_env": "ANTHROPIC_API_KEY",
+      "credential_present": false,
+      "credential_required": true,
+      "engine": "anthropic",
+      "executable": null,
+      "id": "anthropic",
+      "kind": "api",
+      "model": "claude-sonnet-5",
+      "selected": false,
+      "title": "Anthropic API"
+    },
+    {
+      "builtin": true,
+      "configured": false,
+      "credential_env": "OPENAI_API_KEY",
+      "credential_present": false,
+      "credential_required": true,
+      "engine": "openai",
+      "executable": null,
+      "id": "openai",
+      "kind": "api",
+      "model": "gpt-5",
+      "selected": false,
+      "title": "OpenAI API"
+    },
+    {
+      "builtin": true,
+      "configured": false,
+      "credential_env": "",
+      "credential_present": false,
+      "credential_required": false,
+      "engine": "apple",
+      "executable": "tend-afm",
+      "id": "apple",
+      "kind": "cli",
+      "model": "on-device",
+      "selected": false,
+      "title": "Apple Intelligence"
+    }
+  ],
+  "ok": true,
+  "protocol": 6
+}

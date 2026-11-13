@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "protocol": 6,
+  "work_records": [
+    {
+      "created_at": "2026-11-12T14:49:39.838064Z",
+      "external_items": [],
+      "identity": {
+        "work_id": "ENG-1",
+        "workspace_id": "tend"
+      },
+      "metadata": {
+        "goal": "CI is green",
+        "stage": "queued",
+        "title": "Fix the flaky test",
+        "updated_at": "2026-11-12T14:49:39.838064Z"
+      }
+    }
+  ]
+}
