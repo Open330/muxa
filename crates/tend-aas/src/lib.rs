@@ -15,5 +15,6 @@
 pub mod account_provider;
 pub mod account_route;
 pub mod account_swap;
+pub mod codex_hook_trust;
 pub(crate) mod swap_job;
 pub mod swap_service;

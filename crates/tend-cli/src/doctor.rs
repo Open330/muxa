@@ -532,6 +532,73 @@ async fn check_accounts(
     if responded && accounts.as_ref().is_none_or(|module| module.enabled) {
         add(report, "tendd", None, check_swap(socket).await);
     }
+    if accounts.as_ref().is_some_and(|module| module.enabled) {
+        if let Some(result) = check_codex_hook_trust(config).await {
+            add(report, "codex", None, result);
+        }
+    }
+}
+
+/// Codex homes on this host whose hooks would stop a relaunch on "Hooks
+/// need review" (a profile not used since tend rewrote its hooks, say).
+/// Read-only. `None` without the account module or a `codex` to ask.
+async fn check_codex_hook_trust(config: Option<&Path>) -> Option<CheckResult> {
+    let config = config.map(Path::to_path_buf);
+    let lines = tokio::task::spawn_blocking(move || codex_hook_trust_lines(config.as_deref()))
+        .await
+        .ok()??;
+    Some(if lines.is_empty() {
+        CheckResult::Ok("Codex hook trust: every account home trusts the current hooks".into())
+    } else {
+        CheckResult::Warn(lines.join("; "))
+    })
+}
+
+/// One line per Codex home with hooks waiting on review; `None` when it
+/// cannot be checked here. Shared with `tend init`.
+pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String>> {
+    #[cfg(feature = "aas")]
+    {
+        use tend_aas::codex_hook_trust as trust;
+        let accounts = tend::Config::load_or_default(config).ok()?.accounts;
+        let codex = trust::find_codex()?;
+        let homes = trust::known_homes(accounts.for_provider("codex"));
+        let cwd = dirs::home_dir()?.display().to_string();
+        let audits = trust::audit(&codex, &homes, &cwd);
+        Some(
+            audits
+                .iter()
+                .map(|audit| {
+                    let home = tilde(&audit.home.display().to_string());
+                    let (fixable, unvouched) = match &audit.result {
+                        Ok(counts) => *counts,
+                        Err(error) => {
+                            return format!("Codex home {home}: could not check ({error})")
+                        }
+                    };
+                    let mut parts = Vec::new();
+                    if fixable > 0 {
+                        parts.push(format!(
+                            "{fixable} hook(s) trusted under another home but stale here (a \
+                             swap carries the trust over)"
+                        ));
+                    }
+                    if unvouched > 0 {
+                        parts.push(format!(
+                            "{unvouched} hook(s) not trusted under any home (open Codex under \
+                             this home and review them)"
+                        ));
+                    }
+                    format!("Codex home {home}: {}", parts.join(", "))
+                })
+                .collect(),
+        )
+    }
+    #[cfg(not(feature = "aas"))]
+    {
+        let _ = config;
+        None
+    }
 }
 
 /// Whether a swap job store from an earlier run is on this host: evidence

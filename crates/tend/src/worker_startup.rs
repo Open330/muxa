@@ -247,7 +247,8 @@ fn prepare_with(
 /// bottom of the screen: its title, the numbered options with one selected,
 /// and the key-hint footer last. Text that merely mentions it (a transcript
 /// line above a normal composer) is not the menu.
-fn codex_hook_review(screen: &str) -> bool {
+#[must_use]
+pub fn codex_hook_review(screen: &str) -> bool {
     let tail = crate::agent_tui::screen_tail(screen, 20);
     let lines: Vec<&str> = tail
         .lines()

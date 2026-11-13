@@ -184,6 +184,7 @@ pub(crate) async fn run_for_start(
 
     let report = apply::run(&plan, false).context("applying plan")?;
     render_apply_steps(mode, &report);
+    warn_codex_hook_trust(mode, &plan);
 
     // Propagate TEND_SOCKET into the tmux server environment so that
     // every pane — including the one that runs `tend status-line` in
@@ -372,6 +373,16 @@ fn manages_daemon(components: &[Component]) -> bool {
 /// Non-agent components pass through untouched. Used only on the
 /// preset path — `--component` opt-ins bypass this so an explicit
 /// request always installs.
+/// Rewritten Codex hooks are new to Codex under every account home that
+/// trusted the old ones: say which homes will ask for a review.
+fn warn_codex_hook_trust(mode: Mode, plan: &plan::Plan) {
+    if plan.components.contains(&Component::CodexHooks) {
+        for line in crate::doctor::codex_hook_trust_lines(None).unwrap_or_default() {
+            ui::warn_line(mode, &line);
+        }
+    }
+}
+
 fn filter_absent_agents(components: Vec<Component>, detect: &Detection) -> Vec<Component> {
     components
         .into_iter()

@@ -544,6 +544,30 @@ resolved by that shell, in a context tend does not reproduce: it is recorded
 as `unknown`, not certified, and the swap goes on as before. Passing these
 checks is not a promise the launch works.
 
+## Codex hook trust across accounts
+
+Codex asks to review hooks that are new or changed, and records the answer
+per config path as reached through `CODEX_HOME`:
+`[hooks.state."<CODEX_HOME>/config.toml:<event>:0:0"] trusted_hash = …`.
+aas profiles that symlink their `config.toml` to `~/.codex/config.toml` share
+the hooks but each need their own entry, and the hash changes whenever the
+hook's definition does (tend rewriting its hooks, for one).
+
+Before a Codex relaunch tend asks Codex's own app-server, under the new
+account's home (the profile's `CODEX_HOME`, or the one `aas export
+<account>` sets), which hooks wait on review (`hooks/list`). A hook the user
+already trusted under another home on this machine — same event, a
+`trusted_hash` equal to the hook's current hash — gets that entry under the
+new home's key (`config/value/write`, so Codex writes its own file, through
+the symlink). The report says how many were carried over and which were
+never trusted anywhere. tend never trusts a hook the user did not, and never
+answers the menu: when it shows anyway, the swap ends
+`hook_review_pending: … waits on "Hooks need review"`, naming the pane.
+
+`tend doctor` checks every Codex home it knows (`~/.codex`, `$CODEX_HOME`,
+configured accounts, `asx/profiles/codex-*`) and warns about homes whose
+hooks would ask; `tend init` does the same after rewriting the Codex hooks.
+
 ## Limits
 
 - A pane started *with* the agent (`new-window 'aas e …'`, `exec claude …`)
