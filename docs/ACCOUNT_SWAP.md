@@ -555,10 +555,10 @@ hook's definition does (tend rewriting its hooks, for one).
 
 Before a Codex relaunch tend asks Codex's own app-server, under the new
 account's home (the profile's `CODEX_HOME`, or the one `aas export
-<account>` sets), which hooks wait on review (`hooks/list`). A hook the user
-already trusted under another home on this machine — same event, a
-`trusted_hash` equal to the hook's current hash — gets that entry under the
-new home's key (`config/value/write`, so Codex writes its own file, through
+<account>` sets), which hooks wait on review (`hooks/list`). A hook Codex
+reports trusted as the user's own under another account home on this
+machine (a `user` hook from that home's own `config.toml`, same event, same
+current hash) gets that trust under the new home's key (`config/value/write`, so Codex writes its own file, through
 the symlink). The report says how many were carried over and which were
 never trusted anywhere. tend never trusts a hook the user did not, and never
 answers the menu: when it shows anyway, the swap ends
