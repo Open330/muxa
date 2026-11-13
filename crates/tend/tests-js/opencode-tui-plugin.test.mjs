@@ -55,14 +55,19 @@ async function harness() {
   };
   assert.equal(plugin.id, "tend");
   await plugin.setup(ctx);
-  const emit = (type, data) => listener({ details: { type, data } });
+  let here = "/w";
+  const emit = (type, data) => listener({ details: { type, data, location: { directory: here } } });
+  const changeDirectory = (directory) => {
+    here = directory;
+    ctx.location = { directory };
+  };
   const show = (sessionID) => {
     route = { type: "session", sessionID };
   };
   const prompt = (sessionID, text = "go") =>
     emit("session.inbox.enqueued", { sessionID, item: { type: "user", payload: { text } } });
   const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
-  return { sent, emit, show, prompt, settle };
+  return { sent, emit, show, prompt, settle, changeDirectory };
 }
 
 const types = (sent) => sent.map((payload) => payload.type);
@@ -153,9 +158,9 @@ test("a failed execution reports the error and no answer", async () => {
   emit("session.text.ended", { sessionID: "s", assistantMessageID: "m1", text: "partial" });
   emit("session.execution.failed", { sessionID: "s", error: { type: "api", message: "overloaded" } });
   await settle();
-  assert.deepEqual(types(sent).slice(2), ["session.error", "session.idle"]);
-  assert.equal(sent[2].properties.error.data.message, "overloaded");
-  assert.equal(sent[3].tend.response, undefined);
+  assert.deepEqual(types(sent).slice(2), ["tend.execution.started", "session.error", "session.idle"]);
+  assert.equal(sent[3].properties.error.data.message, "overloaded");
+  assert.equal(sent[4].tend.response, undefined);
 });
 
 test("an interrupted execution is idle with no answer", async () => {
@@ -209,4 +214,43 @@ test("a tend that is not on PATH never throws into opencode", async () => {
   show("s");
   prompt("s");
   await settle();
+});
+
+// From the #512 review (Codex), each against the committed plugin.
+test("switching into an already-running session never reports the previous session's text", async () => {
+  const { sent, emit, show, prompt, settle } = await harness();
+  show("A");
+  prompt("A");
+  emit("session.execution.started", { sessionID: "A" });
+  emit("session.text.ended", { sessionID: "A", assistantMessageID: "mA", text: "A PRIVATE ANSWER" });
+  emit("session.execution.started", { sessionID: "B" });
+  show("B");
+  prompt("B", "steer B");
+  emit("session.execution.succeeded", { sessionID: "B" });
+  await settle();
+  assert.equal(sent.at(-1).type, "session.idle");
+  assert.equal(sent.at(-1).tend.response, undefined);
+});
+
+test("an execution that starts after an idle is reported as working", async () => {
+  const { sent, emit, show, prompt, settle } = await harness();
+  show("s");
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  prompt("s", "new intent");
+  emit("session.execution.interrupted", { sessionID: "s", reason: "user" });
+  emit("session.execution.started", { sessionID: "s" });
+  await settle();
+  assert.equal(sent.at(-1).type, "tend.execution.started");
+});
+
+test("viewing another project keeps the bound session's directory", async () => {
+  const { sent, emit, show, prompt, settle, changeDirectory } = await harness();
+  show("A");
+  prompt("A");
+  show("B");
+  changeDirectory("/other-project");
+  emit("session.execution.succeeded", { sessionID: "A" });
+  await settle();
+  assert.equal(sent.at(-1).tend.directory, "/w");
 });

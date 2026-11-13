@@ -12,7 +12,8 @@
 //! a background server shared by every TUI, so tend's 2.x plugin is a TUI
 //! plugin (`plugins/tend/tui.ts`, running in the pane's own process) that
 //! translates the 2.x stream into the same payloads: `session.inbox.enqueued`
-//! into `tend.prompt`, `session.execution.{succeeded,interrupted,failed}`
+//! into `tend.prompt`, `session.execution.started` into
+//! `tend.execution.started` (working), `session.execution.{succeeded,interrupted,failed}`
 //! into `session.idle` (plus `session.error` for a failure),
 //! `session.tool.{called,success,failed}` into a tool part's status,
 //! `form.*` into `question.*`, and `permission.asked` as 2.x sends it
@@ -132,6 +133,18 @@ fn normalize(envelope: &Envelope, pane: Option<String>, at: OffsetDateTime) -> O
     match envelope.ty.as_str() {
         "tend.session.active" | "session.created" => Some(AgentEvent::Started { id, at }),
         "session.deleted" => Some(AgentEvent::SessionEnded { id, at }),
+        // 2.x `session.execution.started`: the session is working, whether
+        // or not a prompt was forwarded first (one queued during the last
+        // execution's cleanup starts the next with none). Same shape as
+        // Codex's rollout activity: a tool start moves Idle to Working and
+        // leaves Error alone.
+        "tend.execution.started" => Some(AgentEvent::ToolStarted {
+            id,
+            tool: "opencode turn".into(),
+            subagent: None,
+            command: None,
+            at,
+        }),
         "tend.prompt" => Some(AgentEvent::PromptSubmitted {
             id,
             prompt: truncate(str_at(p, "/text").unwrap_or_default().to_string(), 4000),
@@ -628,6 +641,20 @@ mod tests {
         assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash-free"));
         // The rejected turn reported no response, so the last one stands.
         assert_eq!(row.last_response.as_deref(), Some(last_response));
+    }
+
+    /// A prompt queued during an interrupted execution's cleanup starts the
+    /// next execution with no prompt forwarded after the idle.
+    #[tokio::test]
+    async fn a_2x_execution_after_an_interrupt_is_working_again() {
+        let state = state_after(vec![
+            prompt("first"),
+            json!({ "type": "tend.prompt", "properties": { "sessionID": "s", "text": "queued" } }),
+            json!({ "type": "session.idle", "properties": { "sessionID": "s" } }),
+            json!({ "type": "tend.execution.started", "properties": { "sessionID": "s" } }),
+        ])
+        .await;
+        assert_eq!(state, crate::event::AgentState::Working);
     }
 
     #[test]

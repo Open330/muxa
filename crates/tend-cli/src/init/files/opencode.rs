@@ -277,9 +277,13 @@ export default {
     let failed = false; // the owner's current execution reported an error
     const tools = new Map(); // tool call id -> name
     let model = null; // the owner's current model, from session.step.started
+    // The bound session's directory, from the event that bound it. The
+    // TUI's own location follows whatever it shows, which may be another
+    // project's session by now.
+    let ownerDirectory = null;
     const directory = () => {
       const location = ctx.location || {};
-      return location.directory || process.cwd();
+      return ownerDirectory || location.directory || process.cwd();
     };
 
     const flush = async () => {
@@ -311,6 +315,11 @@ export default {
         if (item.type !== "user" || !sessionID || sessionID !== shown()) return;
         if (sessionID !== owner) {
           owner = sessionID;
+          ownerDirectory = (event.location && event.location.directory) || null;
+          // Nothing captured for the previous session belongs to this one.
+          reply = null;
+          failed = false;
+          model = null;
           send("tend.session.active", { sessionID });
         }
         const text = item.payload && typeof item.payload.text === "string" ? item.payload.text : "";
@@ -322,6 +331,9 @@ export default {
         case "session.execution.started":
           reply = null;
           failed = false;
+          // Work resumes even when no prompt precedes it here (one queued
+          // during the previous execution's cleanup), so say so.
+          send("tend.execution.started", { sessionID });
           return;
         case "session.text.ended":
           if (!reply || reply.messageID !== d.assistantMessageID) {

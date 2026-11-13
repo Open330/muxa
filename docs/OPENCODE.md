@@ -65,6 +65,7 @@ opencode 2.x:
 | opencode 2.x event | Forwarded as |
 | --- | --- |
 | `session.inbox.enqueued` (a `user` item, into the session this TUI shows) | `tend.prompt` |
+| `session.execution.started` | `tend.execution.started`: working, also when no prompt was forwarded first |
 | `session.tool.called` / `session.tool.success` / `session.tool.failed` | tool part `running` / `completed` / `error` (`shell` carries its command) |
 | `permission.asked` (`action`, `resources`), `permission.replied` | the same types |
 | `form.created`, `form.replied` / `form.cancelled` | `question.asked`, `question.replied` / `question.rejected` |
@@ -90,7 +91,8 @@ opencode 2.x:
   through opencode's API rebinds the pane the same way. In 2.x the server's
   stream covers every TUI's sessions, so only a prompt into the session *this
   TUI is showing* binds the pane; viewing another session moves nothing until
-  it is prompted.
+  it is prompted. The row keeps the bound session's directory, taken from the
+  event that bound it, while the TUI views another project.
 - **Responses** are reset at each prompt and reported only for a turn that
   ended without `session.error`; a failed or aborted turn's partial output is
   not recorded as its answer, and a failed turn stays in error after idle.
