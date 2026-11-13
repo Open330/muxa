@@ -115,10 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aas profiles sharing one `config.toml` still need an entry each, and a
   profile unused since tend rewrote its hooks kept the old hash. Before the
   relaunch, tend asks Codex's app-server (`hooks/list`) which hooks wait on
-  review under the target home, and copies a `trusted_hash` only when the
-  same hook (same event, same current hash) is trusted under another home on
-  this machine (`config/value/write`, so Codex writes its own file through
-  the symlink). Nothing the user never trusted is trusted; the menu is never
+  review under the target home, and copies a `trusted_hash` only when Codex
+  reports the same hook (same event, same current hash) trusted as the
+  user's own under another account home on this machine
+  (`config/value/write`, so Codex writes its own file through the symlink). Nothing the user never trusted is trusted; the menu is never
   answered. When it shows anyway, the swap ends `hook_review_pending` naming
   the pane. `tend doctor` (and `tend init` after rewriting the Codex hooks)
   lists homes whose trust is stale.

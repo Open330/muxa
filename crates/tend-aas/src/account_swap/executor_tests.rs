@@ -1798,13 +1798,6 @@ fn a_registered_follow_up_reports_its_receipt() {
 /// no receipt is claimed for it.
 #[test]
 fn an_unsubmitted_registered_follow_up_is_forgotten() {
-
-/// A relaunched Codex that stops on "Hooks need review" is never answered:
-/// the swap ends with a named outcome naming the pane, and nothing is typed
-/// into it after the relaunch.
-#[test]
-fn a_relaunch_waiting_on_the_hook_review_ends_with_a_named_outcome() {
-    const REVIEW: &str = "  Hooks need review\n  6 hooks are new or changed.\n  Hooks can run outside the\n  sandbox after you trust\n  them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n     (hooks won't run)\n  enter confirm · esc skip";
     let io = FakeIo::new(
         CODEX_IDLE,
         Box::new(|io: &FakeIo, line: &str| {
@@ -1886,6 +1879,20 @@ fn a_prompt_hook_seen_while_waiting_for_the_receipt_is_kept() {
     }
 }
 
+/// A relaunched Codex that stops on "Hooks need review" is never answered:
+/// the swap ends with a named outcome naming the pane, and nothing is typed
+/// into it after the relaunch.
+#[test]
+fn a_relaunch_waiting_on_the_hook_review_ends_with_a_named_outcome() {
+    const REVIEW: &str = "  Hooks need review\n  6 hooks are new or changed.\n  Hooks can run outside the\n  sandbox after you trust\n  them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n     (hooks won't run)\n  enter confirm · esc skip";
+    let io = FakeIo::new(
+        CODEX_IDLE,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line.starts_with("signal TERM") {
+                io.kill(AGENT);
+            }
+            if line == "text \"\\r\"" && io.previous().as_deref() == Some("text \"RELAUNCH\"") {
+                io.agent_appears_in(Duration::from_secs(1));
                 io.show(REVIEW);
             }
         }),
