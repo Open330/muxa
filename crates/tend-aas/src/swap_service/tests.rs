@@ -197,6 +197,7 @@ fn outcome(pane: &str, status: SwapStatus, note: &str) -> SwapOutcome {
         note: note.into(),
         continue_reason: None,
         session_id_source: None,
+        launch_id: None,
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,

@@ -56,6 +56,11 @@ pub(super) trait SwapIo: Clock {
     fn file_digest(&self, path: &str) -> Option<String>;
     /// The working directory process `pid` is actually in.
     fn process_cwd(&self, pid: u32) -> Option<ShellCwd>;
+    /// The `TEND_SWAP_LAUNCH_ID` in process `pid`'s own environment.
+    fn launch_id_of(&self, pid: u32) -> super::LaunchMark {
+        let _ = pid;
+        super::LaunchMark::Unreadable
+    }
 }
 
 /// What a path names, as far as a launch cares.
@@ -187,6 +192,20 @@ pub(super) fn process_cwd(pid: u32) -> Option<ShellCwd> {
     })
 }
 
+/// [`SwapIo::launch_id_of`] from a process's environment entries; an empty
+/// one could not be read (a running agent always has some).
+pub(super) fn launch_id_of(environ: &[(String, String)]) -> super::LaunchMark {
+    if environ.is_empty() {
+        return super::LaunchMark::Unreadable;
+    }
+    environ
+        .iter()
+        .find(|(key, _)| key == "TEND_SWAP_LAUNCH_ID")
+        .map_or(super::LaunchMark::Absent, |(_, value)| {
+            super::LaunchMark::Carries(value.clone())
+        })
+}
+
 /// The pane and processes of a real target.
 pub(super) struct LiveIo<'a> {
     pub(super) backend: &'a SharedBackend,
@@ -215,6 +234,10 @@ impl SwapIo for LiveIo<'_> {
 
     fn process_cwd(&self, pid: u32) -> Option<ShellCwd> {
         process_cwd(pid)
+    }
+
+    fn launch_id_of(&self, pid: u32) -> super::LaunchMark {
+        launch_id_of(&tend::accounts::process_environ(pid))
     }
 
     fn capture(&self) -> Option<String> {

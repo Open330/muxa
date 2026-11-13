@@ -123,6 +123,8 @@ pub struct SwapRequest {
     /// Put the pane's half-typed draft back after the relaunch. A retry
     /// never does: the draft it would restore was captured by another run.
     pub restore_draft: bool,
+    /// How a pane with its shell is relaunched (`[swap] relaunch`).
+    pub relaunch: tend::swap_api::RelaunchMode,
 }
 
 impl SwapRequest {
@@ -144,6 +146,7 @@ impl SwapRequest {
             exclude: Vec::new(),
             allow_direct_respawn: true,
             restore_draft: true,
+            relaunch: config.relaunch,
         }
     }
 
@@ -176,6 +179,7 @@ impl OutcomeFor for SwapOutcome {
             note: note.into(),
             continue_reason: None,
             session_id_source: None,
+            launch_id: None,
             conversation_verified: None,
             conversation_unverified_reason: None,
             registered: Some(resumable_id(&agent.session_id)),
@@ -1006,6 +1010,7 @@ fn bound_skip(want: &DirectTarget, session: &str, note: &str) -> SwapOutcome {
         note: note.to_owned(),
         continue_reason: None,
         session_id_source: None,
+        launch_id: None,
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
@@ -1906,13 +1911,26 @@ fn swap_one(
             return outcome;
         }
     };
-    // The pane had no shell: the relaunch runs through the user's login
-    // shell, the one checked and the one respawned with.
-    if direct {
+    // A pane with its shell is respawned too when `[swap] relaunch =
+    // "respawn"` asks for it, wherever a direct pane may be.
+    // Only a shell that runs nothing but the agent: `respawn-pane -k` ends
+    // the shell's other jobs too, which typing leaves running.
+    let respawn_shell_pane = !direct
+        && request.allow_direct_respawn
+        && request.relaunch == tend::swap_api::RelaunchMode::Respawn
+        && !cfg!(windows)
+        && shell_runs_only(direct_children(pane.pane_pid).as_deref(), launch.top_pid);
+    // The relaunch runs through the user's login shell, the one checked and
+    // the one respawned with.
+    if direct || respawn_shell_pane {
         prerequisites.respawn_shell =
             Some(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
     }
+    let launch_id = new_launch_id();
+    outcome.launch_id.clone_from(&launch_id);
     let target = Target {
+        respawn_shell_pane,
+        launch_id,
         prerequisites,
         socket: target_socket(pane, agent),
         pane: pane.pane_id.clone(),
@@ -2454,6 +2472,7 @@ fn unresolved(target: &str, note: &str) -> SwapOutcome {
         note: note.to_owned(),
         continue_reason: None,
         session_id_source: None,
+        launch_id: None,
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
@@ -2519,6 +2538,13 @@ struct Target {
     /// The pane runs the agent directly, with no shell to type into: it is
     /// respawned in place instead.
     direct: bool,
+    /// The pane has its shell but is respawned anyway (`[swap] relaunch =
+    /// "respawn"`), with a login shell left after the agent exits.
+    respawn_shell_pane: bool,
+    /// The `TEND_SWAP_LAUNCH_ID` the relaunch exports, where it can. Not
+    /// `TEND_LAUNCH_ID`: the relaunch resumes a session that already has a
+    /// launch claim, and is no `tend launch` with a receipt of its own.
+    launch_id: Option<String>,
     /// Where a respawned agent starts.
     cwd: String,
     kind: AgentKind,
@@ -2537,6 +2563,79 @@ struct Target {
     prerequisites: preflight::Prerequisites,
 }
 
+impl Target {
+    /// Whether the relaunch respawns the pane rather than typing into it.
+    fn respawns(&self) -> bool {
+        self.direct || self.respawn_shell_pane
+    }
+}
+
+/// Whether the pane's shell, whose direct `children` were enumerated, runs
+/// nothing but `top` (the agent, or the wrapper that leads to it). A
+/// listing that could not be made, or without `top`, rules nothing out.
+fn shell_runs_only(children: Option<&[u32]>, top: u32) -> bool {
+    children == Some(&[top][..])
+}
+
+/// Every direct child of `pid`, enumerated on its own rather than read off
+/// a process tree that skips what it cannot read: `None` when the listing
+/// itself could not be made.
+#[cfg(target_os = "linux")]
+fn direct_children(pid: u32) -> Option<Vec<u32>> {
+    let mut children = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+        let listed = std::fs::read_to_string(task.ok()?.path().join("children")).ok()?;
+        for word in listed.split_whitespace() {
+            children.push(word.parse().ok()?);
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    Some(children)
+}
+
+/// Every direct child of `pid`, from `pgrep -P`, which reads the kernel's
+/// process table (exit 1: none). `None` when it cannot run or fails.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn direct_children(pid: u32) -> Option<Vec<u32>> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0 | 1) => String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .map(|word| word.parse().ok())
+            .collect(),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn direct_children(_pid: u32) -> Option<Vec<u32>> {
+    None
+}
+
+/// A fresh launch id for one relaunch. Not on Windows, whose relaunch runs
+/// through PowerShell without `env`.
+fn new_launch_id() -> Option<String> {
+    cfg!(unix).then(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// `command` with `TEND_SWAP_LAUNCH_ID` exported to it through `env`, which
+/// every POSIX shell (fish and nushell too) runs as a program.
+fn with_launch_id(command: &str, launch_id: Option<&str>) -> String {
+    match launch_id {
+        Some(id) => format!(
+            "env {} {command}",
+            tend::shell::Dialect::Posix.word(&format!("TEND_SWAP_LAUNCH_ID={id}"))
+        ),
+        None => command.to_owned(),
+    }
+}
+
 /// Stop the agent, type `command` into the pane's shell, wait for the
 /// resumed agent, then send `follow_up`. `Ok` carries a note for the report.
 fn execute(
@@ -2553,7 +2652,7 @@ fn execute(
     let checks = preflight::run(
         io,
         &target.prerequisites,
-        target.direct,
+        target.respawns(),
         &target.cwd,
         target.pane_pid.get(),
     );
@@ -2585,17 +2684,7 @@ fn execute(
         &mut answered,
     )?;
     enter(runner, Phase::Launching)?;
-    if target.direct {
-        relaunch_in_place(runner, target, command)?;
-    } else {
-        io.sleep(SHELL_SETTLE);
-        let group = runner.group();
-        if !runner.send_text(group, Purpose::Relaunch, command)
-            || !runner.send_text(group, Purpose::Relaunch, "\r")
-        {
-            return Err("could not type the relaunch command into the pane".into());
-        }
-    }
+    relaunch(runner, target, command)?;
     let started = io.now();
     let relaunched = loop {
         if io.agent_running(target.pane_pid.get()) {
@@ -2607,7 +2696,7 @@ fn execute(
         io.sleep(Duration::from_millis(300));
     };
     if !relaunched {
-        return Err(if target.direct {
+        return Err(if target.respawns() {
             "respawned the pane, but the agent never appeared; the pane is kept open so its \
              output can be read"
         } else {
@@ -2615,15 +2704,19 @@ fn execute(
         }
         .into());
     }
-    if target.direct {
+    if target.respawns() {
         // Running again: the pane may close with its agent as before.
         runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
     await_ready(runner, target, &mut answered)?;
-    let binding = resume_binding(
-        &io.agent_argvs(target.pane_pid.get()),
-        target.kind,
-        &target.session_id,
+    let binding = launch_vetoed(
+        resume_binding(
+            &io.agent_argvs(target.pane_pid.get()),
+            target.kind,
+            &target.session_id,
+        ),
+        target.launch_id.as_deref(),
+        |pid| io.launch_id_of(pid),
     );
     let (checked, account) = check_account(runner, target, verify, binding.pid())?;
     let (decision, withheld, draft_allowed) = decide_continuation(
@@ -2651,6 +2744,24 @@ fn execute(
         &answered,
         &checked,
     ))
+}
+
+/// Start the agent again: respawn the pane, or type the relaunch into its
+/// shell.
+fn relaunch(runner: &Runner, target: &Target, command: &str) -> Result<(), Refusal> {
+    if target.respawns() {
+        relaunch_in_place(runner, target, command)?;
+    } else {
+        runner.io.sleep(SHELL_SETTLE);
+        let group = runner.group();
+        let command = with_launch_id(command, target.launch_id.as_deref());
+        if !runner.send_text(group, Purpose::Relaunch, &command)
+            || !runner.send_text(group, Purpose::Relaunch, "\r")
+        {
+            return Err("could not type the relaunch command into the pane".into());
+        }
+    }
+    Ok(())
 }
 
 /// Checks which account the relaunched agent (the process bound to the
@@ -2731,6 +2842,7 @@ pub(crate) fn prepare_retry_classified(
         note: "skipped: no live pane runs the agent its job planned; nothing was done".into(),
         continue_reason: None,
         session_id_source: None,
+        launch_id: None,
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
@@ -2762,6 +2874,7 @@ fn identity_outcome(identity: &TargetIdentity) -> SwapOutcome {
         note: String::new(),
         continue_reason: None,
         session_id_source: Some(identity.session_id_source),
+        launch_id: None,
         conversation_verified: Some(identity.conversation_verified),
         conversation_unverified_reason: None,
         registered: None,
@@ -3330,20 +3443,69 @@ fn stop_agent(
     draft: Option<&str>,
     answered: &mut Vec<&'static str>,
 ) -> Result<(), Refusal> {
-    if target.direct && !runner.set_remain_on_exit(Purpose::KeepPaneOpen, true) {
-        return Err(
-            "the pane runs the agent directly and cannot be kept open to relaunch it".into(),
-        );
+    // A respawned pane, shell or not, is kept open until the relaunch is
+    // known to run, so a failed start leaves its output there.
+    if target.respawns() && !runner.set_remain_on_exit(Purpose::KeepPaneOpen, true) {
+        return Err("the pane cannot be kept open to respawn it with the relaunch".into());
     }
     let stopped = if target.kind == AgentKind::ClaudeCode {
         exit_claude(runner, target, launch, follow_up, draft, answered)
     } else {
         stop(runner, launch).map_err(Refusal::from)
     };
-    if stopped.is_err() && target.direct {
+    if stopped.is_err() && target.respawns() {
         runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
     stopped
+}
+
+/// The line a respawned pane runs: `command` through the login `shell`,
+/// with `TEND_SWAP_LAUNCH_ID` in its environment, and — for a pane that had its
+/// shell — that shell again once the agent exits.
+fn respawn_line(shell: &str, command: &str, launch_id: Option<&str>, keep_shell: bool) -> String {
+    let dialect = tend::shell::Dialect::native();
+    let script = if keep_shell {
+        format!("{command}; exec {} -l", dialect.word(shell))
+    } else {
+        command.to_owned()
+    };
+    let mut words: Vec<String> = Vec::new();
+    if let Some(id) = launch_id {
+        words.extend(["env".to_owned(), format!("TEND_SWAP_LAUNCH_ID={id}")]);
+    }
+    words.extend([shell.to_owned(), "-lic".to_owned(), script]);
+    dialect.command_line(&words)
+}
+
+/// What the relaunched process's own environment says about whose launch
+/// it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchMark {
+    /// It carries this `TEND_SWAP_LAUNCH_ID`.
+    Carries(String),
+    /// Its environment was read and has none.
+    Absent,
+    /// It could not be read.
+    Unreadable,
+}
+
+/// The argv binding, unless the bound process's environment names another
+/// launch than this relaunch's: then it is some other start of the same
+/// conversation, and nothing is typed into it. A process with no launch id
+/// or an unreadable environment keeps the argv binding (a wrapper may drop
+/// the variable); only a contradiction vetoes.
+fn launch_vetoed(
+    binding: ResumeBinding,
+    launch_id: Option<&str>,
+    mark_of: impl Fn(u32) -> LaunchMark,
+) -> ResumeBinding {
+    match (&binding, launch_id) {
+        (ResumeBinding::Bound(pid), Some(ours)) => match mark_of(*pid) {
+            LaunchMark::Carries(theirs) if theirs != ours => ResumeBinding::Ambiguous,
+            _ => binding,
+        },
+        _ => binding,
+    }
 }
 
 /// Respawn a pane that ran its agent directly with `command`, keeping the
@@ -3357,8 +3519,12 @@ fn relaunch_in_place(runner: &Runner, target: &Target, command: &str) -> Result<
         .respawn_shell
         .clone()
         .ok_or_else(|| Refusal::Failed("no shell to respawn the pane through".into()))?;
-    let line =
-        tend::shell::Dialect::native().command_line(&[shell, "-lic".into(), command.to_owned()]);
+    let line = respawn_line(
+        &shell,
+        command,
+        target.launch_id.as_deref(),
+        target.respawn_shell_pane,
+    );
     if !runner.respawn(Purpose::Respawn, &target.cwd, &line) {
         return Err(
             "the agent stopped, but its pane could not be respawned with the relaunch; \
@@ -3845,6 +4011,112 @@ mod tests {
         let (chosen, skipped) = select(&agents, &forced);
         assert_eq!(chosen.len(), 2);
         assert!(skipped.is_empty());
+    }
+
+    /// A shell with another job besides the agent is not respawned: that
+    /// would end the job.
+    #[test]
+    fn only_a_shell_running_just_the_agent_is_respawned() {
+        assert!(shell_runs_only(Some(&[10]), 10));
+        // A background job next to the agent, even one whose own details
+        // could not be read: it is counted by pid alone.
+        assert!(!shell_runs_only(Some(&[10, 12]), 10));
+        // No listing, or one without the agent, rules nothing out.
+        assert!(!shell_runs_only(None, 10));
+        assert!(!shell_runs_only(Some(&[]), 10));
+        assert!(!shell_runs_only(Some(&[12]), 10));
+    }
+
+    /// The enumeration itself, on this host: a shell with two children
+    /// lists both.
+    #[cfg(unix)]
+    #[test]
+    fn a_shells_children_are_all_listed() {
+        let mut shell = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = direct_children(shell.id());
+        while seen.as_ref().is_none_or(|c| c.len() < 2) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            seen = direct_children(shell.id());
+        }
+        let children = seen.clone().unwrap_or_default();
+        let _ = std::process::Command::new("kill")
+            .args(children.iter().map(u32::to_string))
+            .status();
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert_eq!(children.len(), 2, "{seen:?}");
+    }
+
+    #[test]
+    fn a_relaunch_line_exports_its_launch_id() {
+        assert_eq!(
+            with_launch_id("aas e b --resume S", Some("L")),
+            "env TEND_SWAP_LAUNCH_ID=L aas e b --resume S"
+        );
+        assert_eq!(with_launch_id("aas e b", None), "aas e b");
+        assert_eq!(
+            respawn_line("/bin/zsh", "aas e b", Some("L"), false),
+            "env TEND_SWAP_LAUNCH_ID=L /bin/zsh -lic 'aas e b'"
+        );
+        assert_eq!(
+            respawn_line("/bin/zsh", "aas e b", None, true),
+            "/bin/zsh -lic 'aas e b; exec /bin/zsh -l'"
+        );
+    }
+
+    /// Only a bound process that names another launch loses its binding; a
+    /// missing or unreadable mark keeps it.
+    #[test]
+    fn a_relaunch_from_another_launch_is_not_bound() {
+        let bound = || ResumeBinding::Bound(7);
+        let mark = |m: LaunchMark| move |_: u32| m.clone();
+        assert_eq!(
+            launch_vetoed(bound(), Some("L"), mark(LaunchMark::Carries("L".into()))),
+            bound()
+        );
+        assert_eq!(
+            launch_vetoed(bound(), Some("L"), mark(LaunchMark::Carries("X".into()))),
+            ResumeBinding::Ambiguous
+        );
+        assert_eq!(
+            launch_vetoed(bound(), Some("L"), mark(LaunchMark::Absent)),
+            bound()
+        );
+        assert_eq!(
+            launch_vetoed(bound(), Some("L"), mark(LaunchMark::Unreadable)),
+            bound()
+        );
+        assert_eq!(
+            launch_vetoed(bound(), None, mark(LaunchMark::Carries("X".into()))),
+            bound()
+        );
+        assert_eq!(
+            launch_vetoed(ResumeBinding::Missing, Some("L"), mark(LaunchMark::Absent)),
+            ResumeBinding::Missing
+        );
+    }
+
+    #[test]
+    fn a_launch_id_is_read_from_the_environment() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect()
+        };
+        assert_eq!(io::launch_id_of(&[]), LaunchMark::Unreadable);
+        assert_eq!(
+            io::launch_id_of(&env(&[("HOME", "/h")])),
+            LaunchMark::Absent
+        );
+        assert_eq!(
+            io::launch_id_of(&env(&[("HOME", "/h"), ("TEND_SWAP_LAUNCH_ID", "L")])),
+            LaunchMark::Carries("L".into())
+        );
     }
 
     /// The running process's conversation must agree with what the registry
