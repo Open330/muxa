@@ -1833,3 +1833,48 @@ fn an_unsubmitted_registered_follow_up_is_forgotten() {
         ]
     );
 }
+
+/// A registered follow-up still waiting for its own hook keeps a prompt
+/// hook of the conversation that arrived meanwhile, whatever ends the wait:
+/// the screen's grace, or the deadline.
+#[test]
+fn a_prompt_hook_seen_while_waiting_for_the_receipt_is_kept() {
+    for (screen, hook_after) in [
+        (CODEX_WORKING, Duration::from_secs(2)),
+        (CODEX_IDLE, Duration::from_millis(19_600)),
+    ] {
+        let io = FakeIo::new(
+            CODEX_IDLE,
+            Box::new(move |io: &FakeIo, line: &str| {
+                if line.starts_with("signal TERM") {
+                    io.kill(AGENT);
+                }
+                if line == "text \"\\r\"" {
+                    match io.previous().as_deref() {
+                        Some("text \"RELAUNCH\"") => {
+                            io.agent_appears_in(Duration::from_secs(1));
+                        }
+                        Some("prompt \"continue\"") => {
+                            io.hooks.borrow_mut().push(io.now.get() + hook_after);
+                            io.show(screen);
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        io.probe.set(true);
+        io.registers.set(true);
+        let (result, observations) = follow_up_run(&io, &mut NoObserver);
+        result.unwrap();
+        assert_eq!(
+            evidence_of(&observations)[1],
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::PromptHook,
+                receipt: Some(false),
+            },
+            "{hook_after:?}"
+        );
+    }
+}

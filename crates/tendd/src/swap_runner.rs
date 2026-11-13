@@ -295,8 +295,8 @@ impl tend_aas::swap_service::PromptRegistry for StoreRegistry {
         self.store.forget_expected_prompt(token);
     }
 
-    fn pending(&self, token: u64) -> bool {
-        self.store.expected_prompt_pending(token)
+    fn consumed(&self, token: u64) -> bool {
+        self.store.expected_prompt_consumed(token)
     }
 }
 

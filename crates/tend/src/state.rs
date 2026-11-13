@@ -647,6 +647,9 @@ pub struct Store {
     /// one matching prompt hook.
     expected_prompts: std::sync::Mutex<Vec<ExpectedPrompt>>,
     expected_prompt_token: std::sync::atomic::AtomicU64,
+    /// Registrations a hook consumed, newest last, so a caller can tell its
+    /// own prompt's hook from an expiry or a forget.
+    consumed_prompts: std::sync::Mutex<std::collections::VecDeque<u64>>,
     /// Disk-backed audit log of every prompt. Lives separately from
     /// `agents` so reaping/GC of the live registry doesn't take prompt
     /// history with it. Tests and consumers that want a no-op history use
@@ -712,6 +715,7 @@ impl Store {
             prompt_seq: Arc::default(),
             expected_prompts: std::sync::Mutex::default(),
             expected_prompt_token: std::sync::atomic::AtomicU64::new(0),
+            consumed_prompts: std::sync::Mutex::default(),
             history,
             dirty: Arc::new(Notify::new()),
             metrics: Metrics::new(),
@@ -1693,17 +1697,12 @@ impl Store {
         Some(token)
     }
 
-    /// Whether the registration `token` named is still waiting for its
-    /// hook: `false` once a hook consumed it (or it was forgotten, or its
-    /// minute ran out). Read-only.
+    /// Whether a prompt hook consumed the registration `token` named: the
+    /// store matched it to that very prompt. An expired or forgotten
+    /// registration was not consumed. Read-only; the last 256 are kept.
     #[must_use]
-    pub fn expected_prompt_pending(&self, token: u64) -> bool {
-        let now = OffsetDateTime::now_utc();
-        self.expected_prompts
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|entry| entry.token == token && entry.until > now)
+    pub fn expected_prompt_consumed(&self, token: u64) -> bool {
+        self.consumed_prompts.lock().unwrap().contains(&token)
     }
 
     /// Drops the registration `token` named, after typing failed.
@@ -1739,7 +1738,15 @@ impl Store {
                 && entry.text == prompt
                 && at >= entry.registered_at
         });
-        found.map_or(PromptOrigin::Unknown, |index| expected.remove(index).origin)
+        found.map_or(PromptOrigin::Unknown, |index| {
+            let entry = expected.remove(index);
+            let mut consumed = self.consumed_prompts.lock().unwrap();
+            consumed.push_back(entry.token);
+            while consumed.len() > 256 {
+                consumed.pop_front();
+            }
+            entry.origin
+        })
     }
 
     pub fn prompt_sequence(&self) -> Arc<std::sync::atomic::AtomicU64> {

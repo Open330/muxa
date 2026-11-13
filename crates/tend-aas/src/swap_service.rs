@@ -161,8 +161,8 @@ pub struct PromptReceipts {
 pub trait PromptRegistry: Send + Sync {
     fn expect(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64>;
     fn forget(&self, token: u64);
-    /// Whether `token` still waits for its hook (`Store::expected_prompt_pending`).
-    fn pending(&self, token: u64) -> bool;
+    /// Whether a hook consumed `token` (`Store::expected_prompt_consumed`).
+    fn consumed(&self, token: u64) -> bool;
 }
 
 struct Receipt {
@@ -268,7 +268,7 @@ impl account_swap::TurnProbe for PromptReceipts {
     fn registration_consumed(&self, token: u64) -> bool {
         self.registry
             .as_ref()
-            .is_some_and(|registry| !registry.pending(token))
+            .is_some_and(|registry| registry.consumed(token))
     }
 }
 

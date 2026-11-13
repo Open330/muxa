@@ -3424,11 +3424,21 @@ fn follow_up_with_evidence(
         let waited = now.saturating_duration_since(started);
         let grace_over =
             screen_since.is_some_and(|since| now.saturating_duration_since(since) >= HOOK_GRACE);
+        // A prompt hook already seen outranks the screen whatever ends the
+        // wait: only the stronger receipt was still being waited for.
         if grace_over || (waited >= FOLLOW_UP_WAIT && screen_since.is_some()) {
-            break TurnEvidence::ScreenActivity;
+            break if hook_since.is_some() {
+                TurnEvidence::PromptHook
+            } else {
+                TurnEvidence::ScreenActivity
+            };
         }
         if waited >= FOLLOW_UP_WAIT {
-            break TurnEvidence::NoneSeen;
+            break if hook_since.is_some() {
+                TurnEvidence::PromptHook
+            } else {
+                TurnEvidence::NoneSeen
+            };
         }
         io.sleep(Duration::from_millis(400));
     };
