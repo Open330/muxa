@@ -238,8 +238,9 @@ impl SwapIo for FakeIo {
         self.forgotten.borrow_mut().push(token);
     }
 
-    fn registered_prompt_seen_after(&self, cursor: u64) -> bool {
-        self.hook_is_registered.get() && self.prompt_seen_after(cursor)
+    fn registration_consumed(&self, _token: u64) -> bool {
+        let now = self.now.get();
+        self.hook_is_registered.get() && self.hooks.borrow().iter().any(|at| *at <= now)
     }
 }
 

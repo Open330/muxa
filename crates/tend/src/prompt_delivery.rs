@@ -476,6 +476,36 @@ mod tests {
             .is_none());
     }
 
+    /// A registration is pending until the hook for its own prompt
+    /// consumes it; another registration's hook leaves it pending.
+    #[tokio::test]
+    async fn a_registration_is_pending_until_its_own_hook() {
+        use crate::PromptOrigin;
+        let store = Store::shared();
+        start(&store).await;
+        let earlier = store
+            .expect_prompt("rmux:%7", Some("/test.sock"), "earlier", PromptOrigin::Tend)
+            .await
+            .unwrap();
+        let ours = store
+            .expect_prompt(
+                "rmux:%7",
+                Some("/test.sock"),
+                "continue",
+                PromptOrigin::Tend,
+            )
+            .await
+            .unwrap();
+        assert!(store.expected_prompt_pending(earlier) && store.expected_prompt_pending(ours));
+        submit(&store, "original", "/test.sock", "earlier").await;
+        assert!(!store.expected_prompt_pending(earlier));
+        assert!(store.expected_prompt_pending(ours));
+        submit(&store, "original", "/test.sock", "continue").await;
+        assert!(!store.expected_prompt_pending(ours));
+        store.forget_expected_prompt(ours);
+        assert!(!store.expected_prompt_pending(ours));
+    }
+
     #[tokio::test]
     async fn cancelling_one_delivery_leaves_another_endpoints_alone() {
         use crate::PromptOrigin;

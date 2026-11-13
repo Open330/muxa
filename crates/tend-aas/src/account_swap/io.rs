@@ -58,9 +58,9 @@ pub(super) trait SwapIo: Clock {
     fn forget_prompt(&self, token: u64) {
         let _ = token;
     }
-    /// Whether the hook for the registered prompt arrived after `cursor`.
-    fn registered_prompt_seen_after(&self, cursor: u64) -> bool {
-        let _ = cursor;
+    /// Whether a hook consumed the follow-up's registration `token`.
+    fn registration_consumed(&self, token: u64) -> bool {
+        let _ = token;
         false
     }
     /// What is at `path` now, symlinks followed. Read-only, and never
@@ -340,15 +340,9 @@ impl SwapIo for LiveIo<'_> {
         }
     }
 
-    fn registered_prompt_seen_after(&self, cursor: u64) -> bool {
-        self.probe.is_some_and(|probe| {
-            probe.registered_prompt_after(
-                cursor,
-                self.target.kind,
-                &self.target.session_id,
-                &super::endpoint_key(&self.target.pane, self.target.socket.as_deref()),
-            )
-        })
+    fn registration_consumed(&self, token: u64) -> bool {
+        self.probe
+            .is_some_and(|probe| probe.registration_consumed(token))
     }
 
     fn prompt_seen_after(&self, cursor: u64) -> bool {

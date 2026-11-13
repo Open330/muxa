@@ -1693,6 +1693,19 @@ impl Store {
         Some(token)
     }
 
+    /// Whether the registration `token` named is still waiting for its
+    /// hook: `false` once a hook consumed it (or it was forgotten, or its
+    /// minute ran out). Read-only.
+    #[must_use]
+    pub fn expected_prompt_pending(&self, token: u64) -> bool {
+        let now = OffsetDateTime::now_utc();
+        self.expected_prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.token == token && entry.until > now)
+    }
+
     /// Drops the registration `token` named, after typing failed.
     pub fn forget_expected_prompt(&self, token: u64) {
         self.expected_prompts

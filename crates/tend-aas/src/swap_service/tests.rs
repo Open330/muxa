@@ -1593,44 +1593,49 @@ fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
     assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
 }
 
-/// A receipt counts as tend's own only when the store attributed the hook
-/// to a registration (`PromptOrigin::Tend`); the registry is the daemon's.
+/// tend's receipt is the store consuming this very registration: another
+/// registration's hook (an earlier tend prompt arriving late) is not it.
 #[test]
-fn a_registered_prompt_receipt_is_told_apart() {
+fn a_receipt_is_the_consumption_of_this_registration() {
     use crate::account_swap::TurnProbe as _;
-    struct Registry(std::sync::Mutex<Vec<String>>);
+    struct Registry {
+        next: std::sync::atomic::AtomicU64,
+        pending: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    }
     impl PromptRegistry for Registry {
-        fn expect(&self, pane: &str, _socket: Option<&str>, text: &str) -> Option<u64> {
-            self.0.lock().unwrap().push(format!("expect {pane} {text}"));
-            Some(9)
+        fn expect(&self, _pane: &str, _socket: Option<&str>, _text: &str) -> Option<u64> {
+            let token = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+            self.pending.lock().unwrap().insert(token);
+            Some(token)
         }
         fn forget(&self, token: u64) {
-            self.0.lock().unwrap().push(format!("forget {token}"));
+            self.pending.lock().unwrap().remove(&token);
+        }
+        fn pending(&self, token: u64) -> bool {
+            self.pending.lock().unwrap().contains(&token)
         }
     }
-    let registry = Arc::new(Registry(std::sync::Mutex::default()));
-    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let receipts = PromptReceipts::new(Arc::clone(&accepted)).with_registry(registry.clone());
-    let endpoint = endpoint_key("%1", Some("/tmp/tmux-1/default"));
-    assert_eq!(receipts.expect_prompt("%1", None, "continue"), Some(9));
-    receipts.forget_prompt(9);
-    assert_eq!(
-        registry.0.lock().unwrap().as_slice(),
-        ["expect %1 continue", "forget 9"]
-    );
-    let cursor = receipts.cursor();
-    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 1));
-    assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
-    assert!(!receipts.registered_prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
-    let mut ours = prompt(AgentKind::ClaudeCode, "c", "%1", 2);
-    ours.origin = tend::state::PromptOrigin::Tend;
-    receipts.record(&ours);
-    assert!(receipts.registered_prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
-    // Without a registry nothing is registered.
-    assert_eq!(
-        PromptReceipts::new(Arc::default()).expect_prompt("%1", None, "x"),
-        None
-    );
+    let registry = Arc::new(Registry {
+        next: std::sync::atomic::AtomicU64::new(0),
+        pending: std::sync::Mutex::default(),
+    });
+    let receipts = PromptReceipts::new(Arc::default()).with_registry(registry.clone());
+    let earlier = receipts
+        .expect_prompt("%1", None, "earlier prompt")
+        .unwrap();
+    let ours = receipts.expect_prompt("%1", None, "continue").unwrap();
+    assert!(!receipts.registration_consumed(ours));
+    // The earlier prompt's hook arrives late and consumes its own token.
+    registry.pending.lock().unwrap().remove(&earlier);
+    assert!(receipts.registration_consumed(earlier));
+    assert!(!receipts.registration_consumed(ours));
+    // Then ours.
+    registry.pending.lock().unwrap().remove(&ours);
+    assert!(receipts.registration_consumed(ours));
+    // Without a registry nothing is registered, or consumed.
+    let bare = PromptReceipts::new(Arc::default());
+    assert_eq!(bare.expect_prompt("%1", None, "x"), None);
+    assert!(!bare.registration_consumed(1));
 }
 
 // --- cancel ------------------------------------------------------------------

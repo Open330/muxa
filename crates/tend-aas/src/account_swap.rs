@@ -1411,16 +1411,10 @@ pub trait TurnProbe: Send + Sync {
     fn forget_prompt(&self, token: u64) {
         let _ = token;
     }
-    /// Whether a prompt hook attributed to tend's own registration arrived
-    /// after `cursor`, from that conversation on that endpoint.
-    fn registered_prompt_after(
-        &self,
-        cursor: u64,
-        kind: AgentKind,
-        conversation: &str,
-        endpoint: &str,
-    ) -> bool {
-        let _ = (cursor, kind, conversation, endpoint);
+    /// Whether a hook consumed the registration `token` (the store matched
+    /// it to that very prompt: session, pane, exact text, after it was made).
+    fn registration_consumed(&self, token: u64) -> bool {
+        let _ = token;
         false
     }
 }
@@ -3405,13 +3399,23 @@ fn follow_up_with_evidence(
     }
     let started = io.now();
     let mut screen_since = None;
+    let mut hook_since = None;
     let evidence = loop {
-        if let Some(cursor) = cursor.filter(|cursor| io.prompt_seen_after(*cursor)) {
-            // The same hook says whether it was the registered prompt.
-            if registered {
-                receipt = Some(io.registered_prompt_seen_after(cursor));
+        // The registration consumed: the store matched a hook to this very
+        // prompt. That is tend's receipt.
+        if let Some(token) = token.filter(|_| registered) {
+            if io.registration_consumed(token) {
+                receipt = Some(true);
+                break TurnEvidence::PromptHook;
             }
-            break TurnEvidence::PromptHook;
+        }
+        if cursor.is_some_and(|cursor| io.prompt_seen_after(cursor)) {
+            // Another prompt of the conversation: still a prompt hook. A
+            // registered one waits a moment for its own.
+            let since = *hook_since.get_or_insert(io.now());
+            if !registered || io.now().saturating_duration_since(since) >= HOOK_GRACE {
+                break TurnEvidence::PromptHook;
+            }
         }
         let now = io.now();
         if screen_since.is_none() && io.capture().is_some_and(|screen| turn_running(&screen)) {

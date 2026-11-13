@@ -161,6 +161,8 @@ pub struct PromptReceipts {
 pub trait PromptRegistry: Send + Sync {
     fn expect(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64>;
     fn forget(&self, token: u64);
+    /// Whether `token` still waits for its hook (`Store::expected_prompt_pending`).
+    fn pending(&self, token: u64) -> bool;
 }
 
 struct Receipt {
@@ -168,8 +170,6 @@ struct Receipt {
     kind: AgentKind,
     conversation: String,
     endpoint: String,
-    /// The hook matched a prompt tend registered before typing it.
-    tend: bool,
 }
 
 /// More than enough for every pane's hooks within one follow-up's wait.
@@ -212,25 +212,6 @@ impl PromptReceipts {
         self
     }
 
-    fn any_after(
-        &self,
-        cursor: u64,
-        kind: AgentKind,
-        conversation: &str,
-        endpoint: &str,
-        tend_only: bool,
-    ) -> bool {
-        self.seen.lock().is_ok_and(|seen| {
-            seen.iter().any(|receipt| {
-                receipt.seq > cursor
-                    && receipt.kind == kind
-                    && receipt.conversation == conversation
-                    && receipt.endpoint == endpoint
-                    && (!tend_only || receipt.tend)
-            })
-        })
-    }
-
     /// Note one prompt hook, by who sent it and from where, under the number
     /// the store gave it; its text is not kept.
     pub fn record(&self, record: &tend::state::PromptRecord) {
@@ -244,7 +225,6 @@ impl PromptReceipts {
             endpoint: record.id.pane.as_deref().map_or_else(String::new, |pane| {
                 account_swap::endpoint_key(pane, record.id.tmux_socket.as_deref())
             }),
-            tend: record.origin == tend::state::PromptOrigin::Tend,
         };
         seen.push_back(receipt);
         while seen.len() > RECEIPTS_KEPT {
@@ -265,7 +245,14 @@ impl account_swap::TurnProbe for PromptReceipts {
         conversation: &str,
         endpoint: &str,
     ) -> bool {
-        self.any_after(cursor, kind, conversation, endpoint, false)
+        self.seen.lock().is_ok_and(|seen| {
+            seen.iter().any(|receipt| {
+                receipt.seq > cursor
+                    && receipt.kind == kind
+                    && receipt.conversation == conversation
+                    && receipt.endpoint == endpoint
+            })
+        })
     }
 
     fn expect_prompt(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64> {
@@ -278,14 +265,10 @@ impl account_swap::TurnProbe for PromptReceipts {
         }
     }
 
-    fn registered_prompt_after(
-        &self,
-        cursor: u64,
-        kind: AgentKind,
-        conversation: &str,
-        endpoint: &str,
-    ) -> bool {
-        self.any_after(cursor, kind, conversation, endpoint, true)
+    fn registration_consumed(&self, token: u64) -> bool {
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| !registry.pending(token))
     }
 }
 

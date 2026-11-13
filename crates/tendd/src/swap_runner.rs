@@ -294,6 +294,10 @@ impl tend_aas::swap_service::PromptRegistry for StoreRegistry {
     fn forget(&self, token: u64) {
         self.store.forget_expected_prompt(token);
     }
+
+    fn pending(&self, token: u64) -> bool {
+        self.store.expected_prompt_pending(token)
+    }
 }
 
 /// What the swap service reads of the daemon. Its methods block on the
