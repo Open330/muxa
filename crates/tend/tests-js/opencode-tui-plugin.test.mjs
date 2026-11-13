@@ -75,7 +75,15 @@ async function harness(answer = () => "") {
   };
   const prompt = (sessionID, text = "go") =>
     emit("session.inbox.enqueued", { sessionID, item: { type: "user", payload: { text } } });
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+  // The plugin forwards on a timer, one child at a time: wait until nothing
+  // new has been sent for a while rather than for a fixed delay.
+  const settle = async () => {
+    let seen = -1;
+    while (seen !== sent.length + prompted.length) {
+      seen = sent.length + prompted.length;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+  };
   return { sent, prompted, emit, show, prompt, settle, changeDirectory };
 }
 

@@ -66,7 +66,15 @@ async function harness(answer = () => "") {
   };
   const hooks = await TendPlugin({ client, directory: "/w" });
   const emit = (type, properties) => hooks.event({ event: { type, properties } });
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+  // The plugin forwards on a timer, one child at a time: wait until nothing
+  // new has been sent for a while rather than for a fixed delay.
+  const settle = async () => {
+    let seen = -1;
+    while (seen !== sent.length + prompted.length) {
+      seen = sent.length + prompted.length;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+  };
   return { sent, prompted, hooks, emit, settle };
 }
 
