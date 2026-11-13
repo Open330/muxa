@@ -388,6 +388,9 @@ pub async fn apply_durable(resolved: Resolved, client: &tend::ipc::Client) -> Re
         .collect::<Vec<_>>();
     let broadcast = steering(&resolved);
     let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
+    // An abandoned operation (out of time, tendd shutting down) takes no new
+    // claims; the next pass picks them up.
+    crate::subprocess::ensure_time_left().context("claim dependency-ready pipeline aliases")?;
     let claims = client
         .pipeline_claim(&identity, run.generation)
         .await
@@ -447,6 +450,18 @@ pub async fn apply_durable(resolved: Resolved, client: &tend::ipc::Client) -> Re
                         format!("report pipeline alias {:?} running", claim.agent.alias)
                     })?;
             }
+            Err(error) if crate::subprocess::abandoned() => {
+                // Out of time or shutting down: what the killed `tend` child
+                // left behind. The claim stays leased and recoverable, and
+                // the next pass adopts or retries the alias; a Failed report
+                // here would strand it.
+                tracing::warn!(
+                    alias = %claim.agent.alias,
+                    %error,
+                    "pipeline alias abandoned; leaving its claim to be retried",
+                );
+                return Err(error);
+            }
             Err(error) => {
                 let detail = format!("{error:#}");
                 let _ = client
@@ -498,6 +513,7 @@ pub async fn reconcile_run(
     identity: &WorkIdentity,
     generation: u64,
 ) -> Result<Vec<LaunchedAgent>> {
+    crate::subprocess::ensure_time_left().context("claim dependency-ready pipeline aliases")?;
     let claims = client
         .pipeline_claim(identity, generation)
         .await
@@ -583,6 +599,18 @@ pub async fn reconcile_run(
                     .with_context(|| {
                         format!("report pipeline alias {:?} running", claim.agent.alias)
                     })?;
+            }
+            Err(error) if crate::subprocess::abandoned() => {
+                // Out of time or shutting down: what the killed `tend` child
+                // left behind. The claim stays leased and recoverable, and
+                // the next pass adopts or retries the alias; a Failed report
+                // here would strand it.
+                tracing::warn!(
+                    alias = %claim.agent.alias,
+                    %error,
+                    "pipeline alias abandoned; leaving its claim to be retried",
+                );
+                return Err(error);
             }
             Err(error) => {
                 let detail = format!("{error:#}");
@@ -1630,6 +1658,93 @@ mod reconcile_tests {
             .expect("reconciliation skipped the second Run")
             .unwrap();
         result
+    }
+
+    /// Run `reconcile_run` under a subprocess scope against a daemon that
+    /// records each request kind. When `cancel_on_claim`, the scope is
+    /// cancelled the moment the claim is granted, as a tendd shutdown would.
+    fn abandoned_pass(cancel_from_start: bool, cancel_on_claim: bool) -> (Result<()>, Vec<String>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("tend.sock");
+        let cancel = Arc::new(AtomicBool::new(cancel_from_start));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let identity = WorkIdentity::new("ws", "first");
+        let claim = tend::pipeline_run::PipelineClaim {
+            identity: identity.clone(),
+            pipeline: "solo".into(),
+            generation: 1,
+            cwd: PathBuf::from("/tmp"),
+            window_id: None,
+            agent: agent_with(tend::collaboration::LaunchPurpose::Primary),
+            pane: Some("%999".into()),
+        };
+        let listener = runtime
+            .block_on(async { tokio::net::UnixListener::bind(&socket) })
+            .unwrap();
+        {
+            let (cancel, seen) = (cancel.clone(), seen.clone());
+            runtime.spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let kind = request["kind"].as_str().unwrap_or("").to_string();
+                        let response = if kind == "pipeline_claim" {
+                            if cancel_on_claim {
+                                cancel.store(true, Ordering::SeqCst);
+                            }
+                            serde_json::json!({"ok": true, "pipeline_claims": [claim.clone()]})
+                        } else {
+                            serde_json::json!({"ok": true})
+                        };
+                        if kind != "hello" {
+                            seen.lock().unwrap().push(kind);
+                        }
+                        let mut bytes = serde_json::to_vec(&response).unwrap();
+                        bytes.push(b'\n');
+                        let _ = writer.write_all(&bytes).await;
+                        line.clear();
+                    }
+                }
+            });
+        }
+        let scope = crate::subprocess::Scope {
+            socket: socket.clone(),
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            cancel: Some(cancel),
+        };
+        let client = tend::ipc::Client::new(socket);
+        let result = crate::subprocess::with_scope(scope, || {
+            runtime.block_on(reconcile_run(&client, &Config::default(), &identity, 1))
+        });
+        let seen = seen.lock().unwrap().clone();
+        (result.map(|_| ()), seen)
+    }
+
+    #[test]
+    fn an_abandoned_pass_takes_no_new_claims() {
+        let (result, seen) = abandoned_pass(true, false);
+        assert!(result.is_err());
+        assert!(seen.is_empty(), "claimed after cancellation: {seen:?}");
+    }
+
+    #[test]
+    fn abandonment_after_a_claim_leaves_it_recoverable_not_failed() {
+        let (result, seen) = abandoned_pass(false, true);
+        assert!(result.is_err());
+        assert_eq!(
+            seen,
+            ["pipeline_claim"],
+            "a Failed report would strand the alias"
+        );
     }
 
     #[tokio::test]

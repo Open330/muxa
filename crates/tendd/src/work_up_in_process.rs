@@ -74,6 +74,7 @@ async fn run(
         let scope = tend_work::subprocess::Scope {
             socket: socket.clone(),
             deadline: std::time::Instant::now() + tend::work_control::WORK_UP_TIMEOUT,
+            cancel: None,
         };
         tend_work::subprocess::with_scope(scope, || {
             runtime.block_on(async move {
@@ -95,7 +96,10 @@ async fn run(
 
 /// The config path the `tend` child chose: `--config` (never passed) or
 /// `TEND_CONFIG`, else the default.
-fn cli_config_path(env: Option<std::ffi::OsString>, default: Option<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn cli_config_path(
+    env: Option<std::ffi::OsString>,
+    default: Option<PathBuf>,
+) -> Option<PathBuf> {
     env.filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or(default)

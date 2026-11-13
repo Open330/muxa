@@ -1,7 +1,7 @@
 # Work in core: tendd stops running `tend` for Work logic
 
 Status: in progress. Step 1 (the move into `crates/tend-work`) is #502.
-`work up` runs in-process (step 3, first call site); see "Done so far".
+`work up` and pipeline reconcile run in-process (step 3); see "Done so far".
 
 ## Problem
 
@@ -137,3 +137,12 @@ pub struct WorkContext {
   - the forced child;
   - the forced child failing without a CLI;
   - `health` answering in under 100 ms during a `work up`.
+- Pipeline reconcile (`pipeline_reconciler`) runs `run_reconcile` in tendd,
+  with the same config, socket and subprocess scope, and the child's 60 s
+  deadline. Dropping the pass (supervisor shutdown) cancels the scope: the
+  running git/tmux command is killed and no further one starts, as the
+  child was killed on drop. `TEND_RECONCILE_CHILD=1` forces the child, and
+  `TEND_PIPELINE_CLI` still selects a program.
+  - Proven on a scratch daemon, with the `tend` binary moved away: a `duo`
+    pipeline's `review` (after `impl`) launched once `impl` reported done.
+    The forced child did the same.
