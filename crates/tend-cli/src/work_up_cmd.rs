@@ -54,15 +54,15 @@ pub async fn run(
         let client = client.ok_or_else(|| {
             anyhow::anyhow!("tend work up requires tendd for durable pipeline state")
         })?;
-        let result = apply_durable(resolved, client).await?;
-        crate::work_backlog::declare_verification(
+        crate::work_backlog::bind_verification(
             client,
-            &tend::work::WorkIdentity::new(result.workspace.clone(), result.work.clone()),
+            &tend::work::WorkIdentity::new(resolved.workspace.clone(), resolved.work.clone()),
             acceptance,
             checks,
-            &result.cwd,
+            &resolved.cwd,
         )
         .await?;
+        let result = apply_durable(resolved, client).await?;
         if let Some(record) = planned
             .as_ref()
             .filter(|record| record.metadata.stage == tend::work::WorkStage::Queued)

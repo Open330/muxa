@@ -2723,6 +2723,7 @@ async fn a_planned_work_round_trips_over_ipc_with_its_result_records() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one daemon round trip: declare, refuse twice, pass
 async fn a_result_on_a_work_with_checks_is_filed_only_once_tend_has_run_them() {
     use crate::decision::{Decision, Evidence};
     use crate::review::{ActorKind, NewReview, ReviewActor, ReviewTarget};
@@ -2793,6 +2794,20 @@ async fn a_result_on_a_work_with_checks_is_filed_only_once_tend_has_run_them() {
         .to_string();
     assert!(refused.contains("checks_failed"), "{refused}");
     assert!(refused.contains("FAIL test -f built"), "{refused}");
+    // Recording it as already decided goes through the same gate.
+    let recorded = client
+        .review_record(
+            &NewReview {
+                idempotency_key: Some("rec-1".into()),
+                ..result()
+            },
+            crate::review::DispositionKind::Accepted,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(recorded.contains("checks_failed"), "{recorded}");
     assert!(client
         .work_record_show(&id)
         .await

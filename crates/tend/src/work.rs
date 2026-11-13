@@ -360,13 +360,18 @@ pub struct WorkEdit {
     /// Replace the declared checks; an empty list clears them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<crate::work_verify::WorkCheck>>,
+    /// Re-pin the declared checks to this directory (absolute): what
+    /// `work up` sends before launching into a route worktree or `--cwd`.
+    /// A verification edit, held to the declarer rule like the checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_cwd: Option<String>,
 }
 
 impl WorkEdit {
-    /// Whether this edit changes what tend verifies.
+    /// Whether this edit changes what tend verifies or where.
     #[must_use]
     pub fn touches_verification(&self) -> bool {
-        self.acceptance.is_some() || self.checks.is_some()
+        self.acceptance.is_some() || self.checks.is_some() || self.verify_cwd.is_some()
     }
 }
 
@@ -474,7 +479,8 @@ impl WorkEdit {
         if let Some(priority) = self.priority {
             plan.priority = Some(priority);
         }
-        let touches = self.acceptance.is_some() || self.checks.is_some();
+        let touches =
+            self.acceptance.is_some() || self.checks.is_some() || self.verify_cwd.is_some();
         if touches {
             let Some(declarer) = declarer else {
                 return Err("acceptance criteria and checks need a known declarer".into());
@@ -501,6 +507,17 @@ impl WorkEdit {
             } else {
                 plan.cwd.clone()
             };
+        }
+        if let Some(dir) = self.verify_cwd {
+            let dir = edit_text(None, Some(dir), 4_096, "verify cwd")?;
+            if let Some(dir) = &dir {
+                if !std::path::Path::new(dir).is_absolute() {
+                    return Err(format!("verify cwd {dir:?} must be an absolute path"));
+                }
+            }
+            if !plan.checks.is_empty() {
+                plan.verify_cwd = dir;
+            }
         }
         if touches {
             plan.declared_by = (!plan.acceptance.is_empty() || !plan.checks.is_empty())
@@ -1587,5 +1604,41 @@ mod tests {
         let plan = moved.plan.unwrap();
         assert_eq!(plan.cwd.as_deref(), Some("/elsewhere"));
         assert_eq!(plan.checks_dir(), Some("/original"));
+    }
+
+    #[test]
+    fn only_the_declarer_or_the_person_may_repin_where_checks_run() {
+        use crate::work_verify::{Declarer, WorkCheck};
+        let identity = WorkIdentity::new("tend", "ENG-5");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let declared = WorkEdit {
+            title: Some("x".into()),
+            cwd: Some("/repo".into()),
+            checks: Some(vec![WorkCheck::new("cargo test")]),
+            ..WorkEdit::default()
+        }
+        .apply_as(&identity, None, now, &Declarer::Operator)
+        .unwrap();
+        let repin = || WorkEdit {
+            verify_cwd: Some("/worktrees/ENG-5".into()),
+            ..WorkEdit::default()
+        };
+        assert!(repin()
+            .apply(&identity, Some(declared.clone()), now)
+            .is_err());
+        assert!(repin()
+            .apply_as(
+                &identity,
+                Some(declared.clone()),
+                now,
+                &Declarer::Agent {
+                    session_id: "orchestrator".into()
+                }
+            )
+            .is_err());
+        let moved = repin()
+            .apply_as(&identity, Some(declared), now, &Declarer::Operator)
+            .unwrap();
+        assert_eq!(moved.plan.unwrap().checks_dir(), Some("/worktrees/ENG-5"));
     }
 }

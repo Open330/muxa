@@ -89,41 +89,49 @@ pub(crate) fn verify_edit(
     (acceptance, checks)
 }
 
-/// Record the acceptance criteria and checks given to `tend work up` /
-/// `tend_start_work` on the Work it started. A Work without a directory
-/// gets the run's. Where the checks then run is tendd's: the Work's durable
-/// Run directory, so a route worktree or `--cwd` is what gets verified.
-pub(crate) async fn declare_verification(
+/// Before `tend work up` / `tend_start_work` launches anything: record the
+/// acceptance criteria and checks it was given, and pin the Work's checks
+/// to the directory it is about to start in (a route worktree or `--cwd`),
+/// so tend verifies the result and not the original checkout. tendd holds
+/// both to the declarer rule; a refusal (an agent starting a Work whose
+/// checks the person declared, into another directory) stops the launch.
+pub(crate) async fn bind_verification(
     client: &Client,
     identity: &WorkIdentity,
     acceptance: Option<Vec<String>>,
     checks: Option<Vec<tend::work_verify::WorkCheck>>,
-    run_cwd: &Path,
+    launch_dir: &Path,
 ) -> Result<()> {
-    if acceptance.is_none() && checks.is_none() {
-        return Ok(());
-    }
     let existing = client
         .work_backlog(None)
         .await?
         .into_iter()
         .find(|record| record.identity == *identity);
-    let has_cwd = existing
-        .as_ref()
-        .and_then(|record| record.plan.as_ref())
-        .is_some_and(|plan| plan.cwd.is_some());
+    let plan = existing.as_ref().and_then(|record| record.plan.as_ref());
+    let launch = launch_dir.to_string_lossy().into_owned();
+    let has_checks = checks.as_ref().map_or_else(
+        || plan.is_some_and(|plan| !plan.checks.is_empty()),
+        |checks| !checks.is_empty(),
+    );
+    let moved = has_checks && plan.and_then(|plan| plan.checks_dir()) != Some(launch.as_str());
+    if acceptance.is_none() && checks.is_none() && !moved {
+        return Ok(());
+    }
     let edit = WorkEdit {
         acceptance,
         checks,
-        cwd: (!has_cwd).then(|| run_cwd.to_string_lossy().into_owned()),
-        // A record made here belongs to a Work that is running now.
+        verify_cwd: has_checks.then(|| launch.clone()),
+        cwd: plan
+            .is_none_or(|plan| plan.cwd.is_none())
+            .then(|| launch.clone()),
+        // A record made here belongs to a Work that is starting now.
         stage: existing.is_none().then_some(WorkStage::InProgress),
         ..WorkEdit::default()
     };
     client
         .work_edit(identity, &edit)
         .await
-        .context("recording the Work's acceptance criteria and checks")?;
+        .with_context(|| format!("binding the Work's checks to {launch}; nothing was started"))?;
     Ok(())
 }
 
@@ -246,6 +254,7 @@ pub async fn run_plan(args: PlanArgs, client: &Client) -> Result<()> {
     let edit = WorkEdit {
         acceptance,
         checks,
+        verify_cwd: None,
         title: args.title,
         goal: args.goal,
         next_action: args.next_action,

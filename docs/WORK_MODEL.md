@@ -77,10 +77,13 @@ gives the whole list, which replaces the Work's (`--no-acceptance`,
 `--no-checks` clear them). `tend_start_work` takes the same lists as
 `acceptance` and `checks`, and both refuse a bad list before anything
 starts. Checks are pinned to the plan's `cwd` as it was when they were
-declared, so a later `cwd` edit does not move them; a Work that has a durable
-Run (`work up`) is verified in that Run's directory, so a route worktree or
-`--cwd` is what gets verified. The commands come only from this declaration, never from
-repository content. They are stored on the plan (`work_verify_v1`) with who
+declared, so a later `cwd` edit does not move them. Before `work up` or
+`tend_start_work` launches anything, it re-pins them to the directory it is
+about to start in, so a route worktree or `--cwd` is what gets verified; that
+re-pin follows the declarer rule below, and when it is refused (an agent
+starting the person's Work somewhere else) nothing is launched. A pipeline
+registration never moves them. The commands come only from this declaration,
+never from repository content. They are stored on the plan (`work_verify_v1`) with who
 declared them, and shown by `tend work show`.
 
 tendd records the declarer from the caller it observes: the agent whose pane
@@ -90,13 +93,17 @@ change its own, but not the person's or another agent's. This keeps the agent
 whose work is checked from rewriting its own checks. It is not
 authentication: every caller runs as the same user.
 
-tendd runs the checks itself, one after another in the Work's directory
-(its durable Run's, else the one the checks were declared for),
-when an agent reports a result: `tend_file_result` or
+tendd runs the checks itself, one after another in the directory they are
+pinned to, when an agent reports a result: `tend_file_result` or
 `tend work done --summary` on the Work (or on a collaboration request sent
-for it), and `tend work done` before it marks the alias done. Each check
-gets its own time limit (default 300 s, at most 1,200 s) and all of them
-together at most 1,200 s; output is kept to its last 40 lines.
+for it), a result recorded as already decided from an agent's pane, and
+`tend work done` before it marks the alias done. Whether a result comes
+from an agent is what tendd observes about the caller, not what the record
+says. Each check gets its own time limit (default 300 s, at most 1,200 s)
+and all of them together at most 1,200 s; output is kept to its last 40
+lines. Whatever a check started is stopped when it ends; a process that
+escapes and keeps the output open fails the check after five seconds rather
+than holding it.
 
 - Every check passes: the result record is filed with each check as test
   evidence marked as run by tend (`"verified": true`), ahead of the agent's
@@ -105,8 +112,9 @@ together at most 1,200 s; output is kept to its last 40 lines.
   stays open, and the agent gets `checks_failed` with each check's output to
   fix and report again. The person is not asked.
 
-A completion right after a passing result (within ten minutes) reuses that
-verification instead of running the checks again.
+A completion right after a passing result reuses that pass once instead of
+running the checks again, only within two minutes and only for the same
+checks, directory and Run generation; a failing run in between cancels it.
 
 ### External issues
 

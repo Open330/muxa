@@ -32,7 +32,7 @@ pub(super) async fn handle(
             *kind = "pipeline_done";
             // A Work with declared checks completes only once they pass;
             // a result record filed just before already ran them.
-            match Box::pin(crate::work_verify::verify_unless_recent(
+            match Box::pin(crate::work_verify::verify_for_completion(
                 &ctx.work_store,
                 pipeline_runs,
                 &identity,

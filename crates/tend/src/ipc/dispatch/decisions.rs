@@ -17,10 +17,12 @@ pub(super) async fn handle(
     let kind = &mut turn.kind;
     let pending_audit = &mut turn.pending_audit;
     let response = match body {
+        // Every way a result enters the store: an agent's result on a Work
+        // with declared checks is verified by tend first, and a failure
+        // keeps it from the person.
         RequestBody::ReviewCreate { mut review } => {
-            // A result an agent files on a Work with declared checks is
-            // verified by tend first; a failure keeps it from the person.
-            match Box::pin(verify_result(ctx, &mut review)).await {
+            let caller_is_agent = caller_is_agent(ctx, conn).await;
+            match Box::pin(verify_result(ctx, &mut review, caller_is_agent)).await {
                 Ok(()) => {
                     let (name, response) = Box::pin(review_response(
                         reviews,
@@ -36,11 +38,38 @@ pub(super) async fn handle(
                 }
             }
         }
+        RequestBody::ReviewRecord {
+            mut review,
+            disposition,
+            note,
+        } => {
+            // Normally the person recording what they decided; from an
+            // agent's pane it is a result like any other.
+            let caller_is_agent = caller_is_agent(ctx, conn).await;
+            match Box::pin(verify_result(ctx, &mut review, caller_is_agent)).await {
+                Ok(()) => {
+                    let (name, response) = Box::pin(review_response(
+                        reviews,
+                        RequestBody::ReviewRecord {
+                            review,
+                            disposition,
+                            note,
+                        },
+                    ))
+                    .await;
+                    *kind = name;
+                    response
+                }
+                Err(refusal) => {
+                    *kind = "review_record";
+                    Response::err(refusal)
+                }
+            }
+        }
         body @ (RequestBody::ReviewGet { .. }
         | RequestBody::ReviewList { .. }
         | RequestBody::ReviewSummary
-        | RequestBody::ReviewDispose { .. }
-        | RequestBody::ReviewRecord { .. }) => {
+        | RequestBody::ReviewDispose { .. }) => {
             // One boxed arm keeps this dispatch frame from growing.
             let (name, response) = Box::pin(review_response(reviews, body)).await;
             *kind = name;
@@ -94,9 +123,10 @@ pub(super) async fn handle(
 async fn verify_result(
     ctx: &ServerCtx,
     review: &mut crate::review::NewReview,
+    caller_is_agent: bool,
 ) -> Result<(), String> {
     crate::work_verify::strip_claims(&mut review.decision);
-    if review.requested_by.kind != crate::review::ActorKind::Agent {
+    if !crate::work_verify::result_needs_checks(caller_is_agent, review.requested_by.kind) {
         return Ok(());
     }
     let identity = match &review.target {
@@ -124,4 +154,12 @@ async fn verify_result(
         }
         crate::work_verify::Gate::Failed(outcomes) => Err(crate::work_verify::refusal(&outcomes)),
     }
+}
+
+/// Whether tendd observes the caller running in a tracked agent's pane.
+async fn caller_is_agent(ctx: &ServerCtx, conn: &mut Conn) -> bool {
+    matches!(
+        Box::pin(super::work_ops::declarer(ctx, conn)).await,
+        crate::work_verify::Declarer::Agent { .. }
+    )
 }

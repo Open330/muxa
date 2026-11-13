@@ -55,7 +55,7 @@ impl Declarer {
 }
 
 /// One command tend runs to verify a result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkCheck {
     /// Shell command line, run in the Work's directory.
@@ -230,25 +230,73 @@ pub fn run_checks(checks: &[WorkCheck], dir: &std::path::Path) -> Vec<CheckOutco
         .collect()
 }
 
+/// What a reader thread has collected so far, and whether its stream
+/// closed. Shared so the check can stop waiting for a stream that never
+/// closes and still report what it printed.
+#[derive(Default)]
+struct Collected {
+    bytes: Vec<u8>,
+    closed: bool,
+}
+
+type SharedOutput = std::sync::Arc<std::sync::Mutex<Collected>>;
+
 /// Keep the newest [`OUTPUT_BUDGET`] bytes of `stream` on its own thread.
-fn drain(stream: Option<Box<dyn std::io::Read + Send>>) -> std::thread::JoinHandle<Vec<u8>> {
+/// The thread is never joined: a process that escaped the check's group
+/// may hold the stream open past the check, and the thread then ends when
+/// that process does.
+fn drain(stream: Option<Box<dyn std::io::Read + Send>>) -> SharedOutput {
+    let shared = SharedOutput::default();
+    let collected = std::sync::Arc::clone(&shared);
     std::thread::spawn(move || {
-        let mut kept = Vec::new();
         if let Some(mut stream) = stream {
             let mut chunk = [0_u8; 8192];
             while let Ok(n) = std::io::Read::read(&mut stream, &mut chunk) {
                 if n == 0 {
                     break;
                 }
-                kept.extend_from_slice(&chunk[..n]);
-                if kept.len() > OUTPUT_BUDGET {
-                    let excess = kept.len() - OUTPUT_BUDGET;
-                    kept.drain(..excess);
+                let mut collected = collected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                collected.bytes.extend_from_slice(&chunk[..n]);
+                if collected.bytes.len() > OUTPUT_BUDGET {
+                    let excess = collected.bytes.len() - OUTPUT_BUDGET;
+                    collected.bytes.drain(..excess);
                 }
             }
         }
-        kept
-    })
+        collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    });
+    shared
+}
+
+/// How long a check's output may stay open after the check itself ended.
+const OUTPUT_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait until both streams closed or `deadline`; their bytes, and whether
+/// they closed.
+fn collect(
+    stdout: &SharedOutput,
+    stderr: &SharedOutput,
+    deadline: std::time::Instant,
+) -> (Vec<u8>, Vec<u8>, bool) {
+    let read = |shared: &SharedOutput| {
+        let collected = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (collected.bytes.clone(), collected.closed)
+    };
+    loop {
+        let (out, out_closed) = read(stdout);
+        let (err, err_closed) = read(stderr);
+        if (out_closed && err_closed) || std::time::Instant::now() >= deadline {
+            return (out, err, out_closed && err_closed);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// stdout, then stderr on a fresh line.
@@ -351,13 +399,23 @@ fn run_check(check: &WorkCheck, dir: &std::path::Path, limit: std::time::Duratio
         let _ = child.kill();
         let _ = child.wait();
     }
-    let output = combined(
-        stdout.join().unwrap_or_default(),
-        &stderr.join().unwrap_or_default(),
+    // Bounded even if a process escaped the group (`setsid`) and still
+    // holds the output open: that check fails rather than hangs.
+    let (out, err, closed) = collect(
+        &stdout,
+        &stderr,
+        std::time::Instant::now() + OUTPUT_CLOSE_GRACE,
     );
-    let tail = tail_of(&output, timed_out.then_some(limit));
+    let mut tail = tail_of(&combined(out, &err), timed_out.then_some(limit));
+    if !closed {
+        if !tail.is_empty() {
+            tail.push('\n');
+        }
+        tail.push_str("a process the check started kept its output open; stopped waiting");
+        tail = crate::decision::clean_tail(&tail);
+    }
     let exit_code = status.and_then(|status| status.code());
-    let passed = status.is_some_and(|status| status.success());
+    let passed = closed && status.is_some_and(|status| status.success());
     outcome(passed, exit_code, timed_out, tail)
 }
 
@@ -370,10 +428,11 @@ pub enum Gate {
     Failed(Vec<CheckOutcome>),
 }
 
-/// Run `identity`'s declared checks off the async runtime, in its durable
-/// Run's directory when it has one (where `work up` put it: a route
-/// worktree, `--cwd`), else the directory the checks were declared for. A
-/// Work with no checks (or no record) is [`Gate::NoChecks`].
+/// Run `identity`'s declared checks off the async runtime, in the directory
+/// they are pinned to (`WorkPlan::verify_cwd`: where they were declared, or
+/// where `work up` re-pinned them under the declarer rule before launch). A
+/// pipeline registration never moves it. A Work with no checks (or no
+/// record) is [`Gate::NoChecks`].
 pub async fn verify(
     store: &crate::dashboard::work_store::SharedWorkStore,
     runs: &crate::pipeline_run::PipelineRunStore,
@@ -387,11 +446,8 @@ pub async fn verify(
     let Some(plan) = plan.filter(|plan| !plan.checks.is_empty()) else {
         return Gate::NoChecks;
     };
-    let run_dir = runs
-        .get(identity)
-        .await
-        .map(|run| run.cwd.to_string_lossy().into_owned());
-    let Some(dir) = run_dir.or_else(|| plan.checks_dir().map(str::to_owned)) else {
+    let generation = runs.get(identity).await.map(|run| run.generation);
+    let Some(dir) = plan.checks_dir().map(str::to_owned) else {
         // Refused at edit time; kept as a failure rather than a pass.
         return Gate::Failed(vec![CheckOutcome {
             command: plan.checks[0].command.clone(),
@@ -402,53 +458,92 @@ pub async fn verify(
             tail: "not run: the Work has no directory".into(),
         }]);
     };
+    let fingerprint = PassKey {
+        identity: identity.clone(),
+        checks: plan.checks.clone(),
+        dir: dir.clone(),
+        generation,
+    };
     let checks = plan.checks;
     let outcomes =
         tokio::task::spawn_blocking(move || run_checks(&checks, std::path::Path::new(&dir)))
             .await
             .unwrap_or_default();
-    if !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.passed) {
-        remember_pass(identity);
+    let passed = !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.passed);
+    record_result(&fingerprint, passed);
+    if passed {
         Gate::Passed(outcomes)
     } else {
         Gate::Failed(outcomes)
     }
 }
 
-/// How long a passing verification of a Work covers a following
-/// completion, so `tend work done --summary` runs the checks once.
-const PASS_REUSE: std::time::Duration = std::time::Duration::from_secs(600);
+/// What a pass was for: the same Work, the same checks, the same
+/// directory and the same durable Run generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PassKey {
+    identity: crate::work::WorkIdentity,
+    checks: Vec<WorkCheck>,
+    dir: String,
+    generation: Option<u64>,
+}
 
-fn passes() -> &'static std::sync::Mutex<
-    std::collections::HashMap<crate::work::WorkIdentity, std::time::Instant>,
-> {
+/// How long a pass can stand in for the completion that follows it: the
+/// pair `tend work done --summary` sends back to back.
+const PASS_REUSE: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn passes() -> &'static std::sync::Mutex<std::collections::HashMap<PassKey, std::time::Instant>> {
     static PASSES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<crate::work::WorkIdentity, std::time::Instant>>,
+        std::sync::Mutex<std::collections::HashMap<PassKey, std::time::Instant>>,
     > = std::sync::OnceLock::new();
     PASSES.get_or_init(Default::default)
 }
 
-fn remember_pass(identity: &crate::work::WorkIdentity) {
-    let mut passes = passes()
+/// Remember a pass for its exact [`PassKey`]; a failure forgets every
+/// pass of that Work.
+fn record_result(key: &PassKey, passed: bool) {
+    let mut table = passes()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    passes.retain(|_, at| at.elapsed() < PASS_REUSE);
-    passes.insert(identity.clone(), std::time::Instant::now());
+    table.retain(|_, at| at.elapsed() < PASS_REUSE);
+    if passed {
+        table.insert(key.clone(), std::time::Instant::now());
+    } else {
+        table.retain(|pass, _| pass.identity != key.identity);
+    }
 }
 
-/// [`verify`], unless the same Work passed within [`PASS_REUSE`].
-pub async fn verify_unless_recent(
+/// [`verify`] for a completion: a pass of the very same checks, directory
+/// and Run generation within [`PASS_REUSE`] stands in once and is used up;
+/// anything else runs the checks again.
+pub async fn verify_for_completion(
     store: &crate::dashboard::work_store::SharedWorkStore,
     runs: &crate::pipeline_run::PipelineRunStore,
     identity: &crate::work::WorkIdentity,
 ) -> Gate {
-    let recent = passes()
+    let plan = store
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .await
         .get(identity)
-        .is_some_and(|at| at.elapsed() < PASS_REUSE);
-    if recent {
-        return Gate::Passed(Vec::new());
+        .and_then(|record| record.plan)
+        .filter(|plan| !plan.checks.is_empty());
+    if let Some(plan) = &plan {
+        if let Some(dir) = plan.checks_dir() {
+            let key = PassKey {
+                identity: identity.clone(),
+                checks: plan.checks.clone(),
+                dir: dir.to_owned(),
+                generation: runs.get(identity).await.map(|run| run.generation),
+            };
+            let reused = passes()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key)
+                .is_some_and(|at| at.elapsed() < PASS_REUSE);
+            if reused {
+                return Gate::Passed(Vec::new());
+            }
+        }
     }
     verify(store, runs, identity).await
 }
@@ -468,6 +563,15 @@ pub fn attach(decision: &mut Option<crate::decision::Decision>, outcomes: &[Chec
     }
     evidence.truncate(crate::decision::MAX_EVIDENCE);
     decision.evidence = evidence;
+}
+
+/// Whether a result must pass its Work's checks before it is filed. Only
+/// what is both declared and observed to come from the person is exempt:
+/// the record's actor is the client's own claim, and an agent can set it
+/// to `user`; the observed caller cannot be chosen.
+#[must_use]
+pub fn result_needs_checks(caller_is_agent: bool, claimed: crate::review::ActorKind) -> bool {
+    caller_is_agent || claimed == crate::review::ActorKind::Agent
 }
 
 /// Clear any client's claim that tend ran its evidence.
@@ -676,11 +780,48 @@ mod tests {
             verify(&store, &runs, &identity).await,
             Gate::Passed(_)
         ));
-        // A completion right after reuses the pass instead of rerunning.
+        // A completion right after reuses that exact pass once, without
+        // rerunning; the next one runs the checks again.
+        assert!(matches!(
+            verify_for_completion(&store, &runs, &identity).await,
+            Gate::Passed(outcomes) if outcomes.is_empty()
+        ));
+        assert!(matches!(
+            verify_for_completion(&store, &runs, &identity).await,
+            Gate::Passed(outcomes) if !outcomes.is_empty()
+        ));
+        // A failure in between forgets the pass: completion re-checks.
         std::fs::remove_file(dir.path().join("ready")).unwrap();
         assert!(matches!(
-            verify_unless_recent(&store, &runs, &identity).await,
-            Gate::Passed(outcomes) if outcomes.is_empty()
+            verify(&store, &runs, &identity).await,
+            Gate::Failed(_)
+        ));
+        assert!(matches!(
+            verify_for_completion(&store, &runs, &identity).await,
+            Gate::Failed(_)
+        ));
+        // A pass of other checks does not stand in for the current ones.
+        std::fs::write(dir.path().join("ready"), b"").unwrap();
+        assert!(matches!(
+            verify(&store, &runs, &identity).await,
+            Gate::Passed(_)
+        ));
+        store
+            .lock()
+            .await
+            .edit_as(
+                identity.clone(),
+                WorkEdit {
+                    checks: Some(vec![WorkCheck::new("test -f other")]),
+                    ..WorkEdit::default()
+                },
+                Some(&Declarer::Operator),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_for_completion(&store, &runs, &identity).await,
+            Gate::Failed(_)
         ));
     }
 
@@ -728,6 +869,36 @@ mod tests {
             verify(&store, &runs, &identity).await,
             Gate::Passed(_)
         ));
+        // A pipeline registration naming another directory (one any client
+        // can send) does not move the checks there either.
+        let routed = tempfile::tempdir().unwrap();
+        std::fs::write(routed.path().join("result"), b"").unwrap();
+        std::fs::remove_file(worktree.path().join("result")).unwrap();
+        runs.register(crate::pipeline_run::PipelineRunRegistration {
+            identity: identity.clone(),
+            pipeline: "solo".into(),
+            desired: vec![crate::pipeline::DesiredAgent {
+                alias: "impl".into(),
+                program: "codex".into(),
+                role: None,
+                task: None,
+                prompt: None,
+                direction: None,
+                options: Vec::new(),
+                after: Vec::new(),
+                purpose: crate::collaboration::LaunchPurpose::Primary,
+            }],
+            cwd: routed.path().to_path_buf(),
+            window_id: None,
+            observed: Vec::new(),
+            invalidate: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            verify(&store, &runs, &identity).await,
+            Gate::Failed(_)
+        ));
     }
 
     /// A check that leaves a process in the background holding its output
@@ -744,5 +915,48 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(outcome.passed, "{}", outcome.tail);
         assert_eq!(outcome.tail, "started background");
+    }
+
+    /// A process that leaves the check's process group and keeps its
+    /// output open cannot hang the verification: the check fails after a
+    /// short grace instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_escaping_the_group_with_the_output_open_fails_the_check() {
+        if std::process::Command::new("perl")
+            .arg("-v")
+            .output()
+            .map_or(true, |out| !out.status.success())
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = &run_checks(
+            &[WorkCheck::new(
+                "perl -MPOSIX -e '$|=1; POSIX::setsid(); print qq(escaped\\n); sleep 8' & sleep 1; exit 0",
+            )],
+            dir.path(),
+        )[0];
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        assert!(!outcome.passed);
+        assert!(outcome.tail.contains("escaped"), "{}", outcome.tail);
+        assert!(
+            outcome.tail.contains("kept its output open"),
+            "{}",
+            outcome.tail
+        );
+    }
+
+    #[test]
+    fn a_result_is_exempt_only_when_both_claimed_and_observed_to_be_the_persons() {
+        use crate::review::ActorKind;
+        assert!(!result_needs_checks(false, ActorKind::User));
+        assert!(
+            result_needs_checks(true, ActorKind::User),
+            "an agent claiming to be the person"
+        );
+        assert!(result_needs_checks(false, ActorKind::Agent));
+        assert!(result_needs_checks(true, ActorKind::Agent));
     }
 }
