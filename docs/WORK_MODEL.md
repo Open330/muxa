@@ -61,6 +61,35 @@ dashboard's editor, which keeps the plan when it saves metadata) and are
 served over IPC as `work_backlog`, `work_edit` and `work_record_show`
 (`work_backlog_v1`).
 
+### Acceptance and checks
+
+A Work can say what done means and how tend checks it:
+
+```sh
+tend work plan web/ENG-1 --title "Fix login" \
+  --accept "login lands on /home" --accept "no new warnings" \
+  --check "cargo test -p web" --check "cargo clippy -- -D warnings"
+tend work up ENG-2 --check "npm test"        # recorded on the Work it starts
+```
+
+`--accept` adds a criterion and `--check` a shell command; repeating a flag
+gives the whole list, which replaces the Work's (`--no-acceptance`,
+`--no-checks` clear them). `tend_start_work` takes the same lists as
+`acceptance` and `checks`, and both refuse a bad list before anything
+starts. Checks are pinned to the plan's `cwd` as it was when they were
+declared, so a later `cwd` edit does not move them; a Work that has a durable
+Run (`work up`) is verified in that Run's directory, so a route worktree or
+`--cwd` is what gets verified. The commands come only from this declaration, never from
+repository content. They are stored on the plan (`work_verify_v1`) with who
+declared them, and shown by `tend work show`.
+
+tendd records the declarer from the caller it observes: the agent whose pane
+the caller runs in, or else the person. The person may always change a
+Work's acceptance and checks; an agent may set them where nobody has, or
+change its own, but not the person's or another agent's. This keeps the agent
+whose work is checked from rewriting its own checks. It is not
+authentication: every caller runs as the same user.
+
 ### External issues
 
 ```sh

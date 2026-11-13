@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expired, cancelled, still open, and how many carry `reply_overdue` or
   `wake_unsubmitted` as their latest recorded interruption, with shares. The
   daemon's collaboration health carries it as `weekly_outcomes`.
+- A Work can carry acceptance criteria and declared checks:
+  `tend work plan --accept TEXT --check CMD` (repeatable; `--no-acceptance`,
+  `--no-checks`), the same flags on `tend work up`, and `acceptance` /
+  `checks` on `tend_start_work`. They are stored on the Work's plan
+  (`work_verify_v1`) with who declared them, run where the Work last started,
+  and shown by `tend work show`. An agent cannot change acceptance or checks
+  the person or another agent declared.
 
 ### Changed
 

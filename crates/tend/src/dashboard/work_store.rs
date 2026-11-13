@@ -145,8 +145,23 @@ impl WorkStore {
         identity: WorkIdentity,
         edit: crate::work::WorkEdit,
     ) -> Result<WorkRecord, String> {
+        self.edit_as(identity, edit, None).await
+    }
+
+    /// [`Self::edit`] on behalf of `declarer`, needed for an edit that
+    /// touches acceptance criteria or checks.
+    pub async fn edit_as(
+        &mut self,
+        identity: WorkIdentity,
+        edit: crate::work::WorkEdit,
+        declarer: Option<&crate::work_verify::Declarer>,
+    ) -> Result<WorkRecord, String> {
         let previous = self.works.get(&identity).cloned();
-        let record = edit.apply(&identity, previous.clone(), OffsetDateTime::now_utc())?;
+        let now = OffsetDateTime::now_utc();
+        let record = match declarer {
+            Some(declarer) => edit.apply_as(&identity, previous.clone(), now, declarer)?,
+            None => edit.apply(&identity, previous.clone(), now)?,
+        };
         if previous.as_ref() == Some(&record) {
             return Ok(record);
         }

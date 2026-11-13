@@ -680,7 +680,9 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Tend never attaches transcripts or diffs implicitly." },
                     "no_ticket": { "type": "boolean", "description": "Skip ticket lookup and use the work id alone. Default false." },
                     "refresh": { "type": "boolean", "description": "Ignore the cached ticket and ask the resolver again. Default false." },
-                    "dry_run": { "type": "boolean", "description": "Return the plan without creating panes or sending prompts. Default false." }
+                    "dry_run": { "type": "boolean", "description": "Return the plan without creating panes or sending prompts. Default false." },
+                    "acceptance": { "type": "array", "maxItems": tend::work_verify::MAX_ACCEPTANCE, "items": { "type": "string" }, "description": "What done means, one criterion per entry. Stored on the Work; replaces its list." },
+                    "checks": { "type": "array", "maxItems": tend::work_verify::MAX_CHECKS, "items": { "type": "string" }, "description": "Shell commands tend runs in the Work's directory to verify the result before the person sees it (e.g. \"cargo test\"). Stored on the Work; replaces its list." }
                 },
                 "required": ["work"],
                 "additionalProperties": false
@@ -3744,7 +3746,18 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
         no_ticket: flag("no_ticket"),
         refresh: flag("refresh"),
         json: true,
+        acceptance: Vec::new(),
+        checks: Vec::new(),
     };
+    let (acceptance, checks) = match start_work_verification(args) {
+        Ok(verification) => verification,
+        Err(error) => return error_result(&error),
+    };
+    if acceptance.is_some() || checks.is_some() {
+        if let Err(error) = crate::work_backlog::require_verify(client).await {
+            return error_result(&format!("{error:#}"));
+        }
+    }
     let resolved = match crate::work_up::resolve(&up, config, Some(client)).await {
         Ok(resolved) => resolved,
         Err(error) => return error_result(&format!("{error:#}")),
@@ -3778,10 +3791,64 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
             Err(error) => return error_result(&format!("tend_start_work worker failed: {error}")),
         }
     };
+    if !result.dry_run {
+        if let Err(error) = crate::work_backlog::declare_verification(
+            client,
+            &tend::work::WorkIdentity::new(result.workspace.clone(), result.work.clone()),
+            acceptance,
+            checks,
+            &result.cwd,
+        )
+        .await
+        {
+            return error_result(&format!(
+                "tend_start_work started the Work but could not record its acceptance or checks: {error:#}"
+            ));
+        }
+    }
     match serde_json::to_value(&result) {
         Ok(value) => json_result(&value),
         Err(error) => error_result(&format!("tend_start_work could not serialize: {error}")),
     }
+}
+
+/// `tend_start_work`'s `acceptance` and `checks`: `None` leaves the Work's
+/// list alone.
+#[allow(clippy::type_complexity)]
+fn start_work_verification(
+    args: &Value,
+) -> std::result::Result<
+    (
+        Option<Vec<String>>,
+        Option<Vec<tend::work_verify::WorkCheck>>,
+    ),
+    String,
+> {
+    let strings = |key: &str| -> std::result::Result<Option<Vec<String>>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("{key} must be an array of strings"))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map(Some),
+            Some(_) => Err(format!("{key} must be an array of strings")),
+        }
+    };
+    let acceptance = strings("acceptance")?;
+    let checks = strings("checks")?.map(|checks| {
+        checks
+            .into_iter()
+            .map(tend::work_verify::WorkCheck::new)
+            .collect()
+    });
+    crate::work_backlog::validate_verify_edit(acceptance.as_ref(), checks.as_ref())
+        .map_err(|error| error.to_string())?;
+    Ok((acceptance, checks))
 }
 
 /// Adapter over [`tend::request::compose`]: read the JSON-RPC argument

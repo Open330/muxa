@@ -295,11 +295,18 @@ async fn route(
         | RequestBody::WorkEdit { .. }
         | RequestBody::WorkRecordShow { .. }
         | RequestBody::WorkExternalUpsert { .. }) => {
+            let declarer = match &body {
+                RequestBody::WorkEdit { edit, .. } if edit.touches_verification() => {
+                    Some(Box::pin(work_ops::declarer(ctx, conn)).await)
+                }
+                _ => None,
+            };
             let (name, response) = Box::pin(super::work_backlog::response(
                 &ctx.work_store,
                 &ctx.reviews,
                 &ctx.pipeline_runs,
                 body,
+                declarer,
             ))
             .await;
             turn.kind = name;

@@ -265,6 +265,9 @@ pub struct WorkRecord {
 pub const WORK_BACKLOG_CAPABILITY: &str = "work_backlog_v1";
 /// Daemons that honor `newest` on `work_record_show`.
 pub const WORK_RECENT_RESULTS_CAPABILITY: &str = "work_recent_results_v1";
+/// Daemons that store acceptance criteria and declared checks on a Work
+/// (`WorkPlan::acceptance`, `WorkPlan::checks`).
+pub const WORK_VERIFY_CAPABILITY: &str = "work_verify_v1";
 /// Daemons that store client-refreshed external references
 /// (`work_external_upsert`).
 pub const WORK_EXTERNAL_CAPABILITY: &str = "work_external_v1";
@@ -288,9 +291,36 @@ pub struct WorkPlan {
     /// Backlog order: lower first; unset sorts after every set value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
+    /// What done means, one criterion per entry, as the person or the
+    /// requesting agent wrote it (`work_verify_v1`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+    /// Commands tend runs in `cwd` to verify a result before anyone looks
+    /// at it (`work_verify_v1`). Declared here by the person or the
+    /// requesting agent, never read from the repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::work_verify::WorkCheck>,
+    /// The directory the checks were declared for: `cwd` as it was when
+    /// they were declared, so a later `cwd` edit by someone else does not
+    /// move them. Set by tendd, never by a client. A Work with a durable
+    /// Run is verified in the Run's directory instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_cwd: Option<String>,
+    /// Who declared `acceptance` and `checks`. Set by tendd from the
+    /// caller, never from a client's request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_by: Option<crate::work_verify::Declarer>,
 }
 
 impl WorkPlan {
+    /// The directory the checks were declared for. Only the pinned value:
+    /// falling back to `cwd` would let an edit that is not a verification
+    /// edit move them.
+    #[must_use]
+    pub fn checks_dir(&self) -> Option<&str> {
+        self.verify_cwd.as_deref()
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -324,6 +354,20 @@ pub struct WorkEdit {
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clear_priority: bool,
+    /// Replace the acceptance criteria; an empty list clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<Vec<String>>,
+    /// Replace the declared checks; an empty list clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<crate::work_verify::WorkCheck>>,
+}
+
+impl WorkEdit {
+    /// Whether this edit changes what tend verifies.
+    #[must_use]
+    pub fn touches_verification(&self) -> bool {
+        self.acceptance.is_some() || self.checks.is_some()
+    }
 }
 
 /// One edited text field: `None` keeps the old value, an empty string
@@ -350,12 +394,39 @@ fn edit_text(
 
 impl WorkEdit {
     /// Apply to `record` (or a fresh queued one) at `now`. Validates every
-    /// given field; nothing is changed on error.
+    /// given field; nothing is changed on error. An edit that touches the
+    /// verification is refused here; use [`Self::apply_as`].
     pub fn apply(
         self,
         identity: &WorkIdentity,
         record: Option<WorkRecord>,
         now: OffsetDateTime,
+    ) -> Result<WorkRecord, String> {
+        if self.touches_verification() {
+            return Err("acceptance criteria and checks need a known declarer".into());
+        }
+        self.apply_inner(identity, record, now, None)
+    }
+
+    /// [`Self::apply`] on behalf of `declarer`, which must be allowed to
+    /// replace the Work's current declaration
+    /// ([`crate::work_verify::Declarer::may_replace`]).
+    pub fn apply_as(
+        self,
+        identity: &WorkIdentity,
+        record: Option<WorkRecord>,
+        now: OffsetDateTime,
+        declarer: &crate::work_verify::Declarer,
+    ) -> Result<WorkRecord, String> {
+        self.apply_inner(identity, record, now, Some(declarer))
+    }
+
+    fn apply_inner(
+        self,
+        identity: &WorkIdentity,
+        record: Option<WorkRecord>,
+        now: OffsetDateTime,
+        declarer: Option<&crate::work_verify::Declarer>,
     ) -> Result<WorkRecord, String> {
         validate_identity(identity)?;
         let created = record.is_none();
@@ -402,6 +473,42 @@ impl WorkEdit {
         }
         if let Some(priority) = self.priority {
             plan.priority = Some(priority);
+        }
+        let touches = self.acceptance.is_some() || self.checks.is_some();
+        if touches {
+            let Some(declarer) = declarer else {
+                return Err("acceptance criteria and checks need a known declarer".into());
+            };
+            if !declarer.may_replace(plan.declared_by.as_ref()) {
+                return Err(match plan.declared_by.as_ref() {
+                    Some(crate::work_verify::Declarer::Operator) => "this Work's acceptance and checks were declared by the person; an agent cannot change them".into(),
+                    _ => "this Work's acceptance and checks were declared by another agent; only it or the person can change them".into(),
+                });
+            }
+        }
+        if let Some(acceptance) = self.acceptance {
+            plan.acceptance = crate::work_verify::validate_acceptance(acceptance)?;
+        }
+        let redeclared = self.checks.is_some();
+        if let Some(checks) = self.checks {
+            plan.checks = crate::work_verify::validate_checks(checks)?;
+        }
+        // Pin the checks to the directory they were declared for, so a
+        // later `cwd` edit by anyone does not move them.
+        if redeclared {
+            plan.verify_cwd = if plan.checks.is_empty() {
+                None
+            } else {
+                plan.cwd.clone()
+            };
+        }
+        if touches {
+            plan.declared_by = (!plan.acceptance.is_empty() || !plan.checks.is_empty())
+                .then(|| declarer.cloned())
+                .flatten();
+        }
+        if !plan.checks.is_empty() && plan.checks_dir().is_none() {
+            return Err("checks need a directory to run in: give the Work a cwd".into());
         }
         record.plan = (!plan.is_empty()).then_some(plan);
         if created
@@ -1347,5 +1454,138 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_work_carries_acceptance_and_checks_that_need_a_directory() {
+        let identity = WorkIdentity::new("tend", "ENG-1");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let operator = crate::work_verify::Declarer::Operator;
+        let checks = vec![crate::work_verify::WorkCheck::new("cargo test")];
+        let refused = WorkEdit {
+            title: Some("x".into()),
+            checks: Some(checks.clone()),
+            ..WorkEdit::default()
+        }
+        .apply_as(&identity, None, now, &operator);
+        assert!(refused.unwrap_err().contains("directory"));
+
+        let record = WorkEdit {
+            title: Some("x".into()),
+            cwd: Some("/src/tend".into()),
+            acceptance: Some(vec![" tests pass ".into()]),
+            checks: Some(checks),
+            ..WorkEdit::default()
+        }
+        .apply_as(&identity, None, now, &operator)
+        .unwrap();
+        let plan = record.plan.as_ref().unwrap();
+        assert_eq!(plan.declared_by, Some(operator.clone()));
+        assert_eq!(plan.acceptance, ["tests pass"]);
+        assert_eq!(plan.checks[0].command, "cargo test");
+
+        // An edit that names neither keeps them; an empty list clears.
+        let kept = WorkEdit {
+            title: Some("y".into()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, Some(record.clone()), now)
+        .unwrap();
+        assert_eq!(kept.plan.as_ref().unwrap().checks.len(), 1);
+        let cleared = WorkEdit {
+            checks: Some(Vec::new()),
+            acceptance: Some(Vec::new()),
+            ..WorkEdit::default()
+        }
+        .apply_as(&identity, Some(record), now, &operator)
+        .unwrap();
+        let plan = cleared.plan.unwrap();
+        assert!(plan.checks.is_empty() && plan.acceptance.is_empty());
+        assert_eq!(plan.declared_by, None);
+        // Without a declarer, a verification edit is refused outright.
+        assert!(WorkEdit {
+            checks: Some(Vec::new()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, None, now)
+        .is_err());
+
+        // Older records and requests without the fields still parse.
+        let old: WorkPlan = serde_json::from_str(r#"{"cwd":"/x"}"#).unwrap();
+        assert!(old.checks.is_empty());
+    }
+
+    #[test]
+    fn only_the_declarer_or_the_person_may_change_a_works_checks() {
+        use crate::work_verify::{Declarer, WorkCheck};
+        let identity = WorkIdentity::new("tend", "ENG-2");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let agent = |id: &str| Declarer::Agent {
+            session_id: id.into(),
+        };
+        let declare = |command: &str| WorkEdit {
+            title: Some("x".into()),
+            cwd: Some("/src".into()),
+            checks: Some(vec![WorkCheck::new(command)]),
+            ..WorkEdit::default()
+        };
+        let by_person = declare("cargo test")
+            .apply_as(&identity, None, now, &Declarer::Operator)
+            .unwrap();
+        // The agent being checked cannot weaken the person's checks.
+        let refused = declare("true")
+            .apply_as(&identity, Some(by_person.clone()), now, &agent("worker"))
+            .unwrap_err();
+        assert!(refused.contains("declared by the person"), "{refused}");
+        // An orchestrating agent may declare where nobody has, and change
+        // its own; another agent may not.
+        let fresh = WorkIdentity::new("tend", "ENG-3");
+        let by_lead = declare("cargo test")
+            .apply_as(&fresh, None, now, &agent("lead"))
+            .unwrap();
+        assert!(declare("cargo nextest run")
+            .apply_as(&fresh, Some(by_lead.clone()), now, &agent("lead"))
+            .is_ok());
+        assert!(declare("true")
+            .apply_as(&fresh, Some(by_lead.clone()), now, &agent("worker"))
+            .unwrap_err()
+            .contains("another agent"));
+        // The person always may, and becomes the declarer.
+        let taken = declare("make check")
+            .apply_as(&fresh, Some(by_lead), now, &Declarer::Operator)
+            .unwrap();
+        assert_eq!(taken.plan.unwrap().declared_by, Some(Declarer::Operator));
+        // Edits that do not touch verification need no declarer.
+        assert!(WorkEdit {
+            title: Some("renamed".into()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, Some(by_person), now)
+        .is_ok());
+    }
+
+    #[test]
+    fn a_cwd_edit_does_not_move_where_declared_checks_run() {
+        use crate::work_verify::{Declarer, WorkCheck};
+        let identity = WorkIdentity::new("tend", "ENG-4");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let declared = WorkEdit {
+            title: Some("x".into()),
+            cwd: Some("/original".into()),
+            checks: Some(vec![WorkCheck::new("cargo test")]),
+            ..WorkEdit::default()
+        }
+        .apply_as(&identity, None, now, &Declarer::Operator)
+        .unwrap();
+        // Any caller may still edit the plan's cwd, but not where the checks run.
+        let moved = WorkEdit {
+            cwd: Some("/elsewhere".into()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, Some(declared), now)
+        .unwrap();
+        let plan = moved.plan.unwrap();
+        assert_eq!(plan.cwd.as_deref(), Some("/elsewhere"));
+        assert_eq!(plan.checks_dir(), Some("/original"));
     }
 }

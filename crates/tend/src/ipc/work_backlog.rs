@@ -9,6 +9,7 @@ pub(super) async fn response(
     reviews: &ReviewStore,
     pipeline_runs: &PipelineRunStore,
     body: RequestBody,
+    declarer: Option<crate::work_verify::Declarer>,
 ) -> (&'static str, Response) {
     match body {
         RequestBody::WorkBacklog { stage } => {
@@ -26,7 +27,11 @@ pub(super) async fn response(
             )
         }
         RequestBody::WorkEdit { identity, edit } => {
-            let result = work_store.lock().await.edit(identity, edit).await;
+            let result = work_store
+                .lock()
+                .await
+                .edit_as(identity, edit, declarer.as_ref())
+                .await;
             (
                 "work_edit",
                 match result {

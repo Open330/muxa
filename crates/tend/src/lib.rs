@@ -116,6 +116,7 @@ pub mod listener_inventory;
 pub mod mux_snapshot_control;
 pub mod work_pipeline_spec;
 pub mod work_presets;
+pub mod work_verify;
 pub mod worker_startup;
 pub mod worker_stop;
 pub mod worktree_change;

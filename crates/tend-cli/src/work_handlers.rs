@@ -53,7 +53,15 @@ pub(super) async fn run_work_cmd(
         }
         WorkCmd::Init(args) => work_init::run(args, cfg, config_path).await,
         WorkCmd::Compose(args) => work_compose::run(args, cfg).await,
-        WorkCmd::Up(args) => crate::work_up_cmd::run(args, cfg, config_path, Some(client)).await,
+        WorkCmd::Up(args) => {
+            Box::pin(crate::work_up_cmd::run(
+                args,
+                cfg,
+                config_path,
+                Some(client),
+            ))
+            .await
+        }
         WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket(), cfg),
         WorkCmd::Plan(args) => work_backlog::run_plan(args, client).await,
         WorkCmd::Link(args) => work_external::run_link(args, client).await,
