@@ -643,7 +643,10 @@ pub const STARTUP_DIALOGS: &[Dialog] = &[
         consent: Consent::None,
     },
     // Codex, when a newer release is out: "1. Update now" is the default
-    // row; Esc skips without installing anything.
+    // row; Esc skips without installing anything. A swap relaunch never
+    // meets it (it starts with `-c check_for_update_on_startup=false`); a
+    // worker launch still can, and an older relaunch line read back from a
+    // retried job too, so the entry stays as their fallback.
     Dialog {
         needles: &["Update available", "Skip until next version"],
         keys: &[ESC],
@@ -668,7 +671,9 @@ pub const STARTUP_DIALOGS: &[Dialog] = &[
         pause: Duration::from_millis(500),
         consent: Consent::None,
     },
-    // Codex: the conversation's own last directory is the default row.
+    // Codex: the conversation's own last directory is the default row. A
+    // swap relaunch sets `tui.resume_cwd="session"` and never meets it; a
+    // worker launch still can.
     Dialog {
         needles: &["Working directory · resume", "Use session directory"],
         keys: &[ENTER],

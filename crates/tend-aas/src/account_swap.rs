@@ -625,12 +625,29 @@ fn resume_free_args(args: &[String], kind: AgentKind) -> Vec<String> {
     kept
 }
 
-fn resume_suffix(kind: AgentKind, session_id: &str) -> [String; 2] {
+fn resume_suffix(kind: AgentKind, session_id: &str) -> Vec<String> {
     match kind {
-        AgentKind::Codex => ["resume".into(), session_id.into()],
-        _ => ["--resume".into(), session_id.into()],
+        // A relaunch should come up on its conversation, not on a menu:
+        // Codex's update check is off for this start, and it resumes in the
+        // session's own directory (what the swap always answered), so those
+        // dialogs are never shown rather than answered.
+        AgentKind::Codex => vec![
+            "-c".into(),
+            CODEX_NO_UPDATE_CHECK.into(),
+            "-c".into(),
+            CODEX_RESUME_IN_SESSION_DIR.into(),
+            "resume".into(),
+            session_id.into(),
+        ],
+        _ => vec!["--resume".into(), session_id.into()],
     }
 }
+
+/// The Codex config override a swap relaunch starts with. Codex ignores a
+/// `-c` key it does not know, so an older release starts as before.
+const CODEX_NO_UPDATE_CHECK: &str = "check_for_update_on_startup=false";
+/// Resume in the session's directory without asking (`tui.resume_cwd`).
+const CODEX_RESUME_IN_SESSION_DIR: &str = "tui.resume_cwd=\"session\"";
 
 /// The line to type back into the pane: the same launch, on `account`,
 /// resuming `session_id`.
@@ -4173,6 +4190,47 @@ mod tests {
         assert_eq!(children.len(), 2, "{seen:?}");
     }
 
+    /// A Codex relaunch turns the update check off for its start, and the
+    /// line still reads as resuming exactly that conversation.
+    #[test]
+    fn a_codex_relaunch_skips_the_update_check_and_still_binds() {
+        let line = relaunch_line(
+            &LaunchLine::bare("codex --yolo"),
+            AgentKind::Codex,
+            "019a",
+            "b",
+            BareMode::Wrap,
+        )
+        .unwrap();
+        assert!(
+            line.ends_with(
+                "-c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 019a"
+            ),
+            "{line}"
+        );
+        // The relaunched process's argv, as the shell hands it over.
+        let argv: Vec<String> = [
+            "codex",
+            "--yolo",
+            "-c",
+            CODEX_NO_UPDATE_CHECK,
+            "-c",
+            CODEX_RESUME_IN_SESSION_DIR,
+            "resume",
+            "019a",
+        ]
+        .iter()
+        .map(|w| (*w).to_owned())
+        .collect();
+        assert_eq!(
+            argv_resumes(&argv, AgentKind::Codex, "019a"),
+            ArgvResume::Exact
+        );
+        assert_eq!(CODEX_RESUME_IN_SESSION_DIR, "tui.resume_cwd=\"session\"");
+        // Claude's line is unchanged.
+        assert_eq!(resume_suffix(AgentKind::ClaudeCode, "S"), ["--resume", "S"]);
+    }
+
     #[test]
     fn a_relaunch_line_exports_its_launch_id() {
         assert_eq!(
@@ -4646,7 +4704,7 @@ mod tests {
         let line = LaunchLine::from_aas("aas exec a@codex -- --yolo resume old -m gpt-5").unwrap();
         assert_eq!(
             relaunch_line(&line, AgentKind::Codex, "sid", "b@codex", BareMode::Skip).unwrap(),
-            "aas exec b@codex -- --yolo -m gpt-5 resume sid"
+            "aas exec b@codex -- --yolo -m gpt-5 -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume sid"
         );
     }
 
@@ -4913,7 +4971,7 @@ mod tests {
         let command = profile_relaunch_line(&line, AgentKind::Codex, "019a-new", &home).unwrap();
         assert_eq!(
             command,
-            "env CODEX_HOME=/h/.codex-home /opt/bin/codex --yolo resume 019a-new"
+            "env CODEX_HOME=/h/.codex-home /opt/bin/codex --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 019a-new"
         );
     }
 
