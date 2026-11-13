@@ -24,6 +24,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = "0.10"
+toml = { workspace = true }
+dirs = { workspace = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }

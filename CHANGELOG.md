@@ -109,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     init` also installs `plugins/tend/tui.ts`, a 2.x TUI plugin that runs in
     the pane and translates 2.x's events (see `docs/OPENCODE.md`).
 
+- A Codex swap no longer stops on "Hooks need review" because the new
+  account's home lacks trust the user already gave. Codex keys hook trust by
+  the `CODEX_HOME` path (`hooks.state."<home>/config.toml:<event>:0:0"`), so
+  aas profiles sharing one `config.toml` still need an entry each, and a
+  profile unused since tend rewrote its hooks kept the old hash. Before the
+  relaunch, tend asks Codex's app-server (`hooks/list`) which hooks wait on
+  review under the target home, and copies a `trusted_hash` only when the
+  same hook (same event, same current hash) is trusted under another home on
+  this machine (`config/value/write`, so Codex writes its own file through
+  the symlink). Nothing the user never trusted is trusted; the menu is never
+  answered. When it shows anyway, the swap ends `hook_review_pending` naming
+  the pane. `tend doctor` (and `tend init` after rewriting the Codex hooks)
+  lists homes whose trust is stale.
+
 ## [0.10.15] - 2026-11-12
 
 ### Added

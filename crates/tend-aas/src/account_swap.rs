@@ -125,6 +125,9 @@ pub struct SwapRequest {
     pub restore_draft: bool,
     /// How a pane with its shell is relaunched (`[swap] relaunch`).
     pub relaunch: tend::swap_api::RelaunchMode,
+    /// The `aas` program (`[swap] aas`), asked for an account's
+    /// `CODEX_HOME` when Codex hook trust is carried over.
+    pub aas: String,
 }
 
 impl SwapRequest {
@@ -147,6 +150,7 @@ impl SwapRequest {
             allow_direct_respawn: true,
             restore_draft: true,
             relaunch: config.relaunch,
+            aas: config.aas.clone(),
         }
     }
 
@@ -1984,14 +1988,56 @@ fn swap_one(
         target: &target,
         probe,
     };
+    // Before Codex starts under the new account's home: hooks the user
+    // already trusted under another home get that trust there too, so the
+    // relaunch does not stop on "Hooks need review".
+    let hooks_note = (agent.kind == AgentKind::Codex)
+        .then(|| {
+            carry_codex_hook_trust(
+                request,
+                profiles.map_or(&[][..], |(profiles, _)| profiles),
+                &account,
+                &target.cwd,
+            )
+        })
+        .flatten();
     let (status, note, withheld, report) = run_live(
         &io, &target, launch, &command, follow_up, &verify, &binding, observer,
     );
     outcome.status = status;
-    outcome.note = note;
+    outcome.note = match hooks_note {
+        Some(hooks) => format!("{note}; {hooks}"),
+        None => note,
+    };
     outcome.continue_withheld = withheld;
     outcome.follow_up = report;
     outcome
+}
+
+/// [`crate::codex_hook_trust::prepare`] for a Codex relaunch onto
+/// `account`, as a note for the report (`None`: nothing to say).
+fn carry_codex_hook_trust(
+    request: &SwapRequest,
+    profiles: &[tend::accounts::AccountProfile],
+    account: &str,
+    cwd: &str,
+) -> Option<String> {
+    use crate::codex_hook_trust as trust;
+    let codex_profiles: Vec<tend::accounts::AccountProfile> = profiles.to_vec();
+    let Some(home) = trust::account_home(&codex_profiles, account, &request.aas) else {
+        return Some(
+            "could not tell the new account's CODEX_HOME, so Codex hook trust was not checked"
+                .into(),
+        );
+    };
+    let Some(codex) = trust::find_codex() else {
+        return Some("no codex program found to check hook trust with".into());
+    };
+    let homes = trust::known_homes(&codex_profiles);
+    match trust::prepare(&codex, &home, cwd, &homes) {
+        Ok(prepared) => prepared.note(),
+        Err(error) => Some(format!("Codex hook trust was not checked ({error})")),
+    }
 }
 
 /// The plan's note for a due follow-up. Whether it is typed depends on what
@@ -3233,6 +3279,22 @@ fn await_ready(
     if !runner.observe(Observation::Readiness { result: seen }) {
         return Err(halt(runner));
     }
+    // Codex asks to review new or changed hooks before it starts. Accepting
+    // lets them run outside the sandbox, so tend never answers it: the
+    // swap ends here, naming the pane that waits on the person.
+    if target.kind == AgentKind::Codex
+        && io
+            .capture()
+            .is_some_and(|screen| tend::worker_startup::codex_hook_review(&screen))
+    {
+        return Err(format!(
+            "{HOOK_REVIEW_PENDING}: relaunched, but Codex in pane {} waits on \"Hooks need \
+             review\"; answer it there (tend does not trust hooks for you); nothing was sent \
+             to the pane",
+            target.pane
+        )
+        .into());
+    }
     match readiness {
         Resume::Ready => {}
         Resume::Blocked(reason) => {
@@ -3261,6 +3323,9 @@ fn await_ready(
     }
     Ok(())
 }
+
+/// The note prefix of a swap whose relaunched Codex waits on the hook review.
+pub const HOOK_REVIEW_PENDING: &str = "hook_review_pending";
 
 /// The relaunch must land on the account it was meant for, checked before
 /// any follow-up starts work on the wrong one. The note on success.
