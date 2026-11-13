@@ -600,5 +600,7 @@ hooks would ask; `tend init` does the same after rewriting the Codex hooks.
 - Codex keeps its thread index per account (`CODEX_HOME`), but `codex resume <id>`
   finds the thread's rollout in the shared `sessions/`, so it resumes under an
   account that never ran it. If the pane's shell is no longer in the thread's
-  directory, Codex first asks which directory to use; tend keeps the
-  session's directory.
+  directory, Codex would ask which directory to use; a swap relaunch sets
+  `tui.resume_cwd="session"`, so it resumes in the session's directory
+  without asking (an older relaunch line still gets the question, answered
+  the same way).
