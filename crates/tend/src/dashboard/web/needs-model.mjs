@@ -187,3 +187,14 @@ export function hostSections(data, now = Date.now()) {
 export function draftKey(card) {
   return JSON.stringify([card.host || "", card.remote ? 1 : 0, card.kind, card.id]);
 }
+
+/// The card a notification links to (`#item=<id>`), if any.
+export function linkedItemOf(hash) {
+  return new URLSearchParams(String(hash || "").replace(/^#/, "")).get("item");
+}
+
+/// Where sign-in should come back to: this page, and the linked card.
+export function needsReturnPath(hash) {
+  const item = linkedItemOf(hash);
+  return item ? `/needs#item=${encodeURIComponent(item)}` : "/needs";
+}

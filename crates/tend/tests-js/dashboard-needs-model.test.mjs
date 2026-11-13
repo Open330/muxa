@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ago, decidedCard, draftKey, evidenceLine, hostSections, pendingCard, safeHref } from "../src/dashboard/web/needs-model.mjs";
+import { ago, decidedCard, draftKey, evidenceLine, hostSections, pendingCard, safeHref, linkedItemOf, needsReturnPath } from "../src/dashboard/web/needs-model.mjs";
 
 const now = Date.parse("2026-11-12T12:00:00Z");
 
@@ -126,4 +126,11 @@ test("the same request id on two hosts keeps two drafts", () => {
   assert.equal(local.cards[0].id, mini.cards[0].id);
   assert.notEqual(draftKey(local.cards[0]), draftKey(mini.cards[0]));
   assert.notEqual(draftKey({ ...local.cards[0], kind: "review" }), draftKey(local.cards[0]));
+});
+
+test("a notification's card survives sign-in", () => {
+  assert.equal(linkedItemOf("#item=s%201%2Fx"), "s 1/x");
+  assert.equal(needsReturnPath("#item=s%201%2Fx"), "/needs#item=s%201%2Fx");
+  assert.equal(needsReturnPath(""), "/needs");
+  assert.equal(needsReturnPath("#pane=%251"), "/needs");
 });

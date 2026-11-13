@@ -492,6 +492,8 @@ async fn return_to_must_be_a_same_origin_path() {
     }
     assert!(routes::safe_return_to("/"));
     assert!(routes::safe_return_to("/?tab=work#panel"));
+    // A notification's link back to its card on "Needs you".
+    assert!(routes::safe_return_to("/needs#item=s%201%2Fx"));
     // Browsers render the failure page instead of JSON.
     let response = call(
         &state,
