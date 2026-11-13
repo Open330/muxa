@@ -21,7 +21,7 @@ private func reply(_ name: String) throws -> TendIPCResponse {
 }
 
 /// Every fixture the Rust side records, with what the app needs from it.
-private let checks: [String: (TendIPCResponse) -> Bool] = [
+private let checks: [String: @Sendable (TendIPCResponse) -> Bool] = [
     "hello": { $0.minProtocol != nil && $0.maxProtocol != nil && $0.capabilities?.isEmpty == false && $0.bootID != nil },
     "snapshot": { $0.agents?.count == 1 },
     "list_sessions": { $0.sessions != nil },
