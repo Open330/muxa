@@ -458,7 +458,7 @@ systems, so tend gets exact state transitions:
 | Claude Code | Supported | `~/.claude/settings.json` |
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
 | Google Antigravity CLI (`agy`) | Supported | `~/.gemini/config/hooks.json` — [details](docs/ANTIGRAVITY.md) |
-| opencode | Supported (plugin events) | `~/.config/opencode/plugins/tend.ts` — [details](docs/OPENCODE.md) |
+| opencode | Supported (plugin events) | `~/.config/opencode/plugins/tend.ts` (1.x), `plugins/tend/tui.ts` (2.x) — [details](docs/OPENCODE.md) |
 
 The Google Gemini CLI is no longer supported; use its successor, the
 Antigravity CLI. `tend init` removes the hooks an older tend wrote into

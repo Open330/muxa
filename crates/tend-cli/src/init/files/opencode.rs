@@ -1,13 +1,30 @@
-//! `~/.config/opencode/plugins/tend.ts` content layer.
+//! opencode plugin content layer: `~/.config/opencode/plugins/tend.ts` for
+//! opencode 1.x and `~/.config/opencode/plugins/tend/tui.ts` for 2.x.
 //!
-//! The plugin forwards a filtered subset of opencode's events to
-//! `tend hook opencode`; `tend::adapters::opencode` documents the contract
-//! between the two. Re-running `tend init` replaces the managed block, so an
-//! older plugin body is upgraded in place.
+//! Both forward a filtered subset of opencode's events to
+//! `tend hook opencode`; `tend::adapters::opencode` documents the contract.
+//! Re-running `tend init` replaces each managed block, so an older plugin
+//! body is upgraded in place.
+//!
+//! **Two files, one install.** opencode 2.x replaced the plugin API and runs
+//! sessions in a background server shared by every TUI, so a server plugin
+//! there has no pane. Its TUI plugin runs in the pane's own process, which
+//! is what tend needs. 1.x loads only `plugins/*.ts`, so it never sees the
+//! `tend/` directory; 2.x loads `tend.ts` as a server plugin, which is why
+//! that file's default export also satisfies 2.x (`{ id, setup }`, a no-op
+//! there). Installing both keeps tend working across an opencode upgrade
+//! without re-running `tend init`.
+//!
+//! **Where.** opencode reads `$XDG_CONFIG_HOME/opencode`, else
+//! `~/.config/opencode`, on every platform. Earlier tends wrote the plugin
+//! under macOS's `~/Library/Application Support`, which opencode never reads;
+//! `tend init` removes that copy.
 
 use crate::init::marker::{self, Outcome, Style};
+use std::path::PathBuf;
 
 const ID: &str = "opencode-plugin";
+const TUI_ID: &str = "opencode-tui-plugin";
 
 const BODY: &str = r#"// Forward opencode's own events to tend, without blocking opencode's UI path.
 //
@@ -15,7 +32,28 @@ const BODY: &str = r#"// Forward opencode's own events to tend, without blocking
 // states, permission and question prompts. The plugin only filters and
 // de-duplicates; `tend hook opencode` maps the documented shapes to tend
 // state. Child sessions (subagent tasks) never reach tend.
-export const TendPlugin = async ({ $, client, directory }) => {
+import { spawn } from "node:child_process";
+
+// One `tend hook opencode` per payload, on stdin. Bun's `$` has no stdin
+// method, so this uses node's spawn, which opencode's Bun runtime provides.
+const forward = (payload) =>
+  new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn("tend", ["hook", "opencode", "--event", "event"], {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    child.on("error", reject);
+    child.on("close", () => resolve());
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(payload));
+  });
+
+export const TendPlugin = async ({ client, directory }) => {
   const queue = [];
   let flushing = false;
   const children = new Set();
@@ -37,7 +75,7 @@ export const TendPlugin = async ({ $, client, directory }) => {
     while (queue.length > 0) {
       const payload = queue.shift();
       try {
-        await $`tend hook opencode --event event`.stdin(JSON.stringify(payload)).quiet();
+        await forward(payload);
       } catch (error) {
         try {
           await client.app.log({
@@ -190,10 +228,254 @@ export const TendPlugin = async ({ $, client, directory }) => {
       }
     },
   };
+};
+
+// opencode 1.x runs `server`; 2.x loads this file as a server plugin and
+// runs `setup`, which does nothing: its TUI plugin (`tend/tui.ts`) does
+// the forwarding there.
+export default { id: "tend", server: TendPlugin, setup: () => {} };"#;
+
+const TUI_BODY: &str = r#"// Forward opencode 2.x's own events to tend, from the TUI that runs in this
+// terminal pane.
+//
+// opencode 2.x runs sessions in a background server shared by every TUI, so
+// a server plugin has no pane. This TUI plugin does: it runs inside the
+// opencode process in the pane, and `tend hook opencode` inherits its
+// environment. It translates the 2.x event stream into the payloads
+// `tend hook opencode` reads (see `tend::adapters::opencode`).
+//
+// The pane speaks for one session: the one last prompted while this TUI
+// was showing it. Viewing another session moves nothing until it is
+// prompted, and events for every other session on the shared server
+// (other TUIs, subagents) are dropped.
+import { spawn } from "node:child_process";
+
+const run = (payload) =>
+  new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("tend", ["hook", "opencode", "--event", "event"], {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+    } catch (_) {
+      resolve();
+      return;
+    }
+    child.on("error", () => resolve());
+    child.on("close", () => resolve());
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(payload));
+  });
+
+export default {
+  id: "tend",
+  setup: async (ctx) => {
+    const queue = [];
+    let flushing = false;
+    let owner = null;
+    let reply = null; // { messageID, texts: [] } for the owner's current execution
+    let failed = false; // the owner's current execution reported an error
+    const tools = new Map(); // tool call id -> name
+    let model = null; // the owner's current model, from session.step.started
+    // The bound session's directory, from the event that bound it. The
+    // TUI's own location follows whatever it shows, which may be another
+    // project's session by now.
+    let ownerDirectory = null;
+    const directory = () => {
+      const location = ctx.location || {};
+      return ownerDirectory || location.directory || process.cwd();
+    };
+
+    const flush = async () => {
+      if (flushing) return;
+      flushing = true;
+      while (queue.length > 0) await run(queue.shift());
+      flushing = false;
+    };
+    const send = (type, properties, extra) => {
+      queue.push({ type, properties, tend: { directory: directory(), ...extra } });
+      if (queue.length > 256) queue.shift();
+      setTimeout(flush, 0);
+    };
+    const shown = () => {
+      const route = ctx.ui.router.current();
+      return route && route.type === "session" ? route.sessionID : null;
+    };
+    const replyText = () => {
+      const text = reply ? reply.texts.join("\n").trim() : "";
+      return text.length > 0 ? text : undefined;
+    };
+
+    const unlisten = ctx.data.listen(({ details: event }) => {
+      const d = (event && event.data) || {};
+      const sessionID = d.sessionID || (d.form && d.form.sessionID);
+      if (event.type === "session.inbox.enqueued") {
+        const item = d.item || {};
+        // A prompt into the session this TUI shows binds the pane to it.
+        if (item.type !== "user" || !sessionID || sessionID !== shown()) return;
+        if (sessionID !== owner) {
+          owner = sessionID;
+          ownerDirectory = (event.location && event.location.directory) || null;
+          // Nothing captured for the previous session belongs to this one.
+          reply = null;
+          failed = false;
+          model = null;
+          send("tend.session.active", { sessionID });
+        }
+        const text = item.payload && typeof item.payload.text === "string" ? item.payload.text : "";
+        send("tend.prompt", { sessionID, text: text.trim() });
+        return;
+      }
+      if (!owner || sessionID !== owner) return;
+      switch (event.type) {
+        case "session.execution.started":
+          reply = null;
+          failed = false;
+          // Work resumes even when no prompt precedes it here (one queued
+          // during the previous execution's cleanup), so say so.
+          send("tend.execution.started", { sessionID });
+          return;
+        case "session.text.ended":
+          if (!reply || reply.messageID !== d.assistantMessageID) {
+            reply = { messageID: d.assistantMessageID, texts: [] };
+          }
+          if (typeof d.text === "string") reply.texts.push(d.text);
+          return;
+        case "session.tool.input.started":
+          tools.set(d.id, d.name);
+          if (tools.size > 512) tools.delete(tools.keys().next().value);
+          return;
+        case "session.tool.called": {
+          const input = d.input || {};
+          send("message.part.updated", {
+            sessionID,
+            part: {
+              type: "tool",
+              tool: tools.get(d.id) || "tool",
+              callID: d.id,
+              state: { status: "running", command: typeof input.command === "string" ? input.command : undefined },
+            },
+          });
+          return;
+        }
+        case "session.tool.success":
+        case "session.tool.failed":
+          send("message.part.updated", {
+            sessionID,
+            part: {
+              type: "tool",
+              tool: tools.get(d.id) || "tool",
+              callID: d.id,
+              state: { status: event.type === "session.tool.success" ? "completed" : "error" },
+            },
+          });
+          return;
+        case "session.step.started":
+          if (d.model) model = d.model;
+          return;
+        case "session.step.ended":
+          send("message.updated", {
+            sessionID,
+            info: {
+              id: d.assistantMessageID,
+              role: "assistant",
+              modelID: model && model.id,
+              providerID: model && model.providerID,
+              cost: d.cost,
+            },
+          });
+          return;
+        case "session.retry.scheduled":
+          send("session.status", {
+            sessionID,
+            status: { type: "retry", attempt: d.attempt, message: d.error && d.error.message },
+          });
+          return;
+        case "permission.asked":
+          send("permission.asked", { sessionID, id: d.id, action: d.action, resources: d.resources });
+          return;
+        case "permission.replied":
+          send("permission.replied", { sessionID, requestID: d.requestID, reply: d.reply });
+          return;
+        case "form.created": {
+          const fields = (d.form && d.form.fields) || [];
+          send("question.asked", {
+            sessionID,
+            id: d.form && d.form.id,
+            questions: fields.map((field) => ({ question: field.description || field.title, header: field.title })),
+          });
+          return;
+        }
+        case "form.replied":
+        case "form.cancelled":
+          send(event.type === "form.replied" ? "question.replied" : "question.rejected", { sessionID, requestID: d.id });
+          return;
+        case "session.execution.failed":
+          failed = true;
+          send("session.error", {
+            sessionID,
+            error: { name: (d.error && d.error.type) || "error", data: { message: d.error && d.error.message } },
+          });
+          send("session.idle", { sessionID });
+          reply = null;
+          return;
+        case "session.execution.interrupted":
+          // Esc, a rejected permission, or a superseded turn: the session
+          // is idle again with no answer to report.
+          send("session.idle", { sessionID });
+          reply = null;
+          return;
+        case "session.execution.succeeded":
+          send("session.idle", { sessionID }, failed ? {} : { response: replyText() });
+          reply = null;
+          failed = false;
+          return;
+        case "session.deleted":
+          send("session.deleted", { sessionID });
+          owner = null;
+          return;
+        default:
+          return;
+      }
+    });
+    return () => unlisten();
+  },
 };"#;
 
-pub fn default_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("opencode").join("plugins").join("tend.ts"))
+/// opencode's config directory: `$XDG_CONFIG_HOME/opencode`, else
+/// `~/.config/opencode`, on every platform (opencode's `global-roots`).
+pub fn config_dir() -> Option<PathBuf> {
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+fn config_dir_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg.filter(|dir| dir.is_absolute())
+        .or_else(|| home.map(|home| home.join(".config")))
+        .map(|dir| dir.join("opencode"))
+}
+
+/// The opencode 1.x plugin file.
+pub fn default_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("plugins").join("tend.ts"))
+}
+
+/// The opencode 2.x TUI plugin, a local plugin directory's `tui` entry.
+pub fn tui_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("plugins").join("tend").join("tui.ts"))
+}
+
+/// Where earlier tends wrote the plugin on macOS (`dirs::config_dir()` is
+/// `~/Library/Application Support` there). opencode never read it. `None`
+/// when it is the same path as [`default_path`], as on Linux.
+pub fn misplaced_path() -> Option<PathBuf> {
+    let old = dirs::config_dir()?
+        .join("opencode")
+        .join("plugins")
+        .join("tend.ts");
+    (Some(&old) != default_path().as_ref()).then_some(old)
 }
 
 pub fn upsert(original: &str) -> (String, Outcome) {
@@ -204,6 +486,14 @@ pub fn upsert(original: &str) -> (String, Outcome) {
 
 pub fn remove(original: &str) -> (String, Outcome) {
     marker::remove_styled(original, ID, Style::Slash)
+}
+
+pub fn upsert_tui(original: &str) -> (String, Outcome) {
+    marker::upsert_styled(original, TUI_ID, TUI_BODY, Style::Slash)
+}
+
+pub fn remove_tui(original: &str) -> (String, Outcome) {
+    marker::remove_styled(original, TUI_ID, Style::Slash)
 }
 
 #[cfg(test)]
@@ -250,7 +540,87 @@ mod tests {
             );
         }
         assert!(BODY.contains("parentID"), "child sessions must be filtered");
-        assert!(BODY.contains("tend hook opencode --event event"));
+        assert!(BODY.contains(r#"["hook", "opencode", "--event", "event"]"#));
+        // Bun's `$` has no `.stdin()`; every forward failed against a real
+        // opencode 1.19.5 until the plugin spawned tend itself.
+        assert!(!BODY.contains(".stdin("));
+    }
+
+    /// The 2.x TUI plugin sends the same vocabulary, translated from the
+    /// 2.x event stream it listens to.
+    #[test]
+    fn tui_plugin_translates_the_2x_events_the_adapter_needs() {
+        for ty in [
+            "tend.session.active",
+            "tend.prompt",
+            "session.idle",
+            "session.error",
+            "session.status",
+            "session.deleted",
+            "permission.asked",
+            "permission.replied",
+            "question.asked",
+            "question.replied",
+            "question.rejected",
+            "message.updated",
+            "message.part.updated",
+        ] {
+            assert!(
+                TUI_BODY.contains(&format!("\"{ty}\"")),
+                "tui plugin never sends {ty}"
+            );
+        }
+        for source in [
+            "session.inbox.enqueued",
+            "session.execution.started",
+            "session.execution.succeeded",
+            "session.execution.failed",
+            "session.execution.interrupted",
+            "session.tool.called",
+            "session.tool.success",
+            "session.tool.failed",
+            "form.created",
+        ] {
+            assert!(
+                TUI_BODY.contains(&format!("\"{source}\"")),
+                "tui plugin ignores {source}"
+            );
+        }
+        assert!(TUI_BODY.contains("export default"));
+        assert!(TUI_BODY.contains(r#"["hook", "opencode", "--event", "event"]"#));
+        let (out, o) = upsert_tui("");
+        assert_eq!(o, Outcome::Inserted);
+        assert!(!out.lines().any(|l| l.trim_start().starts_with('#')));
+        let (removed, o) = remove_tui(&out);
+        assert_eq!(o, Outcome::Removed);
+        assert!(removed.is_empty());
+    }
+
+    /// One `tend.ts` must load under both plugin APIs: 1.x takes
+    /// `default.server`, 2.x requires `default.{id, setup}`.
+    #[test]
+    fn v1_plugin_default_export_satisfies_both_loaders() {
+        assert!(
+            BODY.contains("export default { id: \"tend\", server: TendPlugin, setup: () => {} };")
+        );
+    }
+
+    #[test]
+    fn config_dir_follows_xdg_then_home_config_on_every_platform() {
+        assert_eq!(
+            config_dir_from(Some("/x".into()), Some("/h".into())),
+            Some(PathBuf::from("/x/opencode"))
+        );
+        // A relative XDG_CONFIG_HOME is invalid per the spec; opencode's
+        // `||` would take it, but tend never writes to a cwd-relative path.
+        assert_eq!(
+            config_dir_from(Some("rel".into()), Some("/h".into())),
+            Some(PathBuf::from("/h/.config/opencode"))
+        );
+        assert_eq!(
+            config_dir_from(None, Some("/h".into())),
+            Some(PathBuf::from("/h/.config/opencode"))
+        );
     }
 
     #[test]

@@ -164,7 +164,9 @@ impl Component {
                 "edits ~/.gemini/settings.json only to remove tend entries"
             }
             Component::AntigravityHooks => "writes ~/.gemini/config/hooks.json; agy's own format",
-            Component::OpencodeHooks => "installs ~/.config/opencode/plugins/tend.ts",
+            Component::OpencodeHooks => {
+                "installs ~/.config/opencode/plugins/tend.ts (1.x) and tend/tui.ts (2.x)"
+            }
             Component::TenddSystemd => "Linux only; skipped on macOS / launchd hosts",
             Component::TenddLaunchd => "macOS only; skipped on Linux / systemd hosts",
             Component::TenddShellrc => {

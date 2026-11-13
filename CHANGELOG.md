@@ -58,6 +58,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagrees with them leaves the agent alone, and so does a verified plan
   whose record cannot be read again right before the stop.
 
+### Fixed
+
+- opencode works with tend on macOS and with opencode 2.x, checked against
+  the real opencode 1.19.5 and 2.2.7 TUIs:
+  - `tend init` wrote the plugin under `~/Library/Application Support` on
+    macOS, which opencode never reads; it now writes to `~/.config/opencode`
+    (or `$XDG_CONFIG_HOME/opencode`) and removes the misplaced copy.
+  - The 1.x plugin forwarded nothing: it piped through Bun's `$`, which has
+    no `.stdin()`. It now spawns `tend` itself.
+  - opencode 2.x replaced the plugin API and refused tend's plugin. `tend
+    init` also installs `plugins/tend/tui.ts`, a 2.x TUI plugin that runs in
+    the pane and translates 2.x's events (see `docs/OPENCODE.md`).
+
 ## [0.10.15] - 2026-11-12
 
 ### Added
