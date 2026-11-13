@@ -342,6 +342,7 @@ async fn collaboration_turn_boundary_offer(
         event,
         max_requests,
         max_bytes,
+        supports,
     } = body
     else {
         unreachable!("dispatch routed another request to collaboration_turn_boundary_offer")
@@ -361,7 +362,7 @@ async fn collaboration_turn_boundary_offer(
         // resolve only to a live binding; no pane fallback.
         match topology.resolve_origin(&origin) {
             Ok(current) => match collaboration
-                .offer_turn_boundary(&current, event, max_requests, max_bytes)
+                .offer_turn_boundary_with(&current, event, max_requests, max_bytes, &supports)
                 .await
             {
                 Ok(offers) => Response::with_turn_boundary_offers(offers),

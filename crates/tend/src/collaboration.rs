@@ -4461,9 +4461,10 @@ impl CollaborationStore {
                 .filter(|request| {
                     mine(request)
                         && request.reply_wake_owed()
-                        && !request.turn_offer.as_ref().is_some_and(|offer| {
-                            offer.reply_offered_recently(OffsetDateTime::now_utc())
-                        })
+                        && !(self.hook_transport_enabled()
+                            && request.turn_offer.as_ref().is_some_and(|offer| {
+                                offer.reply_offered_recently(OffsetDateTime::now_utc())
+                            }))
                 })
                 .map(|request| {
                     (

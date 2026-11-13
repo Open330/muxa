@@ -286,7 +286,8 @@ impl Client {
     ) -> Result<Vec<serde_json::Value>, RuntimeError> {
         let resp = self
             .call_checked(&serde_json::json!({"protocol": PROTOCOL_VERSION,
-            "kind":"collaboration_turn_boundary_offer", "origin":origin, "event":event}))
+            "kind":"collaboration_turn_boundary_offer", "origin":origin, "event":event,
+            "supports":[collaboration::turn_offer::REPLY_READY_OFFER]}))
             .await?;
         serde_json::from_value(resp["turn_boundary_offers"].clone()).map_err(RuntimeError::Json)
     }

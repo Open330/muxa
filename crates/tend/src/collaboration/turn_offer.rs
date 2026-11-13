@@ -27,6 +27,9 @@ use time::OffsetDateTime;
 pub const MAX_STOP_OFFERS: u32 = 3;
 /// Minimum gap between two offers of one request through the same event.
 pub const OFFER_BACKOFF: time::Duration = time::Duration::minutes(5);
+/// Offer kind telling a sender its reply is ready. Older hooks render every
+/// unknown offer as work to claim, so it is sent only to hooks that list it.
+pub const REPLY_READY_OFFER: &str = "reply_ready";
 /// Stop continuations reminding a recipient to reply to one claimed request.
 pub const MAX_REPLY_REMINDERS: u32 = MAX_STOP_OFFERS;
 /// Server-side clamps on what one hook response may carry. The byte budget
@@ -97,6 +100,15 @@ pub struct TurnOffer {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_reply_offer_at: Option<OffsetDateTime>,
+    /// When the waker last reserved this request for a typed wake
+    /// (`hook_transport = "primary"`): offers and typed wakes exclude each
+    /// other within the backoff.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub typed_wake_at: Option<OffsetDateTime>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -112,6 +124,7 @@ impl TurnOffer {
         match event {
             TurnBoundaryEvent::Stop => self.reply_offers < MAX_STOP_OFFERS && fresh,
             TurnBoundaryEvent::PromptSubmit => fresh,
+            TurnBoundaryEvent::SessionStart => false,
         }
     }
 
@@ -125,6 +138,13 @@ impl TurnOffer {
     /// The reply notice was offered within the backoff.
     pub fn reply_offered_recently(&self, now: OffsetDateTime) -> bool {
         self.last_reply_offer_at
+            .is_some_and(|at| now - at < OFFER_BACKOFF)
+    }
+
+    /// The waker reserved this request for a typed wake within the
+    /// backoff; a hook must not also offer it.
+    fn typed_wake_recent(&self, now: OffsetDateTime) -> bool {
+        self.typed_wake_at
             .is_some_and(|at| now - at < OFFER_BACKOFF)
     }
 
@@ -179,6 +199,39 @@ impl CollaborationStore {
         self.turn_continuation.store(enabled, Ordering::SeqCst);
     }
 
+    /// Reserve `request_id` for a typed wake now, unless its own hook was
+    /// offered it within the backoff (`hook_transport = "primary"`). Offers
+    /// and typed wakes are chosen under the same transaction lock, so one
+    /// request is never both offered and typed. Always true (and writes
+    /// nothing) with the transport off.
+    pub async fn reserve_typed_wake(&self, request_id: &str) -> Result<bool, CollaborationError> {
+        if !self.hook_transport_enabled() {
+            return Ok(true);
+        }
+        let _transaction = self.transaction_lock.lock().await;
+        let now = OffsetDateTime::now_utc();
+        let row = {
+            let requests = self.requests.read().await;
+            let Some(request) = requests.get(request_id) else {
+                return Ok(false);
+            };
+            if request
+                .turn_offer
+                .as_ref()
+                .is_some_and(|offer| offer.offered_recently(now))
+            {
+                return Ok(false);
+            }
+            let mut row = request.clone();
+            row.turn_offer
+                .get_or_insert_with(TurnOffer::default)
+                .typed_wake_at = Some(now);
+            row
+        };
+        self.commit_request_rows(std::slice::from_ref(&row)).await?;
+        Ok(true)
+    }
+
     /// `collaboration.hook_transport = "primary"`: workers are offered
     /// queued requests, and senders their ready replies, at their own turn
     /// boundaries; typed wakes are left for agents idle with nothing
@@ -205,6 +258,21 @@ impl CollaborationStore {
         event: TurnBoundaryEvent,
         max_requests: Option<usize>,
         max_bytes: Option<usize>,
+    ) -> Result<Vec<Value>, CollaborationError> {
+        self.offer_turn_boundary_with(caller, event, max_requests, max_bytes, &[])
+            .await
+    }
+
+    /// [`Self::offer_turn_boundary`] for a hook that renders the offer kinds
+    /// in `supports` (for example [`REPLY_READY_OFFER`]). A kind an older
+    /// hook would misread is only offered to a hook that names it.
+    pub async fn offer_turn_boundary_with(
+        &self,
+        caller: &Participant,
+        event: TurnBoundaryEvent,
+        max_requests: Option<usize>,
+        max_bytes: Option<usize>,
+        supports: &[String],
     ) -> Result<Vec<Value>, CollaborationError> {
         self.ensure_enabled()?;
         if event == TurnBoundaryEvent::SessionStart {
@@ -281,7 +349,7 @@ impl CollaborationStore {
             offers.push(payload);
             rows.push(request);
         }
-        if hook_transport {
+        if hook_transport && supports.iter().any(|kind| kind == REPLY_READY_OFFER) {
             let budget = (max_requests, max_bytes, used);
             self.offer_ready_replies(caller, event, now, budget, &mut offers, &mut rows)
                 .await;
@@ -313,7 +381,11 @@ impl CollaborationStore {
                         // requests at its own turn boundary too.
                         || (hook_transport
                             && caller.accepts_peer_work()
-                            && request.wake_delivery.is_none())
+                            && request.wake_delivery.is_none()
+                            && !request
+                                .turn_offer
+                                .as_ref()
+                                .is_some_and(|offer| offer.typed_wake_recent(now)))
                         // A wake that was typed but never submitted also
                         // rides along with whatever prompt is submitted
                         // next, as a structured offer.
@@ -456,7 +528,7 @@ fn reply_ready_payload(request: &super::CollaborationRequest) -> Value {
         "request_id": request.id,
         "from": request.to.label(),
         "status": request.reply.as_ref().map(|reply| reply.status),
-        "offer": "reply_ready",
+        "offer": REPLY_READY_OFFER,
     })
 }
 
@@ -964,7 +1036,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let offers = stop(&store, &worker()).await;
+        // An older hook does not name reply_ready: it would render the
+        // entry as work to claim, so it gets none and the wake stays typed.
+        assert!(stop(&store, &worker()).await.is_empty());
+        let reserved = store.reserve_reply_wakes(&worker()).await.unwrap().unwrap();
+        store.complete_reply_wakes(&reserved, false).await.unwrap();
+        let offers = stop_supporting(&store, &worker()).await;
         assert_eq!(ids(&offers), vec![id.clone()]);
         assert_eq!(offers[0]["offer"], "reply_ready");
         assert_eq!(offers[0]["status"], "completed");
@@ -974,7 +1051,10 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(stop(&store, &worker()).await.is_empty(), "once per backoff");
+        assert!(
+            stop_supporting(&store, &worker()).await.is_empty(),
+            "once per backoff"
+        );
         // ...and the reply stays owed (an offer is not a read).
         assert!(store
             .peek_for(&worker(), &id)
@@ -992,5 +1072,58 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    async fn stop_supporting(store: &CollaborationStore, caller: &Participant) -> Vec<Value> {
+        store
+            .offer_turn_boundary_with(
+                caller,
+                TurnBoundaryEvent::Stop,
+                None,
+                None,
+                &[REPLY_READY_OFFER.to_string()],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// One request is never both offered and typed: whichever is chosen
+    /// first under the transaction lock excludes the other for the backoff.
+    #[tokio::test]
+    async fn a_typed_wake_reservation_and_a_hook_offer_exclude_each_other() {
+        let store = store();
+        store.set_hook_transport(true);
+        let create = |body: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .create(
+                        sender(),
+                        worker(),
+                        NewRequest {
+                            body: body.into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            }
+        };
+        // Offered first: the waker's final reservation is refused.
+        let offered = create("offered").await;
+        assert_eq!(ids(&stop(&store, &worker()).await), vec![offered.clone()]);
+        assert!(!store.reserve_typed_wake(&offered).await.unwrap());
+        // Reserved first: the hook does not offer it.
+        let typed = create("typed").await;
+        assert!(store.reserve_typed_wake(&typed).await.unwrap());
+        age_offers(&store, OFFER_BACKOFF).await;
+        assert!(
+            !ids(&stop(&store, &worker()).await).contains(&typed),
+            "a request reserved for a typed wake is not also offered"
+        );
+        // With the transport off nothing is reserved or written.
+        store.set_hook_transport(false);
+        assert!(store.reserve_typed_wake(&offered).await.unwrap());
     }
 }

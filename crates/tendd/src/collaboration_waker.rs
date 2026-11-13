@@ -212,10 +212,11 @@ async fn wake_idle_collaboration_peers_with_inflight(
         }
         // Hook transport: the recipient's own turn-boundary hook is carrying
         // this request; type a wake only once that offer is a backoff old.
-        if request
-            .turn_offer
-            .as_ref()
-            .is_some_and(|offer| offer.offered_recently(time::OffsetDateTime::now_utc()))
+        if collaboration.hook_transport_enabled()
+            && request
+                .turn_offer
+                .as_ref()
+                .is_some_and(|offer| offer.offered_recently(time::OffsetDateTime::now_utc()))
         {
             continue;
         }
@@ -521,6 +522,14 @@ pub(super) async fn deliver_full_collaboration_request(
     {
         return false;
     }
+    if pending.status == tend::collaboration::RequestStatus::Queued
+        && !collaboration
+            .reserve_typed_wake(&pending.id)
+            .await
+            .unwrap_or(false)
+    {
+        return false;
+    }
     let (request, newly_prepared) = if pending.status == tend::collaboration::RequestStatus::Queued
     {
         match collaboration
@@ -753,6 +762,15 @@ async fn send_mailbox_wake(
     let guard = tend::prompt_delivery::lock_pane(collaboration, &recipient.pane).await;
     let agents = store.by_pane(&recipient.pane).await;
     if !redelivery_still_due(collaboration, &agents, recipient, request).await {
+        return false;
+    }
+    // Final transport decision under the pane guard: the recipient's own
+    // hook may have been offered this request since the scan.
+    if !collaboration
+        .reserve_typed_wake(&request.id)
+        .await
+        .unwrap_or(false)
+    {
         return false;
     }
     // The unsubmitted-wake check judges the recipient's row against this

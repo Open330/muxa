@@ -1053,6 +1053,33 @@ async fn a_request_offered_at_the_turn_boundary_is_not_also_typed() {
     });
     wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
     assert!(sends.lock().unwrap().is_empty(), "the hook is carrying it");
+    // The race: the waker read the row before the hook's offer was
+    // recorded. Its final reservation under the pane guard still refuses.
+    let stale = mailbox
+        .create(
+            find("%1"),
+            recipient.clone(),
+            NewRequest {
+                body: "second".into(),
+                ..NewRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    mailbox
+        .offer_turn_boundary(
+            &recipient,
+            tend::collaboration::turn_offer::TurnBoundaryEvent::PromptSubmit,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!send_mailbox_wake(&mailbox, &recipient, &stale, "wake", &[backend], &store).await);
+    assert!(
+        sends.lock().unwrap().is_empty(),
+        "nothing typed from the stale scan"
+    );
 }
 
 #[tokio::test]
