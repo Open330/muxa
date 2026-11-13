@@ -187,11 +187,12 @@ async fn reconcile_in_process(
                     workspace: None,
                     work: None,
                 };
-                tend_work::work_up::run_reconcile(args, &client, &config)
-                    .await
-                    .map_err(|error| {
-                        WorkCommandError::Failed(format!("pipeline reconcile: {error:#}"))
-                    })
+                let result = tend_work::work_up::run_reconcile(args, &client, &config).await;
+                // As the CLI did after every reconcile, success or not.
+                let _ = client.invalidate_agent_directory().await;
+                result.map_err(|error| {
+                    WorkCommandError::Failed(format!("pipeline reconcile: {error:#}"))
+                })
             })
         })
     });

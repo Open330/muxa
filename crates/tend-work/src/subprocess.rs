@@ -77,6 +77,15 @@ fn current() -> Option<Scope> {
     SCOPE.with(|slot| slot.borrow().clone())
 }
 
+/// Whether the thread's scope has run out of time or been cancelled. A
+/// failure then is the operation being abandoned, not the step failing: the
+/// `tend` child it replaces was killed at that point and reported nothing,
+/// so callers must not record it as a durable failure either.
+#[must_use]
+pub fn abandoned() -> bool {
+    current().is_some_and(|scope| scope.remaining().is_none())
+}
+
 /// `Err` once the thread's scope has run out of time. For mux operations
 /// that do not start a process of their own here (`tend::tmux` and rmux
 /// helpers, which carry their own per-call timeouts), checked before each
