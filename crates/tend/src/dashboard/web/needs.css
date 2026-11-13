@@ -39,3 +39,4 @@ main { padding: 0 1rem 2rem; max-width: 46rem; margin: 0 auto; }
 .actions .result { margin: 0; color: var(--muted); }
 .host { padding: .75rem .25rem 0; }
 .host h2 { font-size: .95rem; margin: 0; }
+.card.linked { border-color: var(--accent); }

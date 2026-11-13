@@ -404,6 +404,13 @@ to `$XDG_DATA_HOME/tend/dashboard-decisions.jsonl`
 (owner-only, rotated at 4 MiB) and logged. No dashboard page or static asset can
 be framed by another site (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
 
+Notifications link here. With `[sinks.webhook]` enabled, each message ends
+with a link to the agent's card (`<dashboard>/needs#item=<session>`) and the
+generic payload carries it as `link`. The address is `[sinks.webhook]
+dashboard_url`, else `[dashboard.login] public_url`'s origin; set
+`dashboard_url = ""` for no link. Opening it still needs an operator
+sign-in.
+
 ## Collaboration graph and history API
 
 The collaboration panel projects retained requests into two linked views. The

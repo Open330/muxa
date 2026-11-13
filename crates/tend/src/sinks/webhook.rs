@@ -128,6 +128,8 @@ pub struct WebhookSink {
     on_states: Vec<AgentState>,
     rate_limit: Duration,
     client: reqwest::Client,
+    /// `<origin>/needs`, when messages link to the dashboard.
+    needs_url: Option<String>,
 }
 
 impl WebhookSink {
@@ -193,7 +195,34 @@ impl WebhookSink {
             on_states,
             rate_limit,
             client,
+            needs_url: None,
         }))
+    }
+
+    /// The card for this agent on the "Needs you" page.
+    fn item_link(&self, transition: &Transition) -> Option<String> {
+        let needs = self.needs_url.as_deref()?;
+        let item: String =
+            url::form_urlencoded::byte_serialize(transition.agent.session_id.as_bytes()).collect();
+        Some(format!("{needs}#item={item}"))
+    }
+
+    /// Link each message to its card on the dashboard's "Needs you" page.
+    /// `dashboard_url` from the webhook table wins over `fallback` (the
+    /// sign-in public URL); an empty string turns links off. Only an
+    /// http(s) origin is used.
+    #[must_use]
+    pub fn with_dashboard(mut self, configured: Option<&str>, fallback: Option<String>) -> Self {
+        let base = match configured {
+            Some(url) => Some(url.trim().to_owned()),
+            None => fallback,
+        };
+        self.needs_url = base
+            .filter(|url| !url.is_empty())
+            .and_then(|url| url::Url::parse(&url).ok())
+            .filter(|url| matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
+            .map(|url| format!("{}/needs", url.origin().ascii_serialization()));
+        self
     }
 
     /// Run the sink until the shutdown channel fires or the broadcast
@@ -276,8 +305,12 @@ impl WebhookSink {
         }
         last_sent.insert(key, now);
 
-        let message = format_message(transition);
-        let body = build_payload(self.flavor, &message, transition);
+        let link = self.item_link(transition);
+        let message = match &link {
+            Some(link) => format!("{}\n{link}", format_message(transition)),
+            None => format_message(transition),
+        };
+        let body = build_payload(self.flavor, &message, transition, link.as_deref());
 
         let result = self
             .client
@@ -456,6 +489,7 @@ fn build_payload(
     flavor: WebhookFlavor,
     message: &str,
     transition: &Transition,
+    link: Option<&str>,
 ) -> serde_json::Value {
     match flavor {
         WebhookFlavor::Slack => serde_json::to_value(SlackPayload { text: message })
@@ -467,8 +501,12 @@ fn build_payload(
             // the structured payload. If serialization fails (it
             // shouldn't, every field is plain data), fall back to the
             // message string so we still send *something*.
-            serde_json::to_value(transition)
-                .unwrap_or_else(|_| serde_json::json!({ "text": message }))
+            let mut value = serde_json::to_value(transition)
+                .unwrap_or_else(|_| serde_json::json!({ "text": message }));
+            if let (Some(link), Some(object)) = (link, value.as_object_mut()) {
+                object.insert("link".into(), serde_json::Value::String(link.into()));
+            }
+            value
         }
     }
 }
@@ -529,6 +567,53 @@ mod tests {
             to,
             agent: std::sync::Arc::new(agent),
         }
+    }
+
+    #[test]
+    fn messages_link_to_the_needs_you_card() {
+        let sink = || {
+            WebhookSink::resolve(&WebhookToml {
+                enabled: Some(true),
+                endpoint: Some("https://hooks.slack.com/services/x".into()),
+                ..WebhookToml::default()
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let fallback = Some("https://tend.example.com/auth".to_owned());
+        assert_eq!(
+            sink()
+                .with_dashboard(None, fallback.clone())
+                .needs_url
+                .as_deref(),
+            Some("https://tend.example.com/needs"),
+            "the sign-in public URL's origin"
+        );
+        assert_eq!(
+            sink()
+                .with_dashboard(Some("http://mini.lan:7878/x"), fallback.clone())
+                .needs_url
+                .as_deref(),
+            Some("http://mini.lan:7878/needs"),
+            "the webhook's own setting wins"
+        );
+        assert!(sink()
+            .with_dashboard(Some(""), fallback.clone())
+            .needs_url
+            .is_none());
+        assert!(sink()
+            .with_dashboard(Some("javascript:alert(1)"), None)
+            .needs_url
+            .is_none());
+        assert!(sink().with_dashboard(None, None).needs_url.is_none());
+        let mut waiting = agent(AgentKind::Codex, Some("%3"), None);
+        waiting.session_id = "s 1/x".into();
+        let t = transition(AgentState::Working, AgentState::WaitingInput, waiting);
+        let link = sink().with_dashboard(None, fallback).item_link(&t).unwrap();
+        assert_eq!(link, "https://tend.example.com/needs#item=s+1%2Fx");
+        let generic = build_payload(WebhookFlavor::Generic, "m", &t, Some(&link));
+        assert_eq!(generic["link"], link.as_str());
+        assert!(sink().item_link(&t).is_none(), "no dashboard, no link");
     }
 
     #[test]
@@ -703,7 +788,7 @@ mod tests {
     fn payload_for_slack_uses_text_field() {
         let a = agent(AgentKind::ClaudeCode, Some("p:0"), Some("hi"));
         let t = transition(AgentState::Working, AgentState::WaitingInput, a);
-        let v = build_payload(WebhookFlavor::Slack, "msg", &t);
+        let v = build_payload(WebhookFlavor::Slack, "msg", &t, None);
         let obj = v.as_object().expect("object payload");
         assert!(obj.contains_key("text"));
         assert_eq!(obj.get("text").and_then(|v| v.as_str()), Some("msg"));
@@ -714,7 +799,7 @@ mod tests {
     fn payload_for_discord_uses_content_field() {
         let a = agent(AgentKind::ClaudeCode, Some("p:0"), Some("hi"));
         let t = transition(AgentState::Working, AgentState::WaitingInput, a);
-        let v = build_payload(WebhookFlavor::Discord, "msg", &t);
+        let v = build_payload(WebhookFlavor::Discord, "msg", &t, None);
         let obj = v.as_object().expect("object payload");
         assert!(obj.contains_key("content"));
         assert_eq!(obj.get("content").and_then(|v| v.as_str()), Some("msg"));
@@ -725,7 +810,7 @@ mod tests {
     fn payload_for_generic_serializes_full_transition() {
         let a = agent(AgentKind::ClaudeCode, Some("p:0"), Some("hi"));
         let t = transition(AgentState::Working, AgentState::WaitingInput, a);
-        let v = build_payload(WebhookFlavor::Generic, "msg", &t);
+        let v = build_payload(WebhookFlavor::Generic, "msg", &t, None);
         let obj = v.as_object().expect("object payload");
         // Generic flavor passes the full Transition through; assert the
         // fields are present so a future change to `Transition` (rename

@@ -1084,6 +1084,10 @@ pub struct WebhookToml {
     /// Defaults to 60. Set to 0 to disable (one notification per
     /// transition, even if the agent flaps).
     pub rate_limit_secs: Option<u64>,
+    /// Dashboard address to link each message to its card on the "Needs
+    /// you" page (`<dashboard_url>/needs#item=<session>`). Defaults to
+    /// `[dashboard.login] public_url`; set to `""` for no link.
+    pub dashboard_url: Option<String>,
 }
 
 // The sign-in and sharing sections are typed only where the dashboard server

@@ -249,6 +249,17 @@ function lostAccess(error) {
   login.hidden = false;
 }
 
+/// A notification links to one card (`/needs#item=<id>`): bring it into
+/// view once, after the first load.
+function revealLinkedItem() {
+  const id = new URLSearchParams(window.location.hash.slice(1)).get("item");
+  if (!id) return;
+  const card = [...document.querySelectorAll("#queue .card")].find((node) => node.dataset.id === id);
+  if (!card) return;
+  card.classList.add("linked");
+  card.scrollIntoView({ block: "center" });
+}
+
 async function refresh() {
   const status = $("status");
   // A later refresh (or an auth failure) wins over one still in flight.
@@ -289,13 +300,13 @@ function select(tab) {
   $("tab-history").setAttribute("aria-selected", String(tab === "history"));
   $("queue").hidden = tab !== "queue";
   $("history").hidden = tab !== "history";
-  refresh();
+  refresh().then(revealLinkedItem);
 }
 
 $("tab-queue").addEventListener("click", () => select("queue"));
 $("tab-history").addEventListener("click", () => select("history"));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
+  if (!document.hidden) refresh().then(revealLinkedItem);
 });
 /// Typing in a card: a re-render now would move the cursor.
 function composing() {
@@ -305,4 +316,4 @@ function composing() {
 state.timer = setInterval(() => {
   if (!document.hidden) refresh();
 }, REFRESH_MS);
-refresh();
+refresh().then(revealLinkedItem);

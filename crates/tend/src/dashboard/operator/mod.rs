@@ -181,6 +181,12 @@ impl LoginConfig {
         oidc::origin(&self.public_url)
     }
 
+    /// The dashboard's public origin (`https://host[:port]`).
+    #[must_use]
+    pub fn public_origin(&self) -> String {
+        self.origin()
+    }
+
     pub(in crate::dashboard) fn matches_host(&self, host: &str) -> bool {
         oidc::matches_host(&self.public_url, host)
     }
