@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Webhook messages link to the agent's card on the dashboard's "Needs you"
   page (`[sinks.webhook] dashboard_url`, defaulting to the sign-in public
   URL); the generic payload carries it as `link`.
+- Turn-boundary delivery for opencode. At a clean turn end, `tend hook
+  opencode` returns the requests the user authorized for the session, and
+  the plugin hands them to opencode's own prompt API (1.x `promptAsync`, 2.x
+  `session.prompt` with `queue` delivery) instead of typing into the pane.
+  An interrupted or failed turn gets none, and an offer is held back if the
+  session was prompted again first.
 - Decide from the web: the "Needs you" page answers questions (an option
   or your own words, or decline) and accepts, sends back or withdraws
   results, through the same daemon paths as the Mac app. Operator-only with

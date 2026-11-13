@@ -233,6 +233,9 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                     let ev = place.bind(ev);
                     best_effort_ingest(client, &ev).await;
                     best_effort_default_alias(client, &ev).await;
+                    if let Some(output) = opencode_turn_delivery(client, &ev).await {
+                        println!("{output}");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => tracing::debug!(error = %e, event, "opencode hook payload ignored"),
@@ -298,6 +301,34 @@ pub(super) async fn turn_boundary_delivery(
     .ok()?
     .ok()?;
     turn_boundary_output(event, &offers)
+}
+
+/// opencode's turn boundary: a confirmed idle (`session.idle`, from either
+/// plugin). The offers Claude Code's Stop hook would carry in `reason` are
+/// printed as `{"prompt": TEXT}`, and the plugin hands TEXT to opencode's
+/// own prompt API for this session, so nothing is typed into the terminal.
+/// Nothing is consumed until the model claims a request by id, so a plugin
+/// that drops the prompt (the user typed first) loses nothing.
+async fn opencode_turn_delivery(client: &Client, ev: &tend::event::AgentEvent) -> Option<String> {
+    if !matches!(
+        ev,
+        tend::event::AgentEvent::TurnStopped {
+            idle_confirmed: true,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let output = turn_boundary_delivery(client, ev, "stop").await?;
+    opencode_prompt_output(&output)
+}
+
+/// `{"decision": "block", "reason": TEXT}` (the Stop-hook shape) to the
+/// opencode plugins' `{"prompt": TEXT}`.
+fn opencode_prompt_output(stop_output: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stop_output).ok()?;
+    let text = value.get("reason")?.as_str()?.trim();
+    (!text.is_empty()).then(|| serde_json::json!({ "prompt": text }).to_string())
 }
 
 /// The exact session this hook speaks for. A Codex shared app-server hook has
@@ -470,7 +501,21 @@ fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<Str
 
 #[cfg(test)]
 mod turn_boundary_tests {
-    use super::turn_boundary_output;
+    use super::{opencode_prompt_output, turn_boundary_output};
+
+    #[test]
+    fn opencode_gets_the_stop_offer_text_as_a_prompt() {
+        let offers = vec![serde_json::json!({"request_id": "req_1", "offer": "request"})];
+        let stop = turn_boundary_output("stop", &offers).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&opencode_prompt_output(&stop).unwrap()).unwrap();
+        let prompt = out["prompt"].as_str().unwrap();
+        assert!(prompt.contains("req_1"), "{prompt}");
+        assert!(prompt.contains("tend msg accept"), "{prompt}");
+        assert_eq!(out.as_object().unwrap().len(), 1);
+        assert!(opencode_prompt_output("{\"decision\":\"block\",\"reason\":\"  \"}").is_none());
+        assert!(opencode_prompt_output("not json").is_none());
+    }
 
     #[test]
     fn stop_continues_the_turn_and_prompt_submit_adds_context() {
