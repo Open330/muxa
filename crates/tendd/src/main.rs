@@ -55,6 +55,7 @@ mod herdr_bridge;
 mod pipeline_reconciler;
 mod screen_detect;
 mod synthetic;
+mod work_up_in_process;
 
 mod automation_engine;
 use automation_engine::spawn_automation_task;
@@ -252,6 +253,7 @@ async fn run() -> Result<()> {
         .clone()
         .or(cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
+    work_up_in_process::install(socket.clone());
     tracing::info!(
         socket = %socket.display(),
         generation = restart_generation(),

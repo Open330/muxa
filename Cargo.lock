@@ -3965,6 +3965,7 @@ dependencies = [
  "tempfile",
  "tend",
  "tend-aas",
+ "tend-work",
  "time",
  "tokio",
  "tracing",

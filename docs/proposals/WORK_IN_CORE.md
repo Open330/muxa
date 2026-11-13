@@ -1,7 +1,7 @@
 # Work in core: tendd stops running `tend` for Work logic
 
 Status: in progress. Step 1 (the move into `crates/tend-work`) is #502.
-Steps 2–4 below are not started.
+`work up` runs in-process (step 3, first call site); see "Done so far".
 
 ## Problem
 
@@ -112,3 +112,28 @@ pub struct WorkContext {
 
 - No change to what `work up`, reconcile or agent start do.
 - `tend work …` stays a CLI command with the same output.
+
+## Done so far
+
+- `work up` from IPC, the dashboard and the Mac app runs in tendd. The code
+  is in `crates/tendd/src/work_up_in_process.rs`; the hook is
+  `work_control::install_in_process_work_up`. It mirrors the child exactly
+  rather than introducing `WorkContext` yet:
+  - the same argv, parsed by `UpArgs`;
+  - the CLI's default config file;
+  - the daemon's own env and cwd, which the child inherited;
+  - a client on the socket the child had pinned;
+  - no prompts (`UpArgs::non_interactive`).
+
+  It runs on a blocking thread with its own current-thread runtime, so the
+  thread-local endpoint, blocking IPC and synchronous `git`/tmux stay off
+  the daemon's workers. Unreadable argv or config declines before any
+  effect, and the child runs instead. `TEND_WORK_UP_CHILD=1` forces the
+  child.
+- Proven on a scratch daemon (scratch `HOME`, XDG homes, `TMUX_TMPDIR`
+  tmux server with a plain `sh`, a fake `codex`):
+  - in-process launch with `TEND_CLI` pointing nowhere;
+  - a converging re-run;
+  - the forced child;
+  - the forced child failing without a CLI;
+  - `health` answering in under 100 ms during a `work up`.

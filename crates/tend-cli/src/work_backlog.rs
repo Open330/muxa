@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use tend::ipc::{Client, WorkShow};
 use tend::work::{WorkEdit, WorkIdentity, WorkRecord, WorkStage, WORK_BACKLOG_CAPABILITY};
+pub(crate) use tend_work::backlog::{backlog_supported, fill_from_plan, find_record};
 use time::OffsetDateTime;
 
 #[derive(Debug, clap::Args)]
@@ -68,19 +69,6 @@ async fn require_backlog(client: &Client) -> Result<()> {
         bail!("this tendd does not serve the Work backlog ({WORK_BACKLOG_CAPABILITY}); restart it with the same tend build");
     }
     Ok(())
-}
-
-/// Whether the daemon serves the backlog; used where it is optional.
-pub(crate) async fn backlog_supported(client: &Client) -> bool {
-    client
-        .hello(std::time::Duration::from_secs(2))
-        .await
-        .is_ok_and(|hello| {
-            hello
-                .capabilities
-                .iter()
-                .any(|c| c == WORK_BACKLOG_CAPABILITY)
-        })
 }
 
 /// Resolve `WORK` / `WORKSPACE/WORK` plus `--workspace` to an identity,
@@ -298,33 +286,6 @@ pub(crate) fn render_show(show: &WorkShow, now: OffsetDateTime) -> String {
     out
 }
 
-/// Fill `tend work up` arguments the caller left out from the Work's plan,
-/// if one exists. Explicit arguments always win and `--no-ticket` keeps the
-/// saved issue out. The saved prompt is marked as the plan's
-/// (`body_from_plan`): it is part of every launch prompt on every run, so a
-/// re-run converges, and it never restarts or steers running agents.
-pub(crate) fn fill_from_plan(args: &mut crate::work_up::UpArgs, record: &WorkRecord) {
-    let Some(plan) = &record.plan else {
-        return;
-    };
-    if args.workspace.is_none() {
-        args.workspace = Some(record.identity.workspace_id.clone());
-    }
-    if args.cwd.is_none() {
-        args.planned_cwd = plan.cwd.clone().map(Into::into);
-    }
-    if args.pipeline.is_none() {
-        args.pipeline.clone_from(&plan.pipeline);
-    }
-    if args.body.is_none() && args.skill.is_none() && plan.prompt.is_some() {
-        args.body.clone_from(&plan.prompt);
-        args.body_from_plan = true;
-    }
-    if args.external.is_none() && !args.no_ticket {
-        args.external.clone_from(&plan.external);
-    }
-}
-
 /// Which Work `tend work show WORK` means once its window is gone: the
 /// durable record with that id (an error when several match), else the
 /// identity `work up` would give it from here.
@@ -338,43 +299,6 @@ pub(crate) fn closed_work_identity(
         return Ok(Some(record.identity.clone()));
     }
     Ok(identity(work, workspace, here).ok())
-}
-
-/// The record for Work id `work`: the one in the named workspace, or the
-/// only one when no workspace was named. Several without a workspace is an
-/// error naming them, never a silent "none". With `planned_only`, records
-/// without a plan are ignored.
-pub(crate) fn find_record<'a>(
-    records: &'a [WorkRecord],
-    work: &str,
-    workspace: Option<&str>,
-    planned_only: bool,
-) -> Result<Option<&'a WorkRecord>> {
-    let work = crate::tmux_work::normalize_work_id(work)?;
-    let workspace = workspace
-        .map(crate::tmux_work::normalize_workspace_id)
-        .transpose()?;
-    let matching: Vec<&WorkRecord> = records
-        .iter()
-        .filter(|record| {
-            (!planned_only || record.plan.is_some())
-                && record.identity.work_id == work
-                && workspace
-                    .as_ref()
-                    .is_none_or(|w| &record.identity.workspace_id == w)
-        })
-        .collect();
-    match matching.as_slice() {
-        [] => Ok(None),
-        [one] => Ok(Some(one)),
-        many => bail!(
-            "Work {work} is recorded in several workspaces ({}); pass --workspace",
-            many.iter()
-                .map(|record| record.identity.workspace_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
 
 #[cfg(test)]

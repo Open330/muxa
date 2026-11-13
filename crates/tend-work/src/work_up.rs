@@ -98,6 +98,11 @@ pub struct UpArgs {
     /// restarts or re-prompts agents that are already running.
     #[arg(skip)]
     pub body_from_plan: bool,
+    /// Never prompt, even when stdin and stdout are a terminal: set when
+    /// tendd runs `work up` in-process, where a prompt would block the
+    /// daemon.
+    #[arg(skip)]
+    pub non_interactive: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -221,6 +226,70 @@ pub fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
         true,
         done,
     ))
+}
+
+#[derive(clap::Parser)]
+#[command(name = "tend work up", no_binary_name = true)]
+struct UpCommand {
+    #[command(flatten)]
+    args: UpArgs,
+}
+
+/// Parse the `["work", "up", WORK, …]` argv tendd would hand the CLI.
+pub fn parse_up_argv(argv: &[String]) -> Result<UpArgs> {
+    let [command, subcommand, rest @ ..] = argv else {
+        bail!("expected `work up …`, got {argv:?}");
+    };
+    if command != "work" || subcommand != "up" {
+        bail!("expected `work up …`, got {argv:?}");
+    }
+    <UpCommand as clap::Parser>::try_parse_from(rest)
+        .map(|command| command.args)
+        .map_err(|error| anyhow::anyhow!("{}", error.render()))
+}
+
+/// `tend work up --json --yes` without a terminal: the planned Work's plan
+/// fills omitted arguments, nothing prompts, nothing prints, and the result
+/// is returned rather than written to stdout. tendd calls this in-process;
+/// the CLI's `work up` is the interactive twin (`tend-cli/src/work_up_cmd.rs`),
+/// which can also hand a first run to `tend work init`.
+pub async fn run_noninteractive(
+    mut args: UpArgs,
+    config: &Config,
+    client: &tend::ipc::Client,
+) -> Result<UpResult> {
+    args.non_interactive = true;
+    let planned = if crate::backlog::backlog_supported(client).await {
+        let records = client
+            .work_backlog(None)
+            .await
+            .context("reading the Work backlog")?;
+        crate::backlog::find_record(&records, &args.work, args.workspace.as_deref(), true)?.cloned()
+    } else {
+        None
+    };
+    if let Some(record) = &planned {
+        crate::backlog::fill_from_plan(&mut args, record);
+    }
+    let dry_run = args.dry_run;
+    let resolved = resolve(&args, config, Some(client)).await?;
+    if dry_run {
+        return apply(resolved, true);
+    }
+    let result = apply_durable(resolved, client).await?;
+    if let Some(record) = planned
+        .as_ref()
+        .filter(|record| record.metadata.stage == tend::work::WorkStage::Queued)
+    {
+        let started = tend::work::WorkEdit {
+            stage: Some(tend::work::WorkStage::InProgress),
+            ..tend::work::WorkEdit::default()
+        };
+        if let Err(error) = client.work_edit(&record.identity, &started).await {
+            tracing::warn!(%error, "work up started, but the backlog record stays queued");
+        }
+    }
+    Ok(result)
 }
 
 /// Register desired state with tendd, atomically claim dependency-ready
@@ -1159,7 +1228,9 @@ fn existing_agents(
 fn compose_request(args: &UpArgs, config: &Config, work: &str) -> Result<Option<ComposedRequest>> {
     let body = match args.body.clone() {
         Some(body) => Some(body),
-        None if args.skill.is_none() && args.context.is_none() => ask_for_request(work)?,
+        None if args.skill.is_none() && args.context.is_none() && !args.non_interactive => {
+            ask_for_request(work)?
+        }
         None => None,
     };
     Ok(tend::request::compose(
@@ -1813,10 +1884,54 @@ async fn require_pipeline_purpose_support(
 mod tests {
     use super::*;
 
+    /// tendd's in-process `work up` reads the argv the daemon used to hand
+    /// the CLI. Every request field must survive that round trip.
+    #[test]
+    fn the_daemon_argv_parses_back_into_the_same_arguments() {
+        let request = tend::work_control::WorkUpRequest {
+            work: "ENG-1".into(),
+            external: Some("ENG-1".into()),
+            pipeline: Some("review".into()),
+            workspace: Some("tend".into()),
+            cwd: Some("/repo".into()),
+            skill: Some("/fix".into()),
+            body: Some("make CI green".into()),
+            context: Some("flaky since #500".into()),
+            no_ticket: false,
+            dry_run: true,
+            host: None,
+        };
+        let args = parse_up_argv(&request.arguments()).unwrap();
+        assert_eq!(args.work, "ENG-1");
+        assert_eq!(args.external.as_deref(), Some("ENG-1"));
+        assert_eq!(args.pipeline.as_deref(), Some("review"));
+        assert_eq!(args.workspace.as_deref(), Some("tend"));
+        assert_eq!(args.cwd.as_deref(), Some(Path::new("/repo")));
+        assert_eq!(args.skill.as_deref(), Some("/fix"));
+        assert_eq!(args.body.as_deref(), Some("make CI green"));
+        assert_eq!(args.context.as_deref(), Some("flaky since #500"));
+        assert!(args.json && args.yes && args.dry_run && !args.no_ticket);
+        assert!(
+            !args.non_interactive,
+            "run_noninteractive sets it, not the argv"
+        );
+
+        let bare = tend::work_control::WorkUpRequest {
+            external: None,
+            dry_run: false,
+            ..request
+        };
+        let args = parse_up_argv(&bare.arguments()).unwrap();
+        assert!(args.no_ticket, "no external reference means a local Work");
+        assert!(!args.dry_run);
+        assert!(parse_up_argv(&["work".into(), "down".into()]).is_err());
+    }
+
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
             body_from_plan: false,
             planned_cwd: None,
+            non_interactive: false,
             work: "eng-1".into(),
             external: None,
             pipeline: None,

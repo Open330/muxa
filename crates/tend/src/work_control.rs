@@ -215,14 +215,49 @@ pub fn remote_host_alias(host: Option<&str>) -> Option<&str> {
         .filter(|host| !host.is_empty() && *host != LOCAL_HOST_ALIAS)
 }
 
-/// Run the canonical CLI implementation. `socket_path` pins nested CLI IPC
-/// back to the daemon that accepted the operation, including non-default test
-/// and app sockets.
+/// `work up` run inside the calling process instead of as a `tend` child.
+/// tendd installs one at startup (it links `tend-work`, which this crate
+/// cannot depend on). It gets the request and the daemon socket to call
+/// back on. `None` means it declined before doing anything, and the caller
+/// falls back to the child.
+pub type InProcessWorkUp = std::sync::Arc<
+    dyn Fn(
+            WorkUpRequest,
+            Option<PathBuf>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Result<Value, WorkUpError>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+static IN_PROCESS_WORK_UP: std::sync::OnceLock<InProcessWorkUp> = std::sync::OnceLock::new();
+
+/// Set the in-process `work up` once, at daemon startup. Later calls are
+/// ignored.
+pub fn install_in_process_work_up(run: InProcessWorkUp) {
+    let _ = IN_PROCESS_WORK_UP.set(run);
+}
+
+/// Whether `TEND_WORK_UP_CHILD` forces the `tend` child, the path every
+/// release before this one used.
+fn work_up_child_forced() -> bool {
+    std::env::var_os("TEND_WORK_UP_CHILD").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Run `work up`: in-process when tendd installed it, else the canonical
+/// CLI as a child. `socket_path` pins nested IPC back to the daemon that
+/// accepted the operation, including non-default test and app sockets.
 pub async fn execute_work_up(
     input: &WorkUpRequest,
     socket_path: Option<&Path>,
 ) -> Result<Value, WorkUpError> {
     input.validate()?;
+    if let Some(run) = IN_PROCESS_WORK_UP.get().filter(|_| !work_up_child_forced()) {
+        if let Some(result) = run(input.clone(), socket_path.map(Path::to_path_buf)).await {
+            return result;
+        }
+        tracing::info!("in-process work up declined; running the tend CLI");
+    }
     let output = execute_work_command(
         &resolve_tend_binary(),
         &input.arguments(),
