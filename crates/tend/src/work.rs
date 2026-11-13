@@ -300,9 +300,10 @@ pub struct WorkPlan {
     /// requesting agent, never read from the repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<crate::work_verify::WorkCheck>,
-    /// Where the checks run: the directory the Work last started in, which
-    /// a route worktree or `--cwd` can make differ from `cwd`. Falls back
-    /// to `cwd`.
+    /// The directory the checks were declared for: `cwd` as it was when
+    /// they were declared, so a later `cwd` edit by someone else does not
+    /// move them. Set by tendd, never by a client. A Work with a durable
+    /// Run is verified in the Run's directory instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_cwd: Option<String>,
     /// Who declared `acceptance` and `checks`. Set by tendd from the
@@ -312,10 +313,12 @@ pub struct WorkPlan {
 }
 
 impl WorkPlan {
-    /// The directory the checks run in.
+    /// The directory the checks were declared for. Only the pinned value:
+    /// falling back to `cwd` would let an edit that is not a verification
+    /// edit move them.
     #[must_use]
     pub fn checks_dir(&self) -> Option<&str> {
-        self.verify_cwd.as_deref().or(self.cwd.as_deref())
+        self.verify_cwd.as_deref()
     }
 
     #[must_use]
@@ -357,17 +360,13 @@ pub struct WorkEdit {
     /// Replace the declared checks; an empty list clears them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<crate::work_verify::WorkCheck>>,
-    /// Where the checks run (absolute); set from the directory a Work
-    /// starts in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify_cwd: Option<String>,
 }
 
 impl WorkEdit {
-    /// Whether this edit changes what tend verifies or where.
+    /// Whether this edit changes what tend verifies.
     #[must_use]
     pub fn touches_verification(&self) -> bool {
-        self.acceptance.is_some() || self.checks.is_some() || self.verify_cwd.is_some()
+        self.acceptance.is_some() || self.checks.is_some()
     }
 }
 
@@ -475,8 +474,7 @@ impl WorkEdit {
         if let Some(priority) = self.priority {
             plan.priority = Some(priority);
         }
-        let touches =
-            self.acceptance.is_some() || self.checks.is_some() || self.verify_cwd.is_some();
+        let touches = self.acceptance.is_some() || self.checks.is_some();
         if touches {
             let Some(declarer) = declarer else {
                 return Err("acceptance criteria and checks need a known declarer".into());
@@ -491,14 +489,18 @@ impl WorkEdit {
         if let Some(acceptance) = self.acceptance {
             plan.acceptance = crate::work_verify::validate_acceptance(acceptance)?;
         }
+        let redeclared = self.checks.is_some();
         if let Some(checks) = self.checks {
             plan.checks = crate::work_verify::validate_checks(checks)?;
         }
-        plan.verify_cwd = edit_text(plan.verify_cwd, self.verify_cwd, 4_096, "verify cwd")?;
-        if let Some(dir) = &plan.verify_cwd {
-            if !std::path::Path::new(dir).is_absolute() {
-                return Err(format!("verify cwd {dir:?} must be an absolute path"));
-            }
+        // Pin the checks to the directory they were declared for, so a
+        // later `cwd` edit by anyone does not move them.
+        if redeclared {
+            plan.verify_cwd = if plan.checks.is_empty() {
+                None
+            } else {
+                plan.cwd.clone()
+            };
         }
         if touches {
             plan.declared_by = (!plan.acceptance.is_empty() || !plan.checks.is_empty())
@@ -1560,5 +1562,30 @@ mod tests {
         }
         .apply(&identity, Some(by_person), now)
         .is_ok());
+    }
+
+    #[test]
+    fn a_cwd_edit_does_not_move_where_declared_checks_run() {
+        use crate::work_verify::{Declarer, WorkCheck};
+        let identity = WorkIdentity::new("tend", "ENG-4");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let declared = WorkEdit {
+            title: Some("x".into()),
+            cwd: Some("/original".into()),
+            checks: Some(vec![WorkCheck::new("cargo test")]),
+            ..WorkEdit::default()
+        }
+        .apply_as(&identity, None, now, &Declarer::Operator)
+        .unwrap();
+        // Any caller may still edit the plan's cwd, but not where the checks run.
+        let moved = WorkEdit {
+            cwd: Some("/elsewhere".into()),
+            ..WorkEdit::default()
+        }
+        .apply(&identity, Some(declared), now)
+        .unwrap();
+        let plan = moved.plan.unwrap();
+        assert_eq!(plan.cwd.as_deref(), Some("/elsewhere"));
+        assert_eq!(plan.checks_dir(), Some("/original"));
     }
 }

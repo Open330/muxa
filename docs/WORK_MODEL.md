@@ -76,9 +76,10 @@ tend work up ENG-2 --check "npm test"        # recorded on the Work it starts
 gives the whole list, which replaces the Work's (`--no-acceptance`,
 `--no-checks` clear them). `tend_start_work` takes the same lists as
 `acceptance` and `checks`, and both refuse a bad list before anything
-starts. Checks run in the directory the Work last started in (`work up`
-records it, so a route worktree or `--cwd` is what gets verified), else the
-plan's `cwd`. The commands come only from this declaration, never from
+starts. Checks are pinned to the plan's `cwd` as it was when they were
+declared, so a later `cwd` edit does not move them; a Work that has a durable
+Run (`work up`) is verified in that Run's directory, so a route worktree or
+`--cwd` is what gets verified. The commands come only from this declaration, never from
 repository content. They are stored on the plan (`work_verify_v1`) with who
 declared them, and shown by `tend work show`.
 

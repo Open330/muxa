@@ -90,10 +90,9 @@ pub(crate) fn verify_edit(
 }
 
 /// Record the acceptance criteria and checks given to `tend work up` /
-/// `tend_start_work` on the Work it started, and bind the Work's checks to
-/// the directory it actually started in (a route worktree or `--cwd` can
-/// differ from the plan's), so they verify the result and not the original
-/// checkout.
+/// `tend_start_work` on the Work it started. A Work without a directory
+/// gets the run's. Where the checks then run is tendd's: the Work's durable
+/// Run directory, so a route worktree or `--cwd` is what gets verified.
 pub(crate) async fn declare_verification(
     client: &Client,
     identity: &WorkIdentity,
@@ -101,43 +100,31 @@ pub(crate) async fn declare_verification(
     checks: Option<Vec<tend::work_verify::WorkCheck>>,
     run_cwd: &Path,
 ) -> Result<()> {
-    let declared = acceptance.is_some() || checks.is_some();
+    if acceptance.is_none() && checks.is_none() {
+        return Ok(());
+    }
     let existing = client
         .work_backlog(None)
         .await?
         .into_iter()
         .find(|record| record.identity == *identity);
-    let has_checks = checks.as_ref().map_or_else(
-        || {
-            existing
-                .as_ref()
-                .and_then(|record| record.plan.as_ref())
-                .is_some_and(|plan| !plan.checks.is_empty())
-        },
-        |checks| !checks.is_empty(),
-    );
-    if !declared && !has_checks {
-        return Ok(());
-    }
+    let has_cwd = existing
+        .as_ref()
+        .and_then(|record| record.plan.as_ref())
+        .is_some_and(|plan| plan.cwd.is_some());
     let edit = WorkEdit {
         acceptance,
         checks,
-        verify_cwd: has_checks.then(|| run_cwd.to_string_lossy().into_owned()),
+        cwd: (!has_cwd).then(|| run_cwd.to_string_lossy().into_owned()),
         // A record made here belongs to a Work that is running now.
         stage: existing.is_none().then_some(WorkStage::InProgress),
         ..WorkEdit::default()
     };
-    match client.work_edit(identity, &edit).await {
-        Ok(_) => Ok(()),
-        // Only re-pointing existing checks: a refusal (an agent starting a
-        // Work the person declared checks for) leaves them where they were.
-        Err(error) if !declared => {
-            eprintln!("note: the Work's checks still run in their previous directory: {error}");
-            Ok(())
-        }
-        Err(error) => Err(anyhow::Error::new(error)
-            .context("recording the Work's acceptance criteria and checks")),
-    }
+    client
+        .work_edit(identity, &edit)
+        .await
+        .context("recording the Work's acceptance criteria and checks")?;
+    Ok(())
 }
 
 /// Validate what [`verify_edit`] produced before anything starts, so a bad
@@ -259,7 +246,6 @@ pub async fn run_plan(args: PlanArgs, client: &Client) -> Result<()> {
     let edit = WorkEdit {
         acceptance,
         checks,
-        verify_cwd: None,
         title: args.title,
         goal: args.goal,
         next_action: args.next_action,
