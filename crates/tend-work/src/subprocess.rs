@@ -158,13 +158,15 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let started = Instant::now();
     let status = wait(&mut child, remaining)?;
-    // A descendant can keep the pipes open after the command itself exits.
-    // The deadline covers reading them to the end too; past it the group is
-    // killed, which closes them.
+    // A descendant can keep the pipes open after the command itself exits,
+    // even one that left the process group (`setsid`), which killing the
+    // group cannot reach. The deadline covers reading them to the end too:
+    // past it the group is killed and the readers are left behind (they end
+    // when the last holder closes the pipe) rather than waited on.
     while !(stdout.is_finished() && stderr.is_finished()) {
         if started.elapsed() >= remaining {
             kill_group(child.id());
-            break;
+            return Err(timed_out());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -242,11 +244,30 @@ mod tests {
     #[test]
     fn a_descendant_holding_the_pipes_does_not_outlast_the_deadline() {
         let started = Instant::now();
-        let out = with_scope(scope("/s", Duration::from_millis(300)), || {
+        let error = with_scope(scope("/s", Duration::from_millis(300)), || {
             // The command exits at once; its background child keeps stdout.
-            output(&mut sh("sleep 30 & exit 0")).unwrap()
+            output(&mut sh("sleep 30 & exit 0")).unwrap_err()
         });
-        assert!(out.status.success());
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_detached_descendant_holding_the_pipes_does_not_outlast_the_deadline() {
+        // The grandchild leaves the process group (`setsid`), so killing the
+        // group cannot close the pipes it inherited.
+        let started = Instant::now();
+        let error = with_scope(scope("/s", Duration::from_millis(300)), || {
+            output(&mut sh(
+                "perl -MPOSIX -e 'if (fork() == 0) { POSIX::setsid(); sleep 3; exit 0 } exit 0'",
+            ))
+            .unwrap_err()
+        });
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
