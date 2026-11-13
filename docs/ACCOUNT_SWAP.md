@@ -570,11 +570,12 @@ hooks would ask; `tend init` does the same after rewriting the Codex hooks.
 
 ## Why a swap still restarts the agent
 
-A swap changes which account a running agent bills to. Both providers bind
-the account to the process: Claude reads its token at start
-(`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`), Codex reads `auth.json`
-from its `CODEX_HOME`. So the visible TUI is stopped and started again on
-the other account, resuming the same conversation.
+A swap changes which account a running agent bills to. tend keeps each
+account in its own home (Claude's `CLAUDE_CONFIG_DIR` with its token,
+Codex's `CODEX_HOME`), and a running agent was started under one of them.
+Neither provider offers a way to move a running TUI to another account's
+home, so the visible TUI is stopped and started again under the other one,
+resuming the same conversation.
 
 Codex's app-server does speak a JSON-RPC API with `thread/resume`,
 `turn/start` and `account/*` methods (checked against
@@ -585,14 +586,18 @@ restart:
   are started `--no-daemon` whenever the daemon socket path is too long (it
   is under `~/Library/Application Support`), so their app-server is
   in-process, private to that TUI, and dies with it;
-- a shared app-server daemon belongs to one `CODEX_HOME`. Its frontends all
-  share its account, so it cannot move one agent to another account;
+- a shared app-server daemon runs with the home and environment it started
+  with. Its frontends all share that home, so it cannot move one of them to
+  another account's home;
 - `thread/resume` reattaches a client to a thread. The relaunched TUI already
   does exactly that, by `codex resume <id>`, and tend binds the result from the
   process's own open rollout (`conversation_verified`). A headless resume
   through the API would run a second client that nobody is looking at;
-- `account/login/start` changes the credentials of a live server. That would
-  rewrite the user's login, which is not tend's to do.
+- `account/login/start` changes the authentication of a live server (for
+  every client attached to it, and, depending on the credential mode and
+  store, persistently). It does not move one frontend to another account's
+  home, and changing a server's login on the user's behalf is not tend's to
+  do.
 
 What tend took from the deterministic route instead: the binding comes from
 the provider's own record for the exact process (Claude `sessions/<pid>.json`,
