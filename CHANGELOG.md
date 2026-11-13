@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the session CSRF proof; repeats change nothing; each decision names who
   made it (`web:<email>`) and is audited to `dashboard-decisions.jsonl`.
   Dashboard pages can no longer be framed by other sites.
+- The decision queue puts tend's own check results first. A result filed on
+  a verified Work carries `verification` (each check's command, exit status
+  and output tail, set only by tendd); `tend review queue` shows
+  `[3/3 checks passed]` before the agent's words, and `tend review show`
+  prints "checked by tend" ahead of the agent's summary and evidence.
 - tendd verifies a result before the person sees it. When an agent files a
   result (`tend_file_result`, `tend work done --summary`) on a Work with
   declared checks, or on a request sent for one, or completes it with

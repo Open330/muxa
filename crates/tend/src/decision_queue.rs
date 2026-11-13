@@ -441,6 +441,7 @@ mod tests {
                 session_id: "s".into(),
             },
             generation: 1,
+            verification: None,
             summary: "check".into(),
             anchor: None,
             idempotency_key: None,

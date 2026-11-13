@@ -2817,6 +2817,19 @@ async fn a_result_on_a_work_with_checks_is_filed_only_once_tend_has_run_them() {
 
     std::fs::write(checkout.join("built"), b"").unwrap();
     let item = client.review_create(&result()).await.unwrap();
+    let verification = item.verification.clone().expect("tend's own verification");
+    assert!(verification.passed);
+    assert_eq!(verification.checks[0].tail, "built ok");
+    // The decision queue carries it on the item.
+    let queue = client
+        .decision_queue(&crate::decision_queue::operator_origin(), 50)
+        .await
+        .unwrap();
+    assert!(queue.items.iter().any(|pending| matches!(
+        pending,
+        crate::decision_queue::PendingItem::Review(review)
+            if review.id == item.id && review.verification.as_ref() == Some(&verification)
+    )));
     let evidence = item.decision.unwrap().evidence;
     assert_eq!(
         evidence[0],

@@ -419,6 +419,46 @@ fn run_check(check: &WorkCheck, dir: &std::path::Path, limit: std::time::Duratio
     outcome(passed, exit_code, timed_out, tail)
 }
 
+/// What tend itself established about a result before it reached the
+/// person: the Work's declared checks, run by tendd. Stored on the review
+/// item, set only by tendd, and shown ahead of the agent's own account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verification {
+    /// Every check passed (a failing one keeps the record from being filed,
+    /// so a stored verification normally passed).
+    pub passed: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    pub ran_at: time::OffsetDateTime,
+    /// One per declared check, in declaration order.
+    pub checks: Vec<CheckOutcome>,
+}
+
+impl Verification {
+    #[must_use]
+    pub fn new(checks: Vec<CheckOutcome>) -> Self {
+        Self {
+            passed: !checks.is_empty() && checks.iter().all(|check| check.passed),
+            ran_at: time::OffsetDateTime::now_utc(),
+            checks,
+        }
+    }
+
+    /// `3/3 checks passed`, for one-line views.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        let passed = self.checks.iter().filter(|check| check.passed).count();
+        format!(
+            "{passed}/{} {} passed",
+            self.checks.len(),
+            if self.checks.len() == 1 {
+                "check"
+            } else {
+                "checks"
+            }
+        )
+    }
+}
+
 /// A verification's verdict: the Work declared no checks, or every check
 /// passed, or at least one failed.
 #[derive(Debug, Clone, PartialEq, Eq)]

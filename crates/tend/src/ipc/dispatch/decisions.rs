@@ -22,20 +22,13 @@ pub(super) async fn handle(
         // keeps it from the person.
         RequestBody::ReviewCreate { mut review } => {
             let caller_is_agent = caller_is_agent(ctx, conn).await;
+            *kind = "review_create";
             match Box::pin(verify_result(ctx, &mut review, caller_is_agent)).await {
-                Ok(()) => {
-                    let (name, response) = Box::pin(review_response(
-                        reviews,
-                        RequestBody::ReviewCreate { review },
-                    ))
-                    .await;
-                    *kind = name;
-                    response
-                }
-                Err(refusal) => {
-                    *kind = "review_create";
-                    Response::err(refusal)
-                }
+                Ok(verification) => match reviews.create_verified(*review, verification).await {
+                    Ok(item) => Response::with_review_item(item),
+                    Err(error) => Response::err(error.to_string()),
+                },
+                Err(refusal) => Response::err(refusal),
             }
         }
         RequestBody::ReviewRecord {
@@ -46,8 +39,9 @@ pub(super) async fn handle(
             // Normally the person recording what they decided; from an
             // agent's pane it is a result like any other.
             let caller_is_agent = caller_is_agent(ctx, conn).await;
+            // A decided record keeps no verification: the person decided.
             match Box::pin(verify_result(ctx, &mut review, caller_is_agent)).await {
-                Ok(()) => {
+                Ok(_) => {
                     let (name, response) = Box::pin(review_response(
                         reviews,
                         RequestBody::ReviewRecord {
@@ -124,10 +118,10 @@ async fn verify_result(
     ctx: &ServerCtx,
     review: &mut crate::review::NewReview,
     caller_is_agent: bool,
-) -> Result<(), String> {
+) -> Result<Option<crate::work_verify::Verification>, String> {
     crate::work_verify::strip_claims(&mut review.decision);
     if !crate::work_verify::result_needs_checks(caller_is_agent, review.requested_by.kind) {
-        return Ok(());
+        return Ok(None);
     }
     let identity = match &review.target {
         crate::review::ReviewTarget::Work {
@@ -144,13 +138,14 @@ async fn verify_result(
         crate::review::ReviewTarget::Session { .. } => None,
     };
     let Some(identity) = identity else {
-        return Ok(());
+        return Ok(None);
     };
     match crate::work_verify::verify(&ctx.work_store, &identity).await {
-        crate::work_verify::Gate::NoChecks => Ok(()),
+        crate::work_verify::Gate::NoChecks => Ok(None),
         crate::work_verify::Gate::Passed(outcomes) => {
+            // Also as evidence, for clients that render only the decision.
             crate::work_verify::attach(&mut review.decision, &outcomes);
-            Ok(())
+            Ok(Some(crate::work_verify::Verification::new(outcomes)))
         }
         crate::work_verify::Gate::Failed(outcomes) => Err(crate::work_verify::refusal(&outcomes)),
     }
