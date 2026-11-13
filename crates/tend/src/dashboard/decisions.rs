@@ -41,10 +41,13 @@
 //! # Fleet
 //!
 //! The queue is per host. This host contributes everything (questions,
-//! waiting agents, review items). Each connected Fleet host contributes the
-//! questions addressed to its operator console (the operator-only mailbox
-//! read) and its agents waiting in their panes (from the Fleet snapshot);
-//! review items are not read over Fleet. Every host section names what it
+//! waiting agents, review items). A connected Fleet host whose relay
+//! answers `fleet_decision_queue_v1` contributes its whole queue, read there
+//! as its operator console. An older relay contributes the questions in its
+//! operator mailbox (only its newest messages, so a full read is marked
+//! possibly incomplete) and its waiting agents from the Fleet snapshot, but
+//! no review items. Review items on another host are shown, not decided
+//! here (there is no Fleet write for them). Every host section names what it
 //! covers and what could not be read, and a host that is not online is
 //! listed as such, so nothing is silently missing.
 //!
@@ -135,6 +138,41 @@ async fn remote_section(
             "queue": crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
         });
     }
+    // A current relay sends its host's whole queue, read there as the
+    // operator console: questions, waiting agents and review items.
+    if host
+        .capabilities
+        .iter()
+        .any(|c| c == crate::fleet::FLEET_DECISION_QUEUE_CAPABILITY)
+    {
+        return match fleet
+            .execute(
+                host.alias.clone(),
+                FleetOperation::DecisionQueue { limit },
+                FLEET_READ_TIMEOUT,
+            )
+            .await
+        {
+            Ok(result) => {
+                let queue = result.decision_queue.map_or_else(
+                    || crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
+                    |queue| *queue,
+                );
+                json!({
+                    "alias": host.alias, "local": false, "control": control,
+                    "covers": ["questions", "waiting agents", "review items"],
+                    "unavailable": queue.unavailable.clone(), "queue": queue,
+                })
+            }
+            Err(error) => json!({
+                "alias": host.alias, "local": false, "control": control,
+                "covers": [], "unavailable": [format!("decision queue: {error}")],
+                "queue": crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
+            }),
+        };
+    }
+    // An older relay: questions from its mailbox, which carries only the
+    // newest messages, and agents from the Fleet snapshot.
     let agents = host
         .remote
         .as_ref()
@@ -156,6 +194,15 @@ async fn remote_section(
     {
         Ok(result) => {
             covers.insert(0, "questions");
+            // The mailbox read stops at the newest messages, answered ones
+            // included: when it is full, an older open question may be
+            // past the cut, so the section says it may be incomplete.
+            if result.collaboration_incoming.len() >= crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT {
+                unavailable.insert(
+                    0,
+                    "older questions: this host's tend sends only its newest messages; upgrade it for the full queue".to_owned(),
+                );
+            }
             // Only what is addressed to the operator console counts.
             result
                 .collaboration_incoming
@@ -168,7 +215,10 @@ async fn remote_section(
             Vec::new()
         }
     };
-    let queue = crate::decision_queue::assemble_queue(&human, &agents, Vec::new(), limit);
+    let mut queue = crate::decision_queue::assemble_queue(&human, &agents, Vec::new(), limit);
+    queue.truncated |= unavailable
+        .iter()
+        .any(|note| note.starts_with("older questions"));
     json!({
         "alias": host.alias, "local": false, "control": control,
         "covers": covers, "unavailable": unavailable, "queue": queue,

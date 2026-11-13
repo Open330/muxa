@@ -181,3 +181,9 @@ export function hostSections(data, now = Date.now()) {
     };
   });
 }
+
+/// Request ids are per host (two hosts can hold the same one), so an unsent
+/// answer belongs to the host, the kind of item and its id together.
+export function draftKey(card) {
+  return JSON.stringify([card.host || "", card.remote ? 1 : 0, card.kind, card.id]);
+}

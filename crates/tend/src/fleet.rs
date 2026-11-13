@@ -95,6 +95,9 @@ pub const FLEET_WORKTREE_INVENTORY_CAPABILITY: &str = "worktree_inventory_v1";
 pub const FLEET_WORKTREE_CHANGE_CAPABILITY: &str = "worktree_change_v1";
 /// Relay capability: the relay answers [`RelayRequest::ServerInventory`].
 pub const FLEET_SERVER_INVENTORY_CAPABILITY: &str = "server_inventory_v1";
+/// Relay capability: the relay answers [`RelayRequest::DecisionQueue`] with
+/// its host's whole decision queue, read as the operator console.
+pub const FLEET_DECISION_QUEUE_CAPABILITY: &str = "fleet_decision_queue_v1";
 /// The relay (and, in a daemon's own hello, the controller) carries
 /// `SendPrompt.force` end to end and enforces it through the destination
 /// daemon's guarded `send_prompt`. Distinct from the local
@@ -123,6 +126,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     FLEET_WORKTREE_INVENTORY_CAPABILITY,
     FLEET_WORKTREE_CHANGE_CAPABILITY,
     FLEET_SERVER_INVENTORY_CAPABILITY,
+    FLEET_DECISION_QUEUE_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -584,6 +588,11 @@ pub enum RelayRequest {
     ServerInventory {
         request_id: String,
     },
+    /// The relay host's decision queue as its operator sees it; read-only.
+    DecisionQueue {
+        request_id: String,
+        limit: usize,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -661,6 +670,7 @@ impl RelayRequest {
             | Self::WorktreeInventory { request_id }
             | Self::WorktreeChange { request_id, .. }
             | Self::ServerInventory { request_id }
+            | Self::DecisionQueue { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -805,6 +815,11 @@ pub enum FleetOperation {
     /// `fleet_servers_v1`: TCP listeners on the host associated with tend
     /// (see `tend::listener_inventory`). Read-only.
     ServerInventory,
+    /// `fleet_decision_queue_v1`: the host's decision queue (questions to
+    /// its operator, waiting agents, open review items). Read-only.
+    DecisionQueue {
+        limit: usize,
+    },
     CollaborationSend {
         pane: PaneKey,
         request: Box<NewRequest>,
@@ -907,12 +922,16 @@ pub struct FleetCommandResult {
     /// The host's listeners associated with tend, for `server_inventory`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub servers: Option<crate::listener_inventory::ListenerInventory>,
+    /// The host's decision queue, for `decision_queue`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_queue: Option<Box<crate::decision_queue::PendingQueue>>,
 }
 
 impl FleetCommandResult {
     #[must_use]
     pub fn accepted(message: impl Into<String>) -> Self {
         Self {
+            decision_queue: None,
             accepted: true,
             message: Some(message.into()),
             capture: None,
@@ -946,6 +965,14 @@ impl FleetCommandResult {
     }
 
     #[must_use]
+    pub fn decision_queue(queue: crate::decision_queue::PendingQueue) -> Self {
+        Self {
+            decision_queue: Some(Box::new(queue)),
+            ..Self::accepted("decision queue")
+        }
+    }
+
+    #[must_use]
     pub fn servers(inventory: crate::listener_inventory::ListenerInventory) -> Self {
         Self {
             servers: Some(inventory),
@@ -965,6 +992,7 @@ impl FleetCommandResult {
     #[must_use]
     pub fn capture(capture: Option<String>) -> Self {
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture,
@@ -992,6 +1020,7 @@ impl FleetCommandResult {
         let capture_raw_base64 = raw_capture.as_deref().map(raw_capture_base64);
         let capture = raw_capture.map(sanitize_capture_text);
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture,
@@ -1017,6 +1046,7 @@ impl FleetCommandResult {
     #[must_use]
     pub fn sent(outcome: SendPromptOutcome) -> Self {
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1042,6 +1072,7 @@ impl FleetCommandResult {
     #[must_use]
     pub fn window_capture(capture: FleetWindowCapture) -> Self {
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1067,6 +1098,7 @@ impl FleetCommandResult {
     #[must_use]
     pub fn collaboration_request(request: CollaborationRequest) -> Self {
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1112,6 +1144,7 @@ impl FleetCommandResult {
         incoming.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
         sent.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1138,6 +1171,7 @@ impl FleetCommandResult {
     #[must_use]
     pub fn command(output: WorkCommandOutput) -> Self {
         Self {
+            decision_queue: None,
             accepted: true,
             message: None,
             capture: None,

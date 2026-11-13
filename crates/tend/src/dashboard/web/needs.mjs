@@ -3,7 +3,7 @@
 // token kept by the main page, or the OIDC operator session cookie.
 // Everything an agent wrote is rendered with textContent, never as HTML.
 
-import { decidedCard, hostSections } from "./needs-model.mjs";
+import { decidedCard, draftKey, hostSections } from "./needs-model.mjs";
 import { withPaneHash } from "./pane-drawer.mjs";
 
 const TOKEN_KEY = "tend.token";
@@ -13,6 +13,7 @@ const $ = (id) => document.getElementById(id);
 const state = { tab: "queue", timer: null, generation: 0 };
 /// Unsent answers and notes by card, kept across re-renders.
 const drafts = new Map();
+
 
 function authHeaders() {
   let token = null;
@@ -66,6 +67,7 @@ function el(tag, className, text) {
 function renderCard(card) {
   const li = el("li", "card");
   li.dataset.id = card.id;
+  if (card.host) li.dataset.host = card.host;
   li.append(el("div", `kind ${card.kind}`, card.label));
   li.append(el("h2", null, card.title));
   li.append(el("div", "meta", card.meta));
@@ -119,10 +121,10 @@ function actions(card) {
   box.addEventListener("submit", (event) => event.preventDefault());
   const note = el("textarea", "note");
   note.rows = 2;
-  note.value = drafts.get(card.id) || "";
+  note.value = drafts.get(draftKey(card)) || "";
   note.addEventListener("input", () => {
-    if (note.value) drafts.set(card.id, note.value);
-    else drafts.delete(card.id);
+    if (note.value) drafts.set(draftKey(card), note.value);
+    else drafts.delete(draftKey(card));
   });
   note.maxLength = card.kind === "ask" ? 16384 : 1024;
   const message = el("p", "result");
@@ -134,7 +136,7 @@ function actions(card) {
     try {
       await write(path, body);
       message.textContent = done;
-      drafts.delete(card.id);
+      drafts.delete(draftKey(card));
       setTimeout(refresh, 800);
     } catch (error) {
       if (error.auth) return lostAccess(error);
@@ -147,7 +149,7 @@ function actions(card) {
     const options = el("div", "choices");
     for (const option of card.options) options.append(button(option, () => {
       note.value = option;
-      drafts.set(card.id, option);
+      drafts.set(draftKey(card), option);
     }));
     if (card.options.length) box.append(options);
     box.append(note);

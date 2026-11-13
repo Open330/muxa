@@ -3407,7 +3407,12 @@ mod tests {
         let observe = fleet_host("obs", "dev");
         let mut offline = fleet_host("off", "dev");
         offline.state = FleetHostState::Offline;
-        for host in [here, mini, observe, offline] {
+        // A current relay answers with its whole queue.
+        let mut full = fleet_host("full", "dev");
+        full.capabilities = vec![crate::fleet::FLEET_DECISION_QUEUE_CAPABILITY.into()];
+        let mut busy = fleet_host("busy", "dev");
+        busy.mode = HostAccessMode::Control;
+        for host in [here, mini, observe, offline, full, busy] {
             store.upsert_host(host).await;
         }
         let (runtime, mut commands) = FleetRuntime::new(store);
@@ -3422,7 +3427,23 @@ mod tests {
                         let mut result = FleetCommandResult::accepted("mailbox");
                         // An agent-to-agent request in the reply is ignored.
                         result.collaboration_incoming = vec![q.clone(), a.clone()];
+                        if command.host == "busy" {
+                            // A full read: older questions may be past it.
+                            result.collaboration_incoming =
+                                vec![a.clone(); crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT];
+                        }
                         Ok(result)
+                    }
+                    FleetOperation::DecisionQueue { limit } => {
+                        assert_eq!(command.host, "full");
+                        Ok(FleetCommandResult::decision_queue(
+                            crate::decision_queue::assemble_queue(
+                                std::slice::from_ref(&q),
+                                &[],
+                                Vec::new(),
+                                limit,
+                            ),
+                        ))
                     }
                     FleetOperation::CollaborationGet { request_id, .. } => {
                         let request = if request_id == q.id {
@@ -3464,10 +3485,25 @@ mod tests {
         let body = body_json(call("GET", "/api/decisions".into(), None).await).await;
         let hosts = body["hosts"].as_array().unwrap();
         let alias = |i: usize| hosts[i]["alias"].as_str().unwrap().to_owned();
+        let names = (0..hosts.len()).map(alias).collect::<Vec<_>>();
+        assert_eq!(names, ["here", "busy", "full", "mini", "obs", "off"]);
+        let section = |name: &str| hosts.iter().find(|h| h["alias"] == name).unwrap().clone();
+        let full = section("full");
         assert_eq!(
-            (0..4).map(alias).collect::<Vec<_>>(),
-            ["here", "mini", "obs", "off"]
+            full["covers"],
+            json!(["questions", "waiting agents", "review items"])
         );
+        assert_eq!(
+            full["queue"]["items"][0]["request_id"],
+            question.id.as_str()
+        );
+        let busy = section("busy");
+        assert_eq!(busy["queue"]["truncated"], true);
+        assert!(busy["unavailable"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("older questions"));
+        let hosts: Vec<Value> = ["here", "mini", "obs", "off"].map(section).to_vec();
         assert_eq!(hosts[1]["covers"], json!(["questions", "waiting agents"]));
         assert_eq!(
             hosts[1]["unavailable"],

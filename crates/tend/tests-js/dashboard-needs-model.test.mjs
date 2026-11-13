@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ago, decidedCard, evidenceLine, hostSections, pendingCard, safeHref } from "../src/dashboard/web/needs-model.mjs";
+import { ago, decidedCard, draftKey, evidenceLine, hostSections, pendingCard, safeHref } from "../src/dashboard/web/needs-model.mjs";
 
 const now = Date.parse("2026-11-12T12:00:00Z");
 
@@ -113,4 +113,17 @@ test("the queue is per host, and only allowed actions are offered", () => {
   const old = hostSections({ covers: "this host", queue: { items: [review] } }, now);
   assert.equal(old.length, 1);
   assert.equal(old[0].cards[0].actionable, true);
+});
+
+test("the same request id on two hosts keeps two drafts", () => {
+  const ask = { kind: "human_request", request_id: "dispatch-1", body: "Merge?", from_session_id: "s", created_at: "2026-11-12T11:00:00Z" };
+  const [local, mini] = hostSections({
+    hosts: [
+      { alias: "june-mba", local: true, control: true, queue: { items: [ask] } },
+      { alias: "jiun-mini", local: false, control: true, queue: { items: [ask] } },
+    ],
+  }, now);
+  assert.equal(local.cards[0].id, mini.cards[0].id);
+  assert.notEqual(draftKey(local.cards[0]), draftKey(mini.cards[0]));
+  assert.notEqual(draftKey({ ...local.cards[0], kind: "review" }), draftKey(local.cards[0]));
 });

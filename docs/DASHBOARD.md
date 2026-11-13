@@ -365,15 +365,20 @@ them. They are GETs, so they need no CSRF proof.
 
 The queue is per host (`hosts[]`, each with `alias`, `covers`,
 `unavailable` and its `queue`). The host whose tendd serves the dashboard
-covers everything. Each Fleet host covers the questions addressed to its
-operator console (the operator-only mailbox read) and its agents waiting in
-their panes (from the Fleet snapshot); review items are not read over Fleet
-and the section says so, and a host that is not online is listed with its
-state. A question on a **control-mode** Fleet host can be answered from the
-page: tend reads the request back from that host and answers only if it is
+covers everything. A Fleet host whose tend answers the Fleet
+`decision_queue` read (`fleet_decision_queue_v1`) sends its whole queue,
+read there as its operator console: questions, waiting agents and review
+items. An older Fleet host covers the questions in its operator mailbox and
+its waiting agents (from the Fleet snapshot); that mailbox read carries only
+the newest messages, so when it is full the section says older questions
+may be missing. A host that is not online is listed with its state.
+
+A question on a **control-mode** Fleet host can be answered from the page:
+tend reads the request back from that host and answers only if it is
 addressed to the operator console (otherwise a Fleet reply would be sent as
-the agent in that pane). Observe-only hosts are shown but not answerable
-here. The **Decided** tab covers this host.
+the agent in that pane). Observe-only hosts' questions, and review items on
+other hosts, are shown but decided on their own host. The **Decided** tab
+covers this host.
 
 Each card can be decided from the page, through the same daemon paths as
 the Mac app:
