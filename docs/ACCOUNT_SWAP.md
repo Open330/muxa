@@ -555,10 +555,10 @@ hook's definition does (tend rewriting its hooks, for one).
 
 Before a Codex relaunch tend asks Codex's own app-server, under the new
 account's home (the profile's `CODEX_HOME`, or the one `aas export
-<account>` sets), which hooks wait on review (`hooks/list`). A hook the user
-already trusted under another home on this machine — same event, a
-`trusted_hash` equal to the hook's current hash — gets that entry under the
-new home's key (`config/value/write`, so Codex writes its own file, through
+<account>` sets), which hooks wait on review (`hooks/list`). A hook Codex
+reports trusted as the user's own under another account home on this
+machine (a `user` hook from that home's own `config.toml`, same event, same
+current hash) gets that trust under the new home's key (`config/value/write`, so Codex writes its own file, through
 the symlink). The report says how many were carried over and which were
 never trusted anywhere. tend never trusts a hook the user did not, and never
 answers the menu: when it shows anyway, the swap ends
@@ -567,6 +567,43 @@ answers the menu: when it shows anyway, the swap ends
 `tend doctor` checks every Codex home it knows (`~/.codex`, `$CODEX_HOME`,
 configured accounts, `asx/profiles/codex-*`) and warns about homes whose
 hooks would ask; `tend init` does the same after rewriting the Codex hooks.
+
+## Why a swap still restarts the agent
+
+A swap changes which account a running agent bills to. tend keeps each
+account in its own home (Claude's `CLAUDE_CONFIG_DIR` with its token,
+Codex's `CODEX_HOME`), and a running agent was started under one of them.
+Neither provider offers a way to move a running TUI to another account's
+home, so the visible TUI is stopped and started again under the other one,
+resuming the same conversation.
+
+Codex's app-server does speak a JSON-RPC API with `thread/resume`,
+`turn/start` and `account/*` methods (checked against
+`codex app-server generate-json-schema`, 0.167). It does not replace that
+restart:
+
+- the agents tend swaps are interactive TUIs. Run through aas on macOS they
+  are started `--no-daemon` whenever the daemon socket path is too long (it
+  is under `~/Library/Application Support`), so their app-server is
+  in-process, private to that TUI, and dies with it;
+- a shared app-server daemon runs with the home and environment it started
+  with. Its frontends all share that home, so it cannot move one of them to
+  another account's home;
+- `thread/resume` reattaches a client to a thread. The relaunched TUI already
+  does exactly that, by `codex resume <id>`, and tend binds the result from the
+  process's own open rollout (`conversation_verified`). A headless resume
+  through the API would run a second client that nobody is looking at;
+- `account/login/start` changes the authentication of a live server (for
+  every client attached to it, and, depending on the credential mode and
+  store, persistently). It does not move one frontend to another account's
+  home, and changing a server's login on the user's behalf is not tend's to
+  do.
+
+What tend took from the deterministic route instead: the binding comes from
+the provider's own record for the exact process (Claude `sessions/<pid>.json`,
+the Codex rollout fd); the relaunch can be a tend-owned respawn with its own
+launch id (`[swap] relaunch = "respawn"`); and the follow-up is registered
+like every guarded delivery, so its hook comes back as tend's receipt.
 
 ## Limits
 
