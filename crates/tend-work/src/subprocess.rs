@@ -7,9 +7,12 @@
 //! [`with_scope`] sets a thread-local [`Scope`] around it. The `git`, tmux and
 //! `prepare` commands below then go through [`output`] / [`status`], which
 //! apply that scope. Each command runs in its own process group, is killed
-//! with it at the deadline, and is refused outright once the deadline has
-//! passed. That last part keeps a timed-out `work up` from going on
-//! mutating anything after it has been reported as failed.
+//! with it at the deadline (including descendants that keep its output
+//! open), and is refused outright once the deadline has passed. The mux
+//! helpers that run their own processes in `tend` check
+//! [`ensure_time_left`] first. Together these keep a timed-out `work up` from
+//! touching tmux, git or `prepare` after it has been reported as failed.
+//! Daemon IPC calls are bounded by their own timeouts and are not refused.
 //!
 //! Without a scope (the CLI, the MCP server) both are plain
 //! `Command::output` / `Command::status`.
@@ -51,6 +54,27 @@ fn current() -> Option<Scope> {
     SCOPE.with(|slot| slot.borrow().clone())
 }
 
+/// `Err` once the thread's scope has run out of time. For mux operations
+/// that do not start a process of their own here (`tend::tmux` and rmux
+/// helpers, which carry their own per-call timeouts), checked before each
+/// one, so none of them starts after the deadline.
+pub fn ensure_time_left() -> io::Result<()> {
+    match current() {
+        Some(scope) => {
+            if scope
+                .deadline
+                .checked_duration_since(Instant::now())
+                .is_some_and(|left| !left.is_zero())
+            {
+                Ok(())
+            } else {
+                Err(timed_out())
+            }
+        }
+        None => Ok(()),
+    }
+}
+
 fn prepare(command: &mut Command, scope: &Scope) -> io::Result<Duration> {
     let remaining = scope
         .deadline
@@ -78,15 +102,23 @@ fn timed_out() -> io::Error {
     )
 }
 
-/// Kill the command and everything it started.
-fn kill(child: &mut std::process::Child) {
+/// Kill the process group the command led (its own id, from
+/// `process_group(0)`), which takes everything it started.
+fn kill_group(leader: u32) {
     #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
+    if let Ok(pid) = i32::try_from(leader) {
         let _ = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGKILL,
         );
     }
+    #[cfg(not(unix))]
+    let _ = leader;
+}
+
+/// Kill the command and everything it started.
+fn kill(child: &mut std::process::Child) {
+    kill_group(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -124,7 +156,18 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let started = Instant::now();
     let status = wait(&mut child, remaining)?;
+    // A descendant can keep the pipes open after the command itself exits.
+    // The deadline covers reading them to the end too; past it the group is
+    // killed, which closes them.
+    while !(stdout.is_finished() && stderr.is_finished()) {
+        if started.elapsed() >= remaining {
+            kill_group(child.id());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     Ok(Output {
         status,
         stdout: stdout.join().unwrap_or_default(),
@@ -197,6 +240,21 @@ mod tests {
     }
 
     #[test]
+    fn a_descendant_holding_the_pipes_does_not_outlast_the_deadline() {
+        let started = Instant::now();
+        let out = with_scope(scope("/s", Duration::from_millis(300)), || {
+            // The command exits at once; its background child keeps stdout.
+            output(&mut sh("sleep 30 & exit 0")).unwrap()
+        });
+        assert!(out.status.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn nothing_starts_once_the_deadline_has_passed() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
@@ -205,5 +263,7 @@ mod tests {
         });
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(!marker.exists());
+        assert!(with_scope(scope("/s", Duration::ZERO), ensure_time_left).is_err());
+        assert!(ensure_time_left().is_ok(), "no scope, no deadline");
     }
 }

@@ -1717,6 +1717,7 @@ pub fn state_label(state: AgentState) -> &'static str {
 }
 
 fn send_prompt(pane: &str, text: &str) -> Result<()> {
+    crate::subprocess::ensure_time_left()?;
     let sent = if let Some(rmux) = crate::mux_control::ambient_rmux() {
         tend::PaneBackend::send_prompt_text_on(&rmux, None, pane, text)
     } else {

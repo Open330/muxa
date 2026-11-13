@@ -98,6 +98,7 @@ pub fn command(endpoint: &BackendEndpoint) -> Result<Command, String> {
 }
 
 pub fn capture(endpoint: &BackendEndpoint, args: &[&str]) -> Result<String, String> {
+    crate::subprocess::ensure_time_left().map_err(|error| error.to_string())?;
     match endpoint.host {
         HostKind::Tmux => match tmux_socket_path(endpoint) {
             Some(path) => tend::tmux::capture_control_at(path, args),
@@ -218,6 +219,7 @@ impl Control {
     }
 
     pub fn output(&self, args: &[&str]) -> anyhow::Result<String> {
+        crate::subprocess::ensure_time_left()?;
         match self {
             Self::Endpoint(endpoint) => capture(endpoint, args).map_err(anyhow::Error::msg),
             Self::Ambient => {
