@@ -121,15 +121,16 @@ pub fn vouched_by(hooks: &[Hook], home: &Path) -> Vec<Trusted> {
 pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, Vec<Hook>) {
     let mut copies = Vec::new();
     let mut left = Vec::new();
-    for hook in hooks.iter().filter(|hook| hook.needs_review()) {
-        let own =
-            hook.source == "user" && own_key_event(&hook.key, home) == Some(hook.event.as_str());
-        let vouched = own
-            && trusted.iter().any(|entry| {
-                entry.key != hook.key
-                    && entry.hash == hook.current_hash
-                    && entry.event == hook.event
-            });
+    // Only the home's own user hooks: a project's hooks belong to that
+    // repository, not to the account, and are never tend's to trust.
+    for hook in hooks.iter().filter(|hook| {
+        hook.needs_review()
+            && hook.source == "user"
+            && own_key_event(&hook.key, home) == Some(hook.event.as_str())
+    }) {
+        let vouched = trusted.iter().any(|entry| {
+            entry.key != hook.key && entry.hash == hook.current_hash && entry.event == hook.event
+        });
         if vouched {
             copies.push(Trusted {
                 key: hook.key.clone(),
@@ -474,6 +475,8 @@ fn snake(name: &str) -> String {
 /// What [`prepare`] did for one relaunch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Prepared {
+    /// The home as Codex resolves it (its trust keys use this path).
+    pub home: PathBuf,
     /// Trust entries copied to the target's keys.
     pub copied: usize,
     /// Hooks that will still ask for review: no trusted twin anywhere.
@@ -487,15 +490,18 @@ impl Prepared {
         let mut parts = Vec::new();
         if self.copied > 0 {
             parts.push(format!(
-                "carried over the trust of {} Codex hook(s) already trusted under another account",
-                self.copied
+                "carried over the trust of {} Codex hook(s) already trusted under another \
+                 account to {}",
+                self.copied,
+                self.home.display()
             ));
         }
         if !self.left.is_empty() {
             parts.push(format!(
-                "{} Codex hook(s) are not trusted under any other account here and will ask \
-                 for review: {}",
+                "{} Codex hook(s) in {} are not trusted under any other account here and will \
+                 ask for review: {}",
                 self.left.len(),
+                self.home.display(),
                 self.left.join(", ")
             ));
         }
@@ -509,17 +515,18 @@ impl Prepared {
 /// are asked one at a time, only while something still waits, within
 /// [`BUDGET`]. Errors leave the file as it was (the relaunch then shows the
 /// menu, and says so).
-pub fn prepare(
-    codex: &Path,
-    home: &Path,
-    cwd: &str,
-    homes: &[PathBuf],
-) -> Result<Prepared, String> {
+pub fn prepare(codex: &Path, home: &Path, homes: &[PathBuf]) -> Result<Prepared, String> {
+    let neutral = Neutral::new()?;
+    let cwd = neutral.path();
     let started = Instant::now();
     let mut target = AppServer::open(codex, home)?;
     let hooks = target.hooks(cwd)?;
+    let resolved = resolved_home(home);
     if !hooks.iter().any(Hook::needs_review) {
-        return Ok(Prepared::default());
+        return Ok(Prepared {
+            home: resolved,
+            ..Prepared::default()
+        });
     }
     let mut trusted = Vec::new();
     let (mut copies, mut left) = plan(&hooks, home, &trusted);
@@ -552,6 +559,7 @@ pub fn prepare(
         )?;
     }
     Ok(Prepared {
+        home: resolved,
         copied: copies.len(),
         left: left
             .iter()
@@ -564,6 +572,8 @@ pub fn prepare(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audit {
     pub home: PathBuf,
+    /// The home as Codex resolves it, the path its trust keys use.
+    pub resolved: PathBuf,
     /// `(fixable, unvouched)`: hooks a swap would carry trust to, and ones
     /// it could not. `Err`: the home could not be checked, and why.
     pub result: Result<(usize, usize), String>,
@@ -573,7 +583,21 @@ pub struct Audit {
 /// cannot be checked, within [`BUDGET`] (homes past it are reported as not
 /// checked). Read-only: nothing is written.
 #[must_use]
-pub fn audit(codex: &Path, homes: &[PathBuf], cwd: &str) -> Vec<Audit> {
+pub fn audit(codex: &Path, homes: &[PathBuf]) -> Vec<Audit> {
+    let neutral = match Neutral::new() {
+        Ok(neutral) => neutral,
+        Err(error) => {
+            return homes
+                .iter()
+                .map(|home| Audit {
+                    home: home.clone(),
+                    resolved: resolved_home(home),
+                    result: Err(error.clone()),
+                })
+                .collect()
+        }
+    };
+    let cwd = neutral.path();
     let started = Instant::now();
     let mut listed: Vec<(PathBuf, Result<Vec<Hook>, String>)> = Vec::new();
     for home in homes
@@ -605,15 +629,88 @@ pub fn audit(codex: &Path, homes: &[PathBuf], cwd: &str) -> Vec<Audit> {
                     Ok((copies.len(), left.len()))
                 }
             };
-            Some(Audit { home, result })
+            Some(Audit {
+                resolved: resolved_home(&home),
+                home,
+                result,
+            })
         })
         .collect()
 }
 
-/// The `codex` program to ask: on `PATH` or in the usual install places.
+/// The `codex` an aas launch runs: aas's own shim, when there is one, else
+/// the one on `PATH` or in the usual install places. Older releases hash
+/// hooks differently, so the release asked matters.
 #[must_use]
 pub fn find_codex() -> Option<PathBuf> {
-    crate::account_swap::find_aas("codex").map(PathBuf::from)
+    let mut shims = Vec::new();
+    shims.extend(dirs::data_dir().map(|data| data.join("aas/shims/codex")));
+    shims.extend(dirs::home_dir().map(|home| home.join(".config/aas/shims/codex")));
+    shims
+        .into_iter()
+        .find(|path| path.is_file())
+        .or_else(|| crate::account_swap::find_aas("codex").map(PathBuf::from))
+}
+
+/// The `codex` a running agent `pid` is: its own executable path when its
+/// arguments name one, else [`find_codex`].
+#[must_use]
+pub fn codex_of(pid: u32) -> Option<PathBuf> {
+    tend::process_snapshot::process_argv(pid)
+        .and_then(|argv| argv.into_iter().next())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(find_codex)
+}
+
+/// `home` as Codex resolves it: the directory with its symlinks followed
+/// (`…/asx/profiles/x` is `…/aas/profiles/x` once `asx` links to `aas`).
+#[must_use]
+pub fn resolved_home(home: &Path) -> PathBuf {
+    std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())
+}
+
+/// An empty directory to ask Codex from, so no repository's project hooks
+/// are loaded with the home's own; removed on drop.
+struct Neutral(PathBuf);
+
+impl Neutral {
+    fn new() -> Result<Self, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "tend-hook-trust-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &str {
+        self.0.to_str().unwrap_or(".")
+    }
+}
+
+impl Drop for Neutral {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// Before Codex starts on `account` (a launch, not a swap): carry trust to
+/// its home the way a swap does. `None` when there was nothing to say.
+#[must_use]
+pub fn prepare_launch(
+    profiles: &[tend::accounts::AccountProfile],
+    account: &str,
+    aas: &str,
+) -> Option<String> {
+    let home = account_home(profiles, account, aas)?;
+    let codex = find_codex()?;
+    let homes = known_homes(profiles);
+    match prepare(&codex, &home, &homes) {
+        Ok(prepared) => prepared.note(),
+        Err(error) => Some(format!("Codex hook trust was not checked ({error})")),
+    }
 }
 
 #[cfg(test)]
@@ -662,7 +759,8 @@ mod tests {
             plan(&[hook(TARGET, "stop", "trusted")], target, &[]),
             (vec![], vec![])
         );
-        // A project hook, or one from another file, is never vouched for.
+        // A project hook, or one from another file, is never vouched for,
+        // nor counted as the home's: it belongs to its repository.
         let mut project = hook(TARGET, "stop", "untrusted");
         project.source = "project".into();
         let mut elsewhere = hook(TARGET, "stop", "untrusted");
@@ -670,7 +768,7 @@ mod tests {
         for other in [project, elsewhere] {
             let (copies, left) = plan(&[other], target, &[vouch("/h/.codex", "stop", H)]);
             assert!(copies.is_empty());
-            assert_eq!(left.len(), 1);
+            assert!(left.is_empty());
         }
     }
 
@@ -831,12 +929,14 @@ mod tests {
     fn the_report_says_what_was_carried_and_what_was_left() {
         assert_eq!(Prepared::default().note(), None);
         let note = Prepared {
+            home: PathBuf::from("/p/aas/profiles/codex-b_codex"),
             copied: 6,
             left: vec!["my-hook".into()],
         }
         .note()
         .unwrap();
         assert!(note.contains("carried over the trust of 6"), "{note}");
+        assert!(note.contains("to /p/aas/profiles/codex-b_codex"), "{note}");
         assert!(note.contains("will ask for review: my-hook"), "{note}");
     }
 
@@ -879,11 +979,11 @@ mod tests {
         drop(server);
         let homes = [a.clone(), b.clone()];
         // `b` is fixable only because `a`'s own hook is trusted.
-        let audits = audit(&codex, &homes, cwd);
+        let audits = audit(&codex, &homes);
         assert_eq!(audits.len(), 1, "{audits:?}");
         assert_eq!(audits[0].result, Ok((1, 0)));
         // `b` shares the file but not the key: carried over once, then trusted.
-        let prepared = prepare(&codex, &b, cwd, &homes).unwrap();
+        let prepared = prepare(&codex, &b, &homes).unwrap();
         assert_eq!(prepared.copied, 1, "{prepared:?}");
         assert!(list_hooks(&codex, &b, cwd)
             .unwrap()
@@ -894,9 +994,13 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(
-            prepare(&codex, &b, cwd, &homes).unwrap(),
-            Prepared::default()
+            prepare(&codex, &b, &homes).unwrap(),
+            Prepared {
+                home: resolved_home(&b),
+                ..Prepared::default()
+            }
         );
-        assert!(audit(&codex, &homes, cwd).is_empty());
+        assert!(audit(&codex, &homes).is_empty());
+        assert_eq!(audits[0].resolved, resolved_home(&b));
     }
 }

@@ -547,10 +547,25 @@ async fn check_codex_hook_trust(config: Option<&Path>) -> Option<CheckResult> {
     let lines = tokio::task::spawn_blocking(move || codex_hook_trust_lines(config.as_deref()))
         .await
         .ok()??;
+    // Which Codex answered: an older release hashes hooks differently.
+    let asked = {
+        #[cfg(feature = "aas")]
+        {
+            tend_aas::codex_hook_trust::find_codex()
+                .map(|codex| format!(" (asked {})", tilde(&codex.display().to_string())))
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "aas"))]
+        {
+            String::new()
+        }
+    };
     Some(if lines.is_empty() {
-        CheckResult::Ok("Codex hook trust: every account home trusts the current hooks".into())
+        CheckResult::Ok(format!(
+            "Codex hook trust: every account home trusts the current hooks{asked}"
+        ))
     } else {
-        CheckResult::Warn(lines.join("; "))
+        CheckResult::Warn(format!("{}{asked}", lines.join("; ")))
     })
 }
 
@@ -563,13 +578,22 @@ pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String
         let accounts = tend::Config::load_or_default(config).ok()?.accounts;
         let codex = trust::find_codex()?;
         let homes = trust::known_homes(accounts.for_provider("codex"));
-        let cwd = dirs::home_dir()?.display().to_string();
-        let audits = trust::audit(&codex, &homes, &cwd);
+        let audits = trust::audit(&codex, &homes);
         Some(
             audits
                 .iter()
                 .map(|audit| {
-                    let home = tilde(&audit.home.display().to_string());
+                    // The path Codex resolves is the one its trust keys use;
+                    // say where it was found when that differs.
+                    let home = if audit.resolved == audit.home {
+                        tilde(&audit.resolved.display().to_string())
+                    } else {
+                        tilde(&format!(
+                            "{} (found as {})",
+                            audit.resolved.display(),
+                            audit.home.display()
+                        ))
+                    };
                     let (fixable, unvouched) = match &audit.result {
                         Ok(counts) => *counts,
                         Err(error) => {
