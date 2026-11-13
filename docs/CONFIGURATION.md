@@ -402,7 +402,7 @@ plain "runs only on macOS".
 
 A **provider** is an `[ask.providers.<id>]` table you compose. The id is
 yours to pick (a TOML bare key: letters, digits, `-`, `_`), and `engine`
-says which of the six drives it. Several providers may share one engine —
+says which of the five drives it. Several providers may share one engine —
 a work and a personal OpenAI account, two Anthropic keys, a second `claude`
 binary — and each keeps its own conversation, so switching between them
 resumes rather than restarts. `[ask] agent` and `tend ask --agent` name a
@@ -453,7 +453,7 @@ tend ask provider remove anthropic-work               # a built-in id only loses
 ```
 
 `add` refuses an id that already exists, an id that is not a TOML bare key,
-an engine that is not one of the six, and a built-in id asked to run
+an engine that is not one of the five, and a built-in id asked to run
 someone else's engine. The engine is fixed once added — `set` changes the
 title, model, key variable, and binary, and to change the engine you remove
 the provider and add it again, because a live conversation cannot resume a

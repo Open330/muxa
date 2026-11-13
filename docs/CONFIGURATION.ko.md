@@ -277,7 +277,7 @@ host가 함께 쓸 수 있고, 실행할 수 없는 host에서 턴을 보내면 
 실행됩니다"라는 명확한 오류로 실패합니다.
 
 **provider**는 직접 구성하는 `[ask.providers.<id>]` 테이블입니다. id는 원하는
-대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 여섯 중 무엇으로
+대로 정하고(TOML bare key: 영숫자, `-`, `_`), `engine`이 다섯 중 무엇으로
 구동할지 정합니다. 여러 provider가 같은 engine을 공유할 수 있어 업무용과 개인용
 OpenAI 계정, Anthropic 키 두 개, 두 번째 `claude` 바이너리를 나란히 둘 수
 있습니다. 각각 자기 대화를 따로 유지하므로 provider를 바꿔도 새로 시작하지 않고
@@ -324,7 +324,7 @@ tend ask provider set anthropic --clear-model         # 생략한 플래그의 �
 tend ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
 ```
 
-`add`는 이미 있는 id, TOML bare key가 아닌 id, 여섯 중에 없는 engine, 그리고 다른
+`add`는 이미 있는 id, TOML bare key가 아닌 id, 다섯 중에 없는 engine, 그리고 다른
 engine을 쓰려는 내장 id를 거부합니다. engine은 추가 시점에 고정됩니다. `set`은
 title·model·키 변수·바이너리를 바꾸고, engine을 바꾸려면 provider를 제거한 뒤 다시
 추가해야 합니다. 진행 중인 대화가 `claude` 세션 id를 `codex`에서 resume할 수는

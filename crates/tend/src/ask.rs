@@ -723,25 +723,28 @@ impl AskStore {
             .ok_or_else(|| AskError::NoConfigPath(id.clone()))?;
         let _guard = self.write_lock.lock().await;
         let selected = self.agent.read().await.clone();
-        // A retired table may still be what `[ask] agent` names in the file
-        // even though the daemon started on the default; repoint that too.
-        let fallback = if retired {
-            Some(selected.clone())
-        } else if selected == id {
-            let mut remaining = self.providers.read().await.clone();
-            remaining.remove(&id);
-            Some(provider_instances(&remaining).first().map_or_else(
+        let mut remaining = self.providers.read().await.clone();
+        remaining.remove(&id);
+        let usable = provider_instances(&remaining);
+        // The selection survives only if it still names a usable instance.
+        // Otherwise (it named the removed table, or a retired id resumed from
+        // history) it falls back to the first usable provider. A retired
+        // table may also be what `[ask] agent` names in the file even though
+        // the daemon started on the default, so that is repointed too.
+        let next = if selected != id && find_instance(&usable, &selected).is_some() {
+            selected.clone()
+        } else {
+            usable.first().map_or_else(
                 || AskEngine::Claude.id().to_string(),
                 |first| first.id.clone(),
-            ))
-        } else {
-            None
+            )
         };
+        let fallback = (retired || selected == id || next != selected).then(|| next.clone());
         let config =
             remove_provider_config(&path, &id, fallback.as_deref()).map_err(AskError::Io)?;
         *self.providers.write().await = config.ask.providers;
-        if let Some(fallback) = fallback.filter(|_| !retired) {
-            self.agent.write().await.clone_from(&fallback);
+        if next != selected {
+            self.agent.write().await.clone_from(&next);
         }
         self.publish_change();
         Ok(self.providers().await)
@@ -5032,6 +5035,37 @@ mod tests {
             store.remove_provider("gemini").await.unwrap_err(),
             AskError::RetiredProvider(_)
         ));
+    }
+
+    /// Selecting an old Gemini conversation points the live selection at the
+    /// retired id; removing the table must leave both it and `[ask] agent`
+    /// on a provider that can answer.
+    #[tokio::test]
+    async fn removing_a_retired_table_after_resuming_its_history_repoints_the_selection() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ask]\nenabled = true\nagent = \"gemini\"\n\n\
+             [ask.providers.gemini]\nmodel = \"gemini-2.5-pro\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            agent: startup_agent(&config.ask.agent, &config.ask.providers),
+            providers: config.ask.providers.clone(),
+            config_path: Some(path.clone()),
+            ..AskOptions::default()
+        });
+        // What `select_conversation` does for an old Gemini thread.
+        *store.agent.write().await = "gemini".into();
+        store.remove_provider("gemini").await.unwrap();
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(config.ask.retired_entries().is_empty(), "{config:?}");
+        let instances = store.instances().await;
+        assert!(find_instance(&instances, &config.ask.agent).is_some());
+        assert!(find_instance(&instances, &store.agent().await).is_some());
     }
 
     #[allow(clippy::too_many_lines)] // one add/refuse/remove lifecycle, in order
