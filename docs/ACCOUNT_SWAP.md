@@ -568,6 +568,38 @@ answers the menu: when it shows anyway, the swap ends
 configured accounts, `asx/profiles/codex-*`) and warns about homes whose
 hooks would ask; `tend init` does the same after rewriting the Codex hooks.
 
+## Why a swap still restarts the agent
+
+A swap changes which account a running agent bills to. Both providers bind
+the account to the process: Claude reads its token at start
+(`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`), Codex reads `auth.json`
+from its `CODEX_HOME`. So the visible TUI is stopped and started again on
+the other account, resuming the same conversation.
+
+Codex's app-server does speak a JSON-RPC API with `thread/resume`,
+`turn/start` and `account/*` methods (checked against
+`codex app-server generate-json-schema`, 0.167). It does not replace that
+restart:
+
+- the agents tend swaps are interactive TUIs. Run through aas on macOS they
+  are started `--no-daemon` whenever the daemon socket path is too long (it
+  is under `~/Library/Application Support`), so their app-server is
+  in-process, private to that TUI, and dies with it;
+- a shared app-server daemon belongs to one `CODEX_HOME`. Its frontends all
+  share its account, so it cannot move one agent to another account;
+- `thread/resume` reattaches a client to a thread. The relaunched TUI already
+  does exactly that, by `codex resume <id>`, and tend binds the result from the
+  process's own open rollout (`conversation_verified`). A headless resume
+  through the API would run a second client that nobody is looking at;
+- `account/login/start` changes the credentials of a live server. That would
+  rewrite the user's login, which is not tend's to do.
+
+What tend took from the deterministic route instead: the binding comes from
+the provider's own record for the exact process (Claude `sessions/<pid>.json`,
+the Codex rollout fd); the relaunch can be a tend-owned respawn with its own
+launch id (`[swap] relaunch = "respawn"`); and the follow-up is registered
+like every guarded delivery, so its hook comes back as tend's receipt.
+
 ## Limits
 
 - A pane started *with* the agent (`new-window 'aas e …'`, `exec claude …`)
