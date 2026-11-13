@@ -552,7 +552,7 @@ async fn check_codex_hook_trust(config: Option<&Path>) -> Option<CheckResult> {
         #[cfg(feature = "aas")]
         {
             tend_aas::codex_hook_trust::find_codex()
-                .map(|codex| format!(" (asked {})", tilde(&codex.display().to_string())))
+                .map(|codex| format!(" (asked {})", tilde(&codex.display())))
                 .unwrap_or_default()
         }
         #[cfg(not(feature = "aas"))]
@@ -592,9 +592,15 @@ pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String
         let audits = trust::audit(
             |home| {
                 if aas_profiles.iter().any(|base| home.starts_with(base)) {
-                    Some(codex.clone())
-                } else {
-                    trust::path_codex()
+                    return Some(codex.clone());
+                }
+                // A configured account: the codex on its own launch PATH.
+                match accounts.for_provider("codex").iter().find(|profile| {
+                    trust::account_home(&[(*profile).clone()], &profile.name, "").as_deref()
+                        == Some(home)
+                }) {
+                    Some(profile) => trust::profile_codex(profile, "codex"),
+                    None => trust::path_codex(),
                 }
             },
             &homes,

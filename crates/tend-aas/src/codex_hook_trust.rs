@@ -38,6 +38,41 @@ const EXPORT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The whole of one swap's or one audit's trust work.
 pub const BUDGET: Duration = Duration::from_secs(60);
 
+/// How to run the Codex that is asked: a program, and for a Codex run by an
+/// interpreter (`node …/codex.js`), the script it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Codex {
+    pub program: PathBuf,
+    pub args: Vec<PathBuf>,
+}
+
+impl Codex {
+    /// A Codex program run as itself.
+    #[must_use]
+    pub fn program(program: PathBuf) -> Self {
+        Self {
+            program,
+            args: Vec::new(),
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        command
+    }
+
+    /// The command line, for a report.
+    #[must_use]
+    pub fn display(&self) -> String {
+        std::iter::once(&self.program)
+            .chain(&self.args)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// One hook as `hooks/list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hook {
@@ -150,42 +185,67 @@ pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, 
     (copies, left)
 }
 
-/// The `CODEX_HOME` a profile launches with, read without running
-/// anything: its explicit `env` wins (the launch line sets it after the
-/// file is sourced); otherwise [`assigned_home`] of its `env_file`.
+/// The `CODEX_HOME` a profile launches with (see [`profile_var`]), when it
+/// is an absolute path.
 fn profile_home(profile: &tend::accounts::AccountProfile) -> Option<PathBuf> {
-    if let Some(value) = profile.env.get("CODEX_HOME") {
-        let path = expand_home(value);
-        return path.is_absolute().then_some(path);
+    let value = profile_var(profile, "CODEX_HOME").ok()??;
+    let path = expand_home(&value);
+    path.is_absolute().then_some(path)
+}
+
+/// What `name` is when a profile launches, read without running anything:
+/// its explicit `env` wins (the launch line sets it after the file is
+/// sourced); otherwise the last plain assignment in its `env_file`.
+/// `Ok(None)`: the launch leaves it as the launching process has it.
+/// `Err`: the file is more than plain literal assignments, so it cannot be
+/// told without running it.
+fn profile_var(profile: &tend::accounts::AccountProfile, name: &str) -> Result<Option<String>, ()> {
+    if let Some(value) = profile.env.get(name) {
+        return Ok(Some(value.clone()));
     }
-    let file = expand_home(profile.env_file.as_deref()?);
-    assigned_home(&std::fs::read_to_string(file).ok()?).map(PathBuf::from)
+    let Some(file) = profile.env_file.as_deref() else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(expand_home(file)).map_err(|_| ())?;
+    assigned(&text, name)
 }
 
 /// The `CODEX_HOME` an env file sets, when the whole file is nothing but
 /// blank lines, comments and plain `[export ]NAME=value` assignments, and
 /// that value is a literal absolute path. Anything else (control flow, a
 /// command, a computed or `~` value) is not guessed at: `None`.
+#[cfg(test)]
 fn assigned_home(text: &str) -> Option<String> {
+    assigned(text, "CODEX_HOME")
+        .ok()?
+        .filter(|value| value.starts_with('/'))
+}
+
+/// The last value an env file assigns to `name`, when the whole file is
+/// nothing but blank lines, comments and plain `[export ]NAME=value`
+/// assignments with literal values. `Err`: anything else (control flow, a
+/// command, a computed or `~` value). `Ok(None)`: plain, but `name` is not
+/// assigned.
+fn assigned(text: &str, name: &str) -> Result<Option<String>, ()> {
     let mut found = None;
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let line = line.strip_prefix("export ").map_or(line, str::trim_start);
-        let (name, value) = line.split_once('=')?;
-        let plain_name = !name.is_empty()
-            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-            && !name.starts_with(|c: char| c.is_ascii_digit());
-        let value = literal(value)?;
+        let (key, value) = line.split_once('=').ok_or(())?;
+        let plain_name = !key.is_empty()
+            && key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            && !key.starts_with(|c: char| c.is_ascii_digit());
+        let value = literal(value).ok_or(())?;
         if !plain_name {
-            return None;
+            return Err(());
         }
-        if name == "CODEX_HOME" {
+        if key == name {
             found = Some(value);
         }
     }
-    found.filter(|value| value.starts_with('/'))
+    Ok(found.filter(|value| !value.is_empty()))
 }
 
 /// A shell word that means exactly its text: single-quoted, double-quoted
@@ -259,6 +319,16 @@ pub fn account_home(
     account: &str,
     aas: &str,
 ) -> Option<PathBuf> {
+    account_home_within(profiles, account, aas, EXPORT_TIMEOUT)
+}
+
+/// [`account_home`], with `aas export` given at most `timeout`.
+fn account_home_within(
+    profiles: &[tend::accounts::AccountProfile],
+    account: &str,
+    aas: &str,
+    timeout: Duration,
+) -> Option<PathBuf> {
     if !profiles.is_empty() {
         return tend::accounts::find_profile(profiles, "codex", account).and_then(profile_home);
     }
@@ -268,10 +338,7 @@ pub fn account_home(
     } else {
         format!("{account}@codex")
     };
-    let output = run_bounded(
-        Command::new(program).args(["export", &name]),
-        EXPORT_TIMEOUT,
-    )?;
+    let output = run_bounded(Command::new(program).args(["export", &name]), timeout)?;
     export_home(&output)
 }
 
@@ -334,8 +401,9 @@ struct AppServer {
 }
 
 impl AppServer {
-    fn open(codex: &Path, home: &Path, cwd: &Path, deadline: Instant) -> Result<Self, String> {
-        let mut child = Command::new(codex)
+    fn open(codex: &Codex, home: &Path, cwd: &Path, deadline: Instant) -> Result<Self, String> {
+        let mut child = codex
+            .command()
             .arg("app-server")
             .env("CODEX_HOME", home)
             .current_dir(cwd)
@@ -440,7 +508,7 @@ impl Drop for AppServer {
 
 /// The hooks `codex` loads under `home` for a session in `cwd`.
 fn list_hooks(
-    codex: &Path,
+    codex: &Codex,
     home: &Path,
     cwd: &Path,
     deadline: Instant,
@@ -534,7 +602,7 @@ impl Prepared {
 /// [`BUDGET`]. Errors leave the file as it was (the relaunch then shows the
 /// menu, and says so).
 pub fn prepare(
-    codex: &Path,
+    codex: &Codex,
     home: &Path,
     homes: &[PathBuf],
     budget: Duration,
@@ -606,7 +674,7 @@ pub struct Audit {
 /// cannot be checked, within [`BUDGET`] (homes past it are reported as not
 /// checked). Read-only: nothing is written.
 #[must_use]
-pub fn audit(codex_for: impl Fn(&Path) -> Option<PathBuf>, homes: &[PathBuf]) -> Vec<Audit> {
+pub fn audit(codex_for: impl Fn(&Path) -> Option<Codex>, homes: &[PathBuf]) -> Vec<Audit> {
     let neutral = match Neutral::new() {
         Ok(neutral) => neutral,
         Err(error) => {
@@ -667,39 +735,61 @@ pub fn audit(codex_for: impl Fn(&Path) -> Option<PathBuf>, homes: &[PathBuf]) ->
 /// the one on `PATH` or in the usual install places. Older releases hash
 /// hooks differently, so the release asked matters.
 #[must_use]
-pub fn find_codex() -> Option<PathBuf> {
+pub fn find_codex() -> Option<Codex> {
     let mut shims = Vec::new();
     shims.extend(dirs::data_dir().map(|data| data.join("aas/shims/codex")));
     shims.extend(dirs::home_dir().map(|home| home.join(".config/aas/shims/codex")));
     shims
         .into_iter()
         .find(|path| path.is_file())
+        .map(Codex::program)
         .or_else(path_codex)
 }
 
 /// `codex` as a plain launch line's shell finds it: `PATH`, then the usual
 /// install places. Not aas's shim.
 #[must_use]
-pub fn path_codex() -> Option<PathBuf> {
-    crate::account_swap::find_aas("codex").map(PathBuf::from)
+pub fn path_codex() -> Option<Codex> {
+    crate::account_swap::find_aas("codex")
+        .map(PathBuf::from)
+        .map(Codex::program)
 }
 
-/// The `codex` program a running agent `pid` runs, if that can be told:
-/// its own executable when that is Codex, or the Codex script an
-/// interpreter (`node …/bin/codex`) runs. The process must be the one that
-/// started at `start`, read before and after. `None` otherwise: no other
-/// release is substituted.
+/// The `codex` a configured profile's launch runs: `program` itself when
+/// absolute, else found on the `PATH` that launch has (the profile's own,
+/// when it sets one). `None` when that `PATH` cannot be told without
+/// running the profile's env file.
 #[must_use]
-pub fn codex_of(pid: u32, start: Option<&str>) -> Option<PathBuf> {
-    let same = || {
-        start.is_none_or(|start| {
-            tend::agent_conversation::process_start(pid).as_deref() == Some(start)
-        })
-    };
+pub fn profile_codex(profile: &tend::accounts::AccountProfile, program: &str) -> Option<Codex> {
+    let program = Path::new(program);
+    if program.is_absolute() {
+        return program
+            .is_file()
+            .then(|| Codex::program(program.to_path_buf()));
+    }
+    match profile_var(profile, "PATH").ok()? {
+        None => path_codex(),
+        Some(path) => std::env::split_paths(&path)
+            .map(|dir| expand_home(&dir.display().to_string()).join(program))
+            .find(|candidate| candidate.is_file())
+            .map(Codex::program),
+    }
+}
+
+/// The `codex` a running agent `pid` runs, if that can be told: its own
+/// executable when that is Codex, or its interpreter with the Codex script
+/// it runs as the interpreter's first argument (`node /…/codex.js`). The
+/// process must be the one that started at `start`, read before and after.
+/// `None` otherwise (no start to check, a reused pid, anything else): no
+/// other release is substituted.
+#[must_use]
+pub fn codex_of(pid: u32, start: Option<&str>) -> Option<Codex> {
+    let start = start?;
+    let same = || tend::agent_conversation::process_start(pid).as_deref() == Some(start);
     if !same() {
         return None;
     }
-    let is_codex = |path: &Path| {
+    let named_codex = |path: &Path| {
         path.is_absolute()
             && path.is_file()
             && path
@@ -707,14 +797,20 @@ pub fn codex_of(pid: u32, start: Option<&str>) -> Option<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name == "codex" || name == "codex.js")
     };
-    let found = executable_of(pid).filter(|exe| is_codex(exe)).or_else(|| {
-        // An interpreter: the Codex script is one of its arguments.
-        tend::process_snapshot::process_argv(pid)?
-            .into_iter()
-            .skip(1)
+    let exe = executable_of(pid)?;
+    let found = if named_codex(&exe) {
+        Some(Codex::program(exe))
+    } else {
+        // An interpreter: its first argument is the script it runs.
+        let script = tend::process_snapshot::process_argv(pid)?
+            .get(1)
             .map(PathBuf::from)
-            .find(|path| is_codex(path))
-    });
+            .filter(|path| named_codex(path))?;
+        Some(Codex {
+            program: exe,
+            args: vec![script],
+        })
+    };
     found.filter(|_| same())
 }
 
@@ -776,8 +872,8 @@ pub const LAUNCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// Before Codex starts on `routed` (a launch, not a swap): carry trust to
 /// its home the way a swap does, asking the `codex` that launch will run:
-/// aas's for an aas launch, the launch line's own program (an absolute
-/// path, or found on `PATH`) for a configured profile. Bounded by
+/// aas's for an aas launch, the launch line's own program on the profile's
+/// `PATH` for a configured profile. All of it, `aas export` included, within
 /// [`LAUNCH_BUDGET`]. `None` when there was nothing to say.
 #[must_use]
 pub fn prepare_launch(
@@ -785,17 +881,23 @@ pub fn prepare_launch(
     routed: &tend::swap_api::RoutedLaunch,
     aas: &str,
 ) -> Option<String> {
-    let home = account_home(profiles, &routed.account, aas)?;
+    let deadline = Instant::now() + LAUNCH_BUDGET;
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let home = account_home_within(profiles, &routed.account, aas, left())?;
     let codex = if profiles.is_empty() {
         find_codex()
     } else {
-        match routed.launcher.last().map(PathBuf::from) {
-            Some(program) if program.is_absolute() => Some(program),
-            _ => path_codex(),
-        }
-    }?;
+        let profile = tend::accounts::find_profile(profiles, "codex", &routed.account)?;
+        profile_codex(profile, routed.launcher.last()?)
+    };
+    let Some(codex) = codex else {
+        return Some(format!(
+            "could not tell which codex the launch runs, so hook trust in {} was not checked",
+            resolved_home(&home).display()
+        ));
+    };
     let homes = known_homes(profiles);
-    match prepare(&codex, &home, &homes, LAUNCH_BUDGET) {
+    match prepare(&codex, &home, &homes, left()) {
         Ok(prepared) => prepared.note(),
         Err(error) => Some(format!("Codex hook trust was not checked ({error})")),
     }
@@ -995,8 +1097,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let mut server =
-            AppServer::open(&fake, dir.path(), dir.path(), Instant::now() + BUDGET).unwrap();
+        let mut server = AppServer::open(
+            &Codex::program(fake.clone()),
+            dir.path(),
+            dir.path(),
+            Instant::now() + BUDGET,
+        )
+        .unwrap();
         let started = Instant::now();
         let big = "x".repeat(1024 * 1024);
         assert!(server
@@ -1005,38 +1112,79 @@ mod tests {
         assert!(started.elapsed() < RPC_TIMEOUT + Duration::from_secs(5));
     }
 
-    /// The codex an agent runs is its own executable, or the script its
-    /// interpreter runs; a process that is not the one planned, or that
-    /// runs no Codex, gives none.
+    /// The codex an agent runs is its own executable, or its interpreter
+    /// and the script that is the interpreter's first argument, even when
+    /// the script is not executable. No start, a start that is not the
+    /// planned one, or a process that runs no Codex, gives none.
     #[cfg(unix)]
     #[test]
     fn the_codex_an_agent_runs_is_its_own() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("codex");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // `sh <codex script>`: an interpreter running Codex.
+        let script = dir.path().join("codex.js");
+        // Not executable and without a shebang: only `sh <script>` runs it.
+        std::fs::write(&script, "sleep 30\n").unwrap();
         let mut child = Command::new("sh").arg(&script).spawn().unwrap();
         let pid = child.id();
         std::thread::sleep(Duration::from_millis(200));
         let start = tend::agent_conversation::process_start(pid);
         let found = codex_of(pid, start.as_deref());
         let other = codex_of(pid, Some("not-its-start"));
+        let unplanned = codex_of(pid, None);
         let _ = child.kill();
         let _ = child.wait();
+        let found = found.expect("an interpreter-run codex");
         assert_eq!(
-            found.and_then(|path| std::fs::canonicalize(path).ok()),
-            std::fs::canonicalize(&script).ok()
+            found
+                .args
+                .iter()
+                .map(|path| std::fs::canonicalize(path).ok())
+                .collect::<Vec<_>>(),
+            [std::fs::canonicalize(&script).ok()]
+        );
+        assert!(
+            found.program.ends_with("sh")
+                || found.program.ends_with("bash")
+                || found.program.ends_with("dash"),
+            "{found:?}"
         );
         assert_eq!(other, None);
+        assert_eq!(unplanned, None);
         let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
-        let none = codex_of(sleep.id(), None);
+        let sleep_start = tend::agent_conversation::process_start(sleep.id());
+        let none = codex_of(sleep.id(), sleep_start.as_deref());
         let _ = sleep.kill();
         let _ = sleep.wait();
         assert_eq!(none, None);
+    }
+
+    /// A configured profile's launch finds `codex` on its own `PATH`; a
+    /// `PATH` its env file would compute cannot be told.
+    #[cfg(unix)]
+    #[test]
+    fn a_profiles_codex_is_found_on_its_own_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("profile-bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("codex"), "#!/bin/sh\n").unwrap();
+        let mut profile = tend::accounts::AccountProfile {
+            name: "work".into(),
+            env: std::collections::BTreeMap::from([("PATH".to_owned(), bin.display().to_string())]),
+            env_file: None,
+        };
+        assert_eq!(
+            profile_codex(&profile, "codex"),
+            Some(Codex::program(bin.join("codex")))
+        );
+        let file = dir.path().join("acct.env");
+        std::fs::write(&file, "export PATH=\"$HOME/bin:$PATH\"\n").unwrap();
+        profile.env.clear();
+        profile.env_file = Some(file.display().to_string());
+        assert_eq!(profile_codex(&profile, "codex"), None);
+        std::fs::write(&file, format!("PATH={}\n", bin.display())).unwrap();
+        assert_eq!(
+            profile_codex(&profile, "codex"),
+            Some(Codex::program(bin.join("codex")))
+        );
     }
 
     #[test]
@@ -1078,7 +1226,8 @@ mod tests {
     #[test]
     #[ignore = "needs a real codex binary in TEND_TEST_CODEX"]
     fn prepare_carries_trust_through_the_real_app_server() {
-        let codex = PathBuf::from(std::env::var("TEND_TEST_CODEX").expect("TEND_TEST_CODEX"));
+        let codex_path = PathBuf::from(std::env::var("TEND_TEST_CODEX").expect("TEND_TEST_CODEX"));
+        let codex = Codex::program(codex_path.clone());
         let dir = tempfile::tempdir().unwrap();
         let (a, b, work) = (
             dir.path().join("a"),
@@ -1110,7 +1259,7 @@ mod tests {
         drop(server);
         let homes = [a.clone(), b.clone()];
         // `b` is fixable only because `a`'s own hook is trusted.
-        let audits = audit(|_| Some(codex.clone()), &homes);
+        let audits = audit(|_| Some(Codex::program(codex_path.clone())), &homes);
         assert_eq!(audits.len(), 1, "{audits:?}");
         assert_eq!(audits[0].result, Ok((1, 0)));
         // `b` shares the file but not the key: carried over once, then trusted.
@@ -1131,7 +1280,7 @@ mod tests {
                 ..Prepared::default()
             }
         );
-        assert!(audit(|_| Some(codex.clone()), &homes).is_empty());
+        assert!(audit(|_| Some(Codex::program(codex_path.clone())), &homes).is_empty());
         assert_eq!(audits[0].resolved, resolved_home(&b));
     }
 }
