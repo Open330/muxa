@@ -7,7 +7,8 @@ only at the depth where the provider gives deterministic signals (hook or
 plugin events with a session id, provider session records, or a local API).
 
 Sources are the projects' own docs and release pages as of the survey date;
-see the links per tool. Nothing was run against a live binary.
+see the links per tool. The survey itself ran no binaries; Copilot CLI was
+later checked on a real install (section below).
 
 | Tool | What it is | Deterministic signals | Activity | Adapter cost | Recommendation |
 | --- | --- | --- | --- | --- | --- |
@@ -57,8 +58,8 @@ camelCase events, JSON on stdin):
 Every hook process inherited `TMUX_PANE`, so pane binding works like Claude
 Code's.
 
-**The gap: Esc fires no hook.** Cancelling the permission prompt (and so the
-turn) produced no `postToolUse`, no `agentStop` and no `notification`, even
+**The gap: Esc fires no hook** (observed on 1.0.110, Esc on a permission
+prompt). Cancelling the prompt (and so the turn) produced no `postToolUse`, no `agentStop` and no `notification`, even
 75 s later. A hooks-only adapter would leave the row waiting (or working)
 until the next prompt. The cancel is recorded deterministically in Copilot's
 own session log, `$COPILOT_HOME/session-state/<sessionId>/events.jsonl`:
@@ -83,7 +84,8 @@ built in wave 3, for these reasons:
 - A new `AgentKind` touches about 40 files, including the MCP enums and the
   Mac app.
 - Shipping the hooks half alone would add a provider whose rows stick after
-  every Esc.
+  an Esc on a permission prompt (the path tested on 1.0.110; other Esc paths
+  were not tried).
 
 Notes for whoever builds it:
 
@@ -92,7 +94,11 @@ Notes for whoever builds it:
 - Copilot also runs a repository's `.claude/settings.json` hooks under Claude
   event names, so a repo that installs tend's Claude hooks at project level
   would report a Copilot session as Claude. The adapter has to tell them
-  apart (Copilot's camelCase `sessionId` and `hookName`).
+  apart, and the discriminator must be verified on that compatibility path:
+  the reference documents snake_case `session_id` / `hook_event_name` for
+  the PascalCase Claude-compatible events, and the camelCase fields seen in
+  this run (`sessionId`, `hookName` on `permissionRequest`) were only
+  observed on 1.0.110's native events, not promised.
 - The installer writes `$COPILOT_HOME/hooks/tend.json` (default
   `~/.copilot`). Copilot asks for folder trust before loading repo hooks;
   user hooks load without it.
