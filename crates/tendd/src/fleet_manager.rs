@@ -16,10 +16,11 @@ use tend::fleet::{
     FleetCapturedWindowPane, FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult,
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
-    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
-    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
-    FLEET_SERVER_INVENTORY_CAPABILITY, FLEET_WORKTREE_CHANGE_CAPABILITY,
-    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES,
+    FLEET_DECISION_QUEUE_CAPABILITY, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
+    FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY, FLEET_SERVER_INVENTORY_CAPABILITY,
+    FLEET_WORKTREE_CHANGE_CAPABILITY, FLEET_WORKTREE_INVENTORY_CAPABILITY,
+    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use tend::tmux::SessionInfo;
 use tend::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -476,6 +477,14 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
                 local_send_keys(&self.backends, pane, keys).await
             }
+            FleetOperation::DecisionQueue { limit } => {
+                audit_operation(LOCAL_HOST_ALIAS, "decision_queue", 0);
+                self.client
+                    .decision_queue(&tend::decision_queue::operator_origin(), limit)
+                    .await
+                    .map(FleetCommandResult::decision_queue)
+                    .map_err(|error| error.to_string())
+            }
             // Runs in its own task; see `spawn_worktree_inventory`.
             FleetOperation::WorktreeInventory
             | FleetOperation::WorktreeChange { .. }
@@ -692,6 +701,27 @@ fn spawn_server_inventory(command: HostCommand, agents: &SharedStore) -> Option<
         let _ = reply.send(result);
     });
     None
+}
+
+/// The decision queue goes only to a relay that says it answers it.
+fn decision_queue_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::DecisionQueue { .. }) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_DECISION_QUEUE_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot send its decision queue; upgrade tend on that host"
+    ))
 }
 
 /// The server inventory goes only to a relay that says it answers it.
@@ -1596,6 +1626,13 @@ impl HostTask {
                                     &command.operation,
                                 )
                             })
+                            .or_else(|| {
+                                decision_queue_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
                     {
                         let _ = command.reply.send(Err(refusal));
                         continue;
@@ -1704,6 +1741,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::WorktreeChange { request_id: id, change }
+                        }
+                        FleetOperation::DecisionQueue { limit } => {
+                            audit_operation(&self.alias, "decision_queue", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::DecisionQueue { request_id: id, limit }
                         }
                         FleetOperation::ServerInventory => {
                             audit_operation(&self.alias, "server_inventory", 0);
@@ -2327,6 +2372,12 @@ mod tests {
         assert!(server_inventory_refusal("remote", &current, &servers).is_none());
         assert!(server_inventory_refusal("remote", &older, &inventory).is_none());
         assert!(relay_timeout(configured, &servers) > tend::worktree_inventory::SCAN_BUDGET);
+        // The decision queue goes only to a relay that answers it.
+        let queue = FleetOperation::DecisionQueue { limit: 50 };
+        let refusal = decision_queue_refusal("remote", &older, &queue).unwrap();
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(decision_queue_refusal("remote", &current, &queue).is_none());
+        assert!(decision_queue_refusal("remote", &older, &servers).is_none());
     }
 
     #[test]

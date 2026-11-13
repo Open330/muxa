@@ -491,6 +491,18 @@ async fn handle_request(
                 result: Box::new(FleetCommandResult::worktrees(rows)),
             })
         }
+        RelayRequest::DecisionQueue { request_id, limit } => {
+            // As this host's operator console: the controller asking holds
+            // the operator's Fleet control.
+            let queue = client
+                .decision_queue(&tend::decision_queue::operator_origin(), limit)
+                .await
+                .context("reading the decision queue")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: Box::new(FleetCommandResult::decision_queue(queue)),
+            })
+        }
         RelayRequest::ServerInventory { request_id } => {
             static SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
             let Ok(_permit) = SCAN.try_acquire() else {

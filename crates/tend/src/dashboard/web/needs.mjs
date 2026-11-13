@@ -3,7 +3,7 @@
 // token kept by the main page, or the OIDC operator session cookie.
 // Everything an agent wrote is rendered with textContent, never as HTML.
 
-import { decidedCard, pendingCard } from "./needs-model.mjs";
+import { decidedCard, draftKey, hostSections } from "./needs-model.mjs";
 import { withPaneHash } from "./pane-drawer.mjs";
 
 const TOKEN_KEY = "tend.token";
@@ -13,6 +13,7 @@ const $ = (id) => document.getElementById(id);
 const state = { tab: "queue", timer: null, generation: 0 };
 /// Unsent answers and notes by card, kept across re-renders.
 const drafts = new Map();
+
 
 function authHeaders() {
   let token = null;
@@ -66,6 +67,7 @@ function el(tag, className, text) {
 function renderCard(card) {
   const li = el("li", "card");
   li.dataset.id = card.id;
+  if (card.host) li.dataset.host = card.host;
   li.append(el("div", `kind ${card.kind}`, card.label));
   li.append(el("h2", null, card.title));
   li.append(el("div", "meta", card.meta));
@@ -101,7 +103,7 @@ function renderCard(card) {
     li.append(link);
   }
   if (card.outcome) li.append(el("p", "outcome", card.outcome));
-  if (state.tab === "queue") li.append(actions(card));
+  if (state.tab === "queue" && card.actionable !== false) li.append(actions(card));
   return li;
 }
 
@@ -119,10 +121,10 @@ function actions(card) {
   box.addEventListener("submit", (event) => event.preventDefault());
   const note = el("textarea", "note");
   note.rows = 2;
-  note.value = drafts.get(card.id) || "";
+  note.value = drafts.get(draftKey(card)) || "";
   note.addEventListener("input", () => {
-    if (note.value) drafts.set(card.id, note.value);
-    else drafts.delete(card.id);
+    if (note.value) drafts.set(draftKey(card), note.value);
+    else drafts.delete(draftKey(card));
   });
   note.maxLength = card.kind === "ask" ? 16384 : 1024;
   const message = el("p", "result");
@@ -134,7 +136,7 @@ function actions(card) {
     try {
       await write(path, body);
       message.textContent = done;
-      drafts.delete(card.id);
+      drafts.delete(draftKey(card));
       setTimeout(refresh, 800);
     } catch (error) {
       if (error.auth) return lostAccess(error);
@@ -147,19 +149,21 @@ function actions(card) {
     const options = el("div", "choices");
     for (const option of card.options) options.append(button(option, () => {
       note.value = option;
-      drafts.set(card.id, option);
+      drafts.set(draftKey(card), option);
     }));
     if (card.options.length) box.append(options);
     box.append(note);
     const path = `/api/decisions/requests/${encodeURIComponent(card.id)}`;
+    // A question on another Fleet host is answered there, over Fleet.
+    const withHost = (body) => (card.remote ? { ...body, host: card.host } : body);
     box.append(
       button("Send answer", () => {
         if (!note.value.trim()) return (message.textContent = "Write an answer first.");
-        send(path, { answer: note.value }, "Answered.");
+        send(path, withHost({ answer: note.value }), "Answered.");
       }, "primary"),
       button("Decline", () => {
         if (!note.value.trim()) return (message.textContent = "Say why you decline.");
-        send(path, { answer: note.value, declined: true }, "Declined.");
+        send(path, withHost({ answer: note.value, declined: true }), "Declined.");
       }),
     );
   } else if (card.kind === "review") {
@@ -195,6 +199,26 @@ function actions(card) {
 function renderList(list, cards, empty) {
   list.replaceChildren(...cards.map(renderCard));
   if (!cards.length) list.replaceChildren(el("li", "card meta", empty));
+}
+
+/// One heading per host (only when there is more than one), what it
+/// covers and what could not be read, then its cards.
+function renderSections(list, sections) {
+  const nodes = [];
+  const several = sections.length > 1;
+  for (const section of sections) {
+    if (several || section.notes.length) {
+      const head = el("li", "host");
+      if (several) head.append(el("h2", null, section.alias));
+      if (several && section.covers.length) head.append(el("div", "meta", section.covers.join(" · ")));
+      for (const note of section.notes) head.append(el("div", "meta", note));
+      nodes.push(head);
+    }
+    nodes.push(...section.cards.map(renderCard));
+  }
+  const total = sections.reduce((sum, section) => sum + section.cards.length, 0);
+  if (!total) nodes.push(el("li", "card meta", "Nothing is waiting on you."));
+  list.replaceChildren(...nodes);
 }
 
 function unavailableNote(unavailable, truncated) {
@@ -237,11 +261,12 @@ async function refresh() {
       // Fetched (so a lost session shows), but not re-rendered under the
       // cursor; drafts survive the next render either way.
       if (composing()) return;
-      const cards = (data.queue?.items || []).map((item) => pendingCard(item)).filter(Boolean);
-      renderList($("queue"), cards, "Nothing is waiting on you.");
-      $("count").textContent = cards.length ? `${cards.length} waiting` : "";
-      status.textContent = unavailableNote(data.queue?.unavailable, data.queue?.truncated);
-      $("covers").textContent = `Covers ${data.covers || "this host"}.`;
+      const sections = hostSections(data);
+      renderSections($("queue"), sections);
+      const total = sections.reduce((sum, section) => sum + section.cards.length, 0);
+      $("count").textContent = total ? `${total} waiting` : "";
+      status.textContent = "";
+      $("covers").textContent = `Covers ${sections.map((s) => s.alias).join(", ")}.`;
     } else {
       const data = await read("/api/decisions/history");
       if (!current()) return;

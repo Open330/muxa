@@ -361,16 +361,33 @@ daemon reads as the Mac app (`decision_queue`, `decision_history`).
 Authorization: both reads are **operator-only**, like pane output. They need
 the dashboard token or a live operator sign-in; a viewer session gets 403,
 an anonymous visitor 401, and `public_read` or `auth = "none"` never expose
-them. They are GETs, so they need no CSRF proof. The queue covers the host
-whose tendd serves the dashboard; the response says so (`covers`).
+them. They are GETs, so they need no CSRF proof.
+
+The queue is per host (`hosts[]`, each with `alias`, `covers`,
+`unavailable` and its `queue`). The host whose tendd serves the dashboard
+covers everything. A Fleet host whose tend answers the Fleet
+`decision_queue` read (`fleet_decision_queue_v1`) sends its whole queue,
+read there as its operator console: questions, waiting agents and review
+items. An older Fleet host covers the questions in its operator mailbox and
+its waiting agents (from the Fleet snapshot); that mailbox read carries only
+the newest messages, so when it is full the section says older questions
+may be missing. A host that is not online is listed with its state.
+
+A question on a **control-mode** Fleet host can be answered from the page:
+tend reads the request back from that host and answers only if it is
+addressed to the operator console (otherwise a Fleet reply would be sent as
+the agent in that pane). Observe-only hosts' questions, and review items on
+other hosts, are shown but decided on their own host. The **Decided** tab
+covers this host.
 
 Each card can be decided from the page, through the same daemon paths as
 the Mac app:
 
 - a question (human request): pick an option or write an answer, then
   **Send answer** or **Decline** — `POST /api/decisions/requests/{id}`
-  with `{"answer": "…", "declined": false}`. Only requests addressed to the
-  operator console can be answered, once.
+  with `{"answer": "…", "declined": false, "host": "…"}` (`host` only for a
+  question on another Fleet host). Only requests addressed to the operator
+  console can be answered, once.
 - a result to review: an option button, **Looks good**, **Send back** (needs
   a note) or **Withdraw** — `POST /api/decisions/reviews/{id}` with
   `{"disposition": "accepted" | "returned" | "withdrawn", "note": "…",
