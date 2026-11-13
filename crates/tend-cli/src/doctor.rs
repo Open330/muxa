@@ -564,31 +564,32 @@ pub(crate) fn codex_hook_trust_lines(config: Option<&Path>) -> Option<Vec<String
         let codex = trust::find_codex()?;
         let homes = trust::known_homes(accounts.for_provider("codex"));
         let cwd = dirs::home_dir()?.display().to_string();
-        let audits = trust::audit(&codex, &homes, &cwd).ok()?;
+        let audits = trust::audit(&codex, &homes, &cwd);
         Some(
             audits
                 .iter()
                 .map(|audit| {
+                    let home = tilde(&audit.home.display().to_string());
+                    let (fixable, unvouched) = match &audit.result {
+                        Ok(counts) => *counts,
+                        Err(error) => {
+                            return format!("Codex home {home}: could not check ({error})")
+                        }
+                    };
                     let mut parts = Vec::new();
-                    if audit.fixable > 0 {
+                    if fixable > 0 {
                         parts.push(format!(
-                            "{} hook(s) trusted under another home but stale here (a swap \
-                             carries the trust over)",
-                            audit.fixable
+                            "{fixable} hook(s) trusted under another home but stale here (a \
+                             swap carries the trust over)"
                         ));
                     }
-                    if audit.unvouched > 0 {
+                    if unvouched > 0 {
                         parts.push(format!(
-                            "{} hook(s) never trusted on this host (open Codex under this \
-                             home and review them)",
-                            audit.unvouched
+                            "{unvouched} hook(s) not trusted under any home (open Codex under \
+                             this home and review them)"
                         ));
                     }
-                    format!(
-                        "Codex home {}: {}",
-                        tilde(&audit.home.display().to_string()),
-                        parts.join(", ")
-                    )
+                    format!("Codex home {home}: {}", parts.join(", "))
                 })
                 .collect(),
         )

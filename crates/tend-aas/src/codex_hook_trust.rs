@@ -13,23 +13,30 @@
 //! A swap relaunches Codex under another account's home. If that home's
 //! entry is missing, or still holds the hash of an older definition, the
 //! relaunched agent stops on the review menu. tend never answers that menu.
-//! Instead, before the relaunch, a hook the user already trusted under
-//! another home on this machine — same event, a `trusted_hash` equal to the
-//! hook's current hash — gets that same entry under the target's key.
-//! Nothing is trusted that the user has not trusted somewhere.
+//! Instead, before the relaunch, a hook the user already trusted as their
+//! own under another account home on this machine — Codex itself reports
+//! it `trusted`, a `user` hook from that home's own `config.toml`, same
+//! event, same current hash — gets that trust under the target's key.
+//! A raw `hooks.state` entry is never taken as proof: only what Codex
+//! answers about a hook it actually loads.
 //!
 //! Everything goes through Codex's own app-server (`hooks/list` to read
-//! each hook's key, current hash and trust status; `config/value/write` to
-//! upsert `hooks.state`), so Codex writes its own file, through the
-//! symlink, in its own format.
+//! each hook's key, current hash, source and trust status;
+//! `config/value/write` to upsert `hooks.state`), so Codex writes its own
+//! file, through the symlink, in its own format.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-/// How long one app-server conversation may take.
-const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one app-server request (written and answered) may take.
+const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `aas export` may take.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The whole of one swap's or one audit's trust work.
+const BUDGET: Duration = Duration::from_secs(60);
 
 /// One hook as `hooks/list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,39 +60,80 @@ impl Hook {
     }
 }
 
-/// One `trusted_hash` the user gave under some key.
+/// One hook the user trusted as their own under some home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trusted {
     pub key: String,
+    pub event: String,
     pub hash: String,
 }
 
-/// The event segment of a hooks.state key (`…:stop:0:0` → `stop`).
-fn key_event(key: &str) -> Option<&str> {
+/// The event of `key` when it is exactly
+/// `<home>/config.toml:<event>:<group>:<hook>` for `home`'s own user config.
+/// The directory is compared resolved (Codex may print `/private/var/…` for
+/// `/var/…`); the `config.toml` link itself is not followed, so a profile
+/// sharing another home's file is still its own home.
+fn own_key_event<'a>(key: &'a str, home: &Path) -> Option<&'a str> {
     let mut parts = key.rsplitn(4, ':');
-    let _hook = parts.next()?;
-    let _group = parts.next()?;
-    parts.next()
+    let (hook, group, event, path) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let valid = !event.is_empty()
+        && event.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        && group.parse::<u32>().is_ok()
+        && hook.parse::<u32>().is_ok();
+    let path = Path::new(path);
+    let same_home = path.file_name().is_some_and(|name| name == "config.toml")
+        && path.parent().is_some_and(|dir| same_dir(dir, home));
+    (valid && same_home).then_some(event)
 }
 
-/// The trust entries to add under `hooks`' own keys: for each hook waiting
-/// on review, one the user already trusted under another key — same event,
-/// same hash as the hook is now. Hooks with no such entry are returned
-/// apart; they are left for the user.
+/// Whether two directories are one, by their resolved paths.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// What `home`'s own hooks vouch for: those Codex reports `trusted`, from
+/// the user's config of that very home.
 #[must_use]
-pub fn plan(hooks: &[Hook], trusted: &[Trusted]) -> (Vec<Trusted>, Vec<Hook>) {
+pub fn vouched_by(hooks: &[Hook], home: &Path) -> Vec<Trusted> {
+    hooks
+        .iter()
+        .filter(|hook| hook.trust == "trusted" && hook.source == "user")
+        .filter_map(|hook| {
+            let event = own_key_event(&hook.key, home)?;
+            (event == hook.event).then(|| Trusted {
+                key: hook.key.clone(),
+                event: hook.event.clone(),
+                hash: hook.current_hash.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The trust entries to add under `hooks`' own keys: for each of the
+/// target's own user hooks waiting on review, one trusted as the user's own
+/// under another home — same event, same hash as the hook is now. Hooks
+/// with no such twin are returned apart; they are left for the user.
+#[must_use]
+pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, Vec<Hook>) {
     let mut copies = Vec::new();
     let mut left = Vec::new();
     for hook in hooks.iter().filter(|hook| hook.needs_review()) {
-        let vouched = hook.source == "user"
+        let own =
+            hook.source == "user" && own_key_event(&hook.key, home) == Some(hook.event.as_str());
+        let vouched = own
             && trusted.iter().any(|entry| {
                 entry.key != hook.key
                     && entry.hash == hook.current_hash
-                    && key_event(&entry.key) == Some(hook.event.as_str())
+                    && entry.event == hook.event
             });
         if vouched {
             copies.push(Trusted {
                 key: hook.key.clone(),
+                event: hook.event.clone(),
                 hash: hook.current_hash.clone(),
             });
         } else {
@@ -95,33 +143,18 @@ pub fn plan(hooks: &[Hook], trusted: &[Trusted]) -> (Vec<Trusted>, Vec<Hook>) {
     (copies, left)
 }
 
-/// Every `hooks.state` entry with a `trusted_hash` in `config` (a TOML
-/// document). Malformed documents give none.
-#[must_use]
-pub fn trusted_in(config: &str) -> Vec<Trusted> {
-    let Ok(value) = config.parse::<toml::Table>() else {
-        return Vec::new();
-    };
-    let Some(state) = value
-        .get("hooks")
-        .and_then(|hooks| hooks.get("state"))
-        .and_then(toml::Value::as_table)
-    else {
-        return Vec::new();
-    };
-    state
-        .iter()
-        .filter_map(|(key, entry)| {
-            let hash = entry.get("trusted_hash")?.as_str()?;
-            Some(Trusted {
-                key: key.clone(),
-                hash: hash.to_owned(),
-            })
-        })
-        .collect()
+/// The `CODEX_HOME` a profile launches with: its `env`, then its
+/// `env_file`, the later one winning as it does at launch.
+fn profile_home(profile: &tend::accounts::AccountProfile) -> Option<PathBuf> {
+    profile
+        .resolved_env()
+        .into_iter()
+        .rfind(|(key, _)| key == "CODEX_HOME")
+        .map(|(_, value)| PathBuf::from(value))
+        .filter(|path| path.is_absolute())
 }
 
-/// The Codex homes on this machine whose trust can vouch for a hook:
+/// The account homes on this machine whose own hooks can vouch for a hook:
 /// `~/.codex`, `$CODEX_HOME`, the configured accounts' `CODEX_HOME`, and
 /// the aas profiles (`asx/profiles/codex-*` under the data directory and
 /// `~/.config`). Each listed once.
@@ -131,11 +164,7 @@ pub fn known_homes(codex_profiles: &[tend::accounts::AccountProfile]) -> Vec<Pat
     let home = dirs::home_dir();
     homes.extend(home.as_ref().map(|home| home.join(".codex")));
     homes.extend(std::env::var_os("CODEX_HOME").map(PathBuf::from));
-    for profile in codex_profiles {
-        if let Some(path) = profile.env.get("CODEX_HOME") {
-            homes.push(expand_home(path));
-        }
-    }
+    homes.extend(codex_profiles.iter().filter_map(profile_home));
     let mut bases = Vec::new();
     bases.extend(dirs::data_dir().map(|data| data.join("asx/profiles")));
     bases.extend(home.as_ref().map(|home| home.join(".config/asx/profiles")));
@@ -167,39 +196,9 @@ pub fn known_homes(codex_profiles: &[tend::accounts::AccountProfile]) -> Vec<Pat
     homes
 }
 
-fn expand_home(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), dirs::home_dir()) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(path),
-    }
-}
-
-/// Every trust entry in the config files of `homes`, each file read once.
-#[must_use]
-pub fn trusted_across(homes: &[PathBuf]) -> Vec<Trusted> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut trusted = Vec::new();
-    for home in homes {
-        let config = home.join("config.toml");
-        let Ok(real) = std::fs::canonicalize(&config) else {
-            continue;
-        };
-        if files.contains(&real) {
-            continue;
-        }
-        files.push(real);
-        if let Ok(text) = std::fs::read_to_string(&config) {
-            trusted.extend(trusted_in(&text));
-        }
-    }
-    trusted.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.hash.cmp(&b.hash)));
-    trusted.dedup();
-    trusted
-}
-
 /// The `CODEX_HOME` an account's relaunch runs under: the configured
-/// profile's own, or what `aas export <account>` sets. `None` when it
-/// cannot be told.
+/// profile's own (`env`, then `env_file`), or what `aas export <account>`
+/// sets. `None` when it cannot be told.
 #[must_use]
 pub fn account_home(
     profiles: &[tend::accounts::AccountProfile],
@@ -207,9 +206,7 @@ pub fn account_home(
     aas: &str,
 ) -> Option<PathBuf> {
     if !profiles.is_empty() {
-        return tend::accounts::find_profile(profiles, "codex", account)
-            .and_then(|profile| profile.env.get("CODEX_HOME"))
-            .map(|path| expand_home(path));
+        return tend::accounts::find_profile(profiles, "codex", account).and_then(profile_home);
     }
     let program = crate::account_swap::find_aas(aas)?;
     let name = if account.contains('@') {
@@ -217,17 +214,26 @@ pub fn account_home(
     } else {
         format!("{account}@codex")
     };
-    let output = run_bounded(Command::new(program).args(["export", &name]))?;
-    // Only the one line is read; anything else it prints stays unread.
+    let output = run_bounded(
+        Command::new(program).args(["export", &name]),
+        EXPORT_TIMEOUT,
+    )?;
+    export_home(&output)
+}
+
+/// The `CODEX_HOME` line of `aas export` output. Nothing else of it is
+/// read or kept: the rest may carry credentials.
+fn export_home(output: &str) -> Option<PathBuf> {
     output
         .lines()
-        .find_map(|line| line.strip_prefix("export CODEX_HOME="))
+        .find_map(|line| line.trim().strip_prefix("export CODEX_HOME="))
         .map(|value| PathBuf::from(value.trim().trim_matches('"').trim_matches('\'')))
         .filter(|path| path.is_absolute())
 }
 
-/// `command`'s standard output, if it succeeded within the timeout.
-fn run_bounded(command: &mut Command) -> Option<String> {
+/// `command`'s standard output, if it succeeded within `timeout`. A child
+/// whose descendant keeps the pipe open past its exit is not waited for.
+fn run_bounded(command: &mut Command, timeout: Duration) -> Option<String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -235,15 +241,16 @@ fn run_bounded(command: &mut Command) -> Option<String> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (send, read) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut text = String::new();
-        std::io::Read::read_to_string(&mut stdout, &mut text).map(|_| text)
+        let _ = send.send(std::io::Read::read_to_string(&mut stdout, &mut text).map(|_| text));
     });
-    let deadline = std::time::Instant::now() + APP_SERVER_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
+            Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             _ => {
@@ -253,14 +260,20 @@ fn run_bounded(command: &mut Command) -> Option<String> {
             }
         }
     };
-    let text = reader.join().ok()?.ok()?;
+    let text = read
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?
+        .ok()?;
     status.success().then_some(text)
 }
 
 /// A short conversation with `codex app-server` over stdio under `home`.
+/// Writing happens on its own thread, so a server that stops reading can
+/// only make a request time out; the child is killed and reaped on drop.
 struct AppServer {
     child: Child,
-    lines: std::sync::mpsc::Receiver<String>,
+    writer: Option<mpsc::Sender<String>>,
+    lines: mpsc::Receiver<String>,
     next: u64,
 }
 
@@ -275,7 +288,8 @@ impl AppServer {
             .spawn()
             .map_err(|error| format!("cannot start {} app-server: {error}", codex.display()))?;
         let stdout = child.stdout.take().ok_or("no app-server output")?;
-        let (send, lines) = std::sync::mpsc::channel();
+        let mut stdin = child.stdin.take().ok_or("no app-server input")?;
+        let (send, lines) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if send.send(line).is_err() {
@@ -283,8 +297,20 @@ impl AppServer {
                 }
             }
         });
+        let (writer, outgoing) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in outgoing {
+                if writeln!(stdin, "{line}")
+                    .and_then(|()| stdin.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut server = Self {
             child,
+            writer: Some(writer),
             lines,
             next: 0,
         };
@@ -292,20 +318,16 @@ impl AppServer {
             "initialize",
             serde_json::json!({"clientInfo": {"name": "tend", "version": env!("CARGO_PKG_VERSION")}}),
         )?;
-        server.notify("initialized")?;
+        server.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized"}))?;
         Ok(server)
     }
 
-    fn write(&mut self, message: &serde_json::Value) -> Result<(), String> {
-        let stdin = self.child.stdin.as_mut().ok_or("app-server input closed")?;
-        writeln!(stdin, "{message}").map_err(|error| format!("app-server: {error}"))?;
-        stdin
-            .flush()
-            .map_err(|error| format!("app-server: {error}"))
-    }
-
-    fn notify(&mut self, method: &str) -> Result<(), String> {
-        self.write(&serde_json::json!({"jsonrpc": "2.0", "method": method}))
+    fn send(&self, message: &serde_json::Value) -> Result<(), String> {
+        self.writer
+            .as_ref()
+            .ok_or("app-server input closed")?
+            .send(message.to_string())
+            .map_err(|_| "app-server input closed".to_owned())
     }
 
     fn call(
@@ -315,15 +337,14 @@ impl AppServer {
     ) -> Result<serde_json::Value, String> {
         self.next += 1;
         let id = self.next;
-        self.write(
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        self.send(
             &serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         )?;
-        let deadline = std::time::Instant::now() + APP_SERVER_TIMEOUT;
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
             let line = self
                 .lines
-                .recv_timeout(left)
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .map_err(|_| format!("app-server did not answer {method}"))?;
             let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
@@ -340,19 +361,25 @@ impl AppServer {
                 .ok_or_else(|| format!("app-server {method}: no result"));
         }
     }
+
+    /// The hooks Codex loads under this home for a session in `cwd`.
+    fn hooks(&mut self, cwd: &str) -> Result<Vec<Hook>, String> {
+        let result = self.call("hooks/list", serde_json::json!({"cwds": [cwd]}))?;
+        Ok(parse_hooks(&result))
+    }
 }
 
 impl Drop for AppServer {
     fn drop(&mut self) {
+        self.writer = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// The hooks Codex loads under `home` for a session in `cwd`.
-fn list_hooks(server: &mut AppServer, cwd: &str) -> Result<Vec<Hook>, String> {
-    let result = server.call("hooks/list", serde_json::json!({"cwds": [cwd]}))?;
-    Ok(parse_hooks(&result))
+/// The hooks `codex` loads under `home` for a session in `cwd`.
+fn list_hooks(codex: &Path, home: &Path, cwd: &str) -> Result<Vec<Hook>, String> {
+    AppServer::open(codex, home)?.hooks(cwd)
 }
 
 /// `hooks/list`'s result as hooks.
@@ -419,7 +446,8 @@ impl Prepared {
         }
         if !self.left.is_empty() {
             parts.push(format!(
-                "{} Codex hook(s) were never trusted on this machine and will ask for review: {}",
+                "{} Codex hook(s) are not trusted under any other account here and will ask \
+                 for review: {}",
                 self.left.len(),
                 self.left.join(", ")
             ));
@@ -429,21 +457,38 @@ impl Prepared {
 }
 
 /// Before Codex is relaunched under `home` in `cwd`: copy the trust of
-/// hooks the user already trusted under `homes` to `home`'s own keys, so
-/// the relaunch does not stop on the review menu. Errors leave the file
-/// as it was (the relaunch then shows the menu, and says so).
+/// hooks the user trusted as their own under the other `homes` to `home`'s
+/// own keys, so the relaunch does not stop on the review menu. Donor homes
+/// are asked one at a time, only while something still waits, within
+/// [`BUDGET`]. Errors leave the file as it was (the relaunch then shows the
+/// menu, and says so).
 pub fn prepare(
     codex: &Path,
     home: &Path,
     cwd: &str,
     homes: &[PathBuf],
 ) -> Result<Prepared, String> {
-    let mut server = AppServer::open(codex, home)?;
-    let hooks = list_hooks(&mut server, cwd)?;
+    let started = Instant::now();
+    let mut target = AppServer::open(codex, home)?;
+    let hooks = target.hooks(cwd)?;
     if !hooks.iter().any(Hook::needs_review) {
         return Ok(Prepared::default());
     }
-    let (copies, left) = plan(&hooks, &trusted_across(homes));
+    let mut trusted = Vec::new();
+    let (mut copies, mut left) = plan(&hooks, home, &trusted);
+    for donor in homes.iter().filter(|donor| *donor != home) {
+        if left.is_empty() || started.elapsed() >= BUDGET {
+            break;
+        }
+        if !donor.join("config.toml").exists() {
+            continue;
+        }
+        // A home that cannot be read vouches for nothing.
+        if let Ok(donor_hooks) = list_hooks(codex, donor, cwd) {
+            trusted.extend(vouched_by(&donor_hooks, donor));
+            (copies, left) = plan(&hooks, home, &trusted);
+        }
+    }
     if !copies.is_empty() {
         let value: serde_json::Map<String, serde_json::Value> = copies
             .iter()
@@ -454,7 +499,7 @@ pub fn prepare(
                 )
             })
             .collect();
-        server.call(
+        target.call(
             "config/value/write",
             serde_json::json!({"keyPath": "hooks.state", "mergeStrategy": "upsert", "value": value}),
         )?;
@@ -468,36 +513,54 @@ pub fn prepare(
     })
 }
 
-/// One home's hooks that wait on review, for `tend doctor`: the ones a
-/// swap would carry trust to (`fixable`), and the ones it could not.
+/// One home's hooks that wait on review, for `tend doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audit {
     pub home: PathBuf,
-    pub fixable: usize,
-    pub unvouched: usize,
+    /// `(fixable, unvouched)`: hooks a swap would carry trust to, and ones
+    /// it could not. `Err`: the home could not be checked, and why.
+    pub result: Result<(usize, usize), String>,
 }
 
-/// [`Audit`] every home in `homes` that has hooks waiting on review.
-/// Read-only: nothing is written.
-pub fn audit(codex: &Path, homes: &[PathBuf], cwd: &str) -> Result<Vec<Audit>, String> {
-    let trusted = trusted_across(homes);
-    let mut out = Vec::new();
+/// [`Audit`] each home in `homes` that has hooks waiting on review or
+/// cannot be checked, within [`BUDGET`] (homes past it are reported as not
+/// checked). Read-only: nothing is written.
+#[must_use]
+pub fn audit(codex: &Path, homes: &[PathBuf], cwd: &str) -> Vec<Audit> {
+    let started = Instant::now();
+    let mut listed: Vec<(PathBuf, Result<Vec<Hook>, String>)> = Vec::new();
     for home in homes
         .iter()
         .filter(|home| home.join("config.toml").exists())
     {
-        let mut server = AppServer::open(codex, home)?;
-        let hooks = list_hooks(&mut server, cwd)?;
-        let (copies, left) = plan(&hooks, &trusted);
-        if !copies.is_empty() || !left.is_empty() {
-            out.push(Audit {
-                home: home.clone(),
-                fixable: copies.len(),
-                unvouched: left.len(),
-            });
-        }
+        let hooks = if started.elapsed() >= BUDGET {
+            Err("not checked: the check ran out of time".to_owned())
+        } else {
+            list_hooks(codex, home, cwd)
+        };
+        listed.push((home.clone(), hooks));
     }
-    Ok(out)
+    let trusted: Vec<Trusted> = listed
+        .iter()
+        .filter_map(|(home, hooks)| hooks.as_ref().ok().map(|hooks| vouched_by(hooks, home)))
+        .flatten()
+        .collect();
+    listed
+        .into_iter()
+        .filter_map(|(home, hooks)| {
+            let result = match hooks {
+                Err(error) => Err(error),
+                Ok(hooks) => {
+                    let (copies, left) = plan(&hooks, &home, &trusted);
+                    if copies.is_empty() && left.is_empty() {
+                        return None;
+                    }
+                    Ok((copies.len(), left.len()))
+                }
+            };
+            Some(Audit { home, result })
+        })
+        .collect()
 }
 
 /// The `codex` program to ask: on `PATH` or in the usual install places.
@@ -512,10 +575,11 @@ mod tests {
 
     const H: &str = "sha256:270142e975acd1e3788822119c11b61b665c5db864cf75ba457d952e23e347ef";
     const OLD: &str = "sha256:51d95ede00000000000000000000000000000000000000000000000000000000";
+    const TARGET: &str = "/p/codex-b_codex";
 
-    fn hook(key: &str, event: &str, trust: &str) -> Hook {
+    fn hook(home: &str, event: &str, trust: &str) -> Hook {
         Hook {
-            key: key.into(),
+            key: format!("{home}/config.toml:{event}:0:0"),
             event: event.into(),
             command: Some(format!("tend hook codex --event {event}")),
             current_hash: H.into(),
@@ -524,11 +588,187 @@ mod tests {
         }
     }
 
-    fn trusted(key: &str, hash: &str) -> Trusted {
+    fn vouch(home: &str, event: &str, hash: &str) -> Trusted {
         Trusted {
-            key: key.into(),
+            key: format!("{home}/config.toml:{event}:0:0"),
+            event: event.into(),
             hash: hash.into(),
         }
+    }
+
+    #[test]
+    fn trust_is_carried_only_from_an_identical_trusted_hook() {
+        let target = Path::new(TARGET);
+        let hooks = [hook(TARGET, "stop", "modified")];
+        let (copies, left) = plan(&hooks, target, &[vouch("/h/.codex", "stop", H)]);
+        assert_eq!(copies, [vouch(TARGET, "stop", H)]);
+        assert!(left.is_empty());
+        // Only an old definition was ever trusted: left for the user.
+        let (copies, left) = plan(&hooks, target, &[vouch("/h/.codex", "stop", OLD)]);
+        assert!(copies.is_empty());
+        assert_eq!(left.len(), 1);
+        // The same hash for another event does not vouch for this one.
+        let (copies, _) = plan(&hooks, target, &[vouch("/h/.codex", "session_start", H)]);
+        assert!(copies.is_empty());
+        // A trusted hook needs nothing.
+        assert_eq!(
+            plan(&[hook(TARGET, "stop", "trusted")], target, &[]),
+            (vec![], vec![])
+        );
+        // A project hook, or one from another file, is never vouched for.
+        let mut project = hook(TARGET, "stop", "untrusted");
+        project.source = "project".into();
+        let mut elsewhere = hook(TARGET, "stop", "untrusted");
+        elsewhere.key = "/repo/.codex/hooks.json:stop:0:0".into();
+        for other in [project, elsewhere] {
+            let (copies, left) = plan(&[other], target, &[vouch("/h/.codex", "stop", H)]);
+            assert!(copies.is_empty());
+            assert_eq!(left.len(), 1);
+        }
+    }
+
+    /// Only a hook Codex reports trusted, from a home's own user config,
+    /// vouches. Malformed keys, other files and project or plugin hooks do
+    /// not, whatever their hash (the reviewer's cases).
+    #[test]
+    fn only_a_homes_own_trusted_user_hook_vouches() {
+        let home = Path::new("/h/.codex");
+        let mut hooks = vec![hook("/h/.codex", "stop", "trusted")];
+        assert_eq!(vouched_by(&hooks, home), [vouch("/h/.codex", "stop", H)]);
+        for key in [
+            "stop:0:0",
+            "/untrusted/repository/.codex/hooks.json:stop:0:0",
+            "plugin@unknown:hooks/hooks.json:stop:0:0",
+            "/h/.codex/config.toml:stop:x:0",
+            "/h/.codex/config.toml:stop:0:0:9",
+            "/h/.codex/config.toml:Stop:0:0",
+        ] {
+            hooks[0].key = key.into();
+            assert!(vouched_by(&hooks, home).is_empty(), "{key}");
+        }
+        let mut project = hook("/h/.codex", "stop", "trusted");
+        project.source = "project".into();
+        let untrusted = hook("/h/.codex", "stop", "untrusted");
+        let mut mismatched = hook("/h/.codex", "stop", "trusted");
+        mismatched.event = "session_start".into();
+        assert!(vouched_by(&[project, untrusted, mismatched], home).is_empty());
+    }
+
+    #[test]
+    fn a_profiles_codex_home_follows_its_launch_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("acct.env");
+        std::fs::write(&file, "export CODEX_HOME=\"/tmp/from-env-file\"\n").unwrap();
+        let profile = tend::accounts::AccountProfile {
+            name: "work".into(),
+            env: std::collections::BTreeMap::from([(
+                "CODEX_HOME".to_owned(),
+                "/tmp/from-env".to_owned(),
+            )]),
+            env_file: Some(file.display().to_string()),
+        };
+        assert_eq!(
+            profile_home(&profile),
+            Some(PathBuf::from("/tmp/from-env-file"))
+        );
+        let plain = tend::accounts::AccountProfile {
+            env_file: None,
+            ..profile
+        };
+        assert_eq!(profile_home(&plain), Some(PathBuf::from("/tmp/from-env")));
+    }
+
+    #[test]
+    fn only_the_codex_home_line_of_aas_export_is_read() {
+        let output = "export CLAUDE_CODE_OAUTH_TOKEN=\"secret\"\n\
+                      export CODEX_HOME=\"/Users/u/Library/Application Support/asx/profiles/codex-e_codex\"\n";
+        assert_eq!(
+            export_home(output),
+            Some(PathBuf::from(
+                "/Users/u/Library/Application Support/asx/profiles/codex-e_codex"
+            ))
+        );
+        assert_eq!(export_home("export CODEX_HOME=relative\n"), None);
+        assert_eq!(export_home(""), None);
+    }
+
+    /// A child whose descendant keeps stdout open, and one that never
+    /// exits, both end within the bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_run_never_outlives_its_deadline() {
+        let started = Instant::now();
+        assert_eq!(
+            run_bounded(
+                Command::new("sh").args(["-c", "sleep 30 & echo hi"]),
+                Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(
+            run_bounded(Command::new("sleep").arg("30"), Duration::from_secs(1)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            run_bounded(Command::new("echo").arg("hi"), Duration::from_secs(5)).as_deref(),
+            Some("hi\n")
+        );
+    }
+
+    /// A server that stops reading its input only times a request out.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_stops_reading_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("codex");
+        // Answers `initialize`, then never reads again.
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nread line\necho '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\nexec sleep 60\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut server = AppServer::open(&fake, dir.path()).unwrap();
+        let started = Instant::now();
+        let big = "x".repeat(1024 * 1024);
+        assert!(server
+            .call("config/value/write", serde_json::json!({ "value": big }))
+            .is_err());
+        assert!(started.elapsed() < RPC_TIMEOUT + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn hooks_list_results_are_read() {
+        let result = serde_json::json!({"data": [{"cwd": "/w", "hooks": [{
+            "key": "/p/b/config.toml:permission_request:0:0",
+            "eventName": "permissionRequest",
+            "command": "tend hook codex --event permission_request",
+            "currentHash": H,
+            "trustStatus": "untrusted",
+            "source": "user"
+        }], "warnings": [], "errors": []}]});
+        let hooks = parse_hooks(&result);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].event, "permission_request");
+        assert!(hooks[0].needs_review());
+        assert_eq!(snake("stop"), "stop");
+    }
+
+    #[test]
+    fn the_report_says_what_was_carried_and_what_was_left() {
+        assert_eq!(Prepared::default().note(), None);
+        let note = Prepared {
+            copied: 6,
+            left: vec!["my-hook".into()],
+        }
+        .note()
+        .unwrap();
+        assert!(note.contains("carried over the trust of 6"), "{note}");
+        assert!(note.contains("will ask for review: my-hook"), "{note}");
     }
 
     /// Against the real Codex app-server (`TEND_TEST_CODEX=<codex>`): a
@@ -558,7 +798,7 @@ mod tests {
         let cwd = work.to_str().unwrap();
         // Trust it under `a`, the way a person answering the menu would.
         let mut server = AppServer::open(&codex, &a).unwrap();
-        let hook = list_hooks(&mut server, cwd).unwrap().remove(0);
+        let hook = server.hooks(cwd).unwrap().remove(0);
         assert!(hook.needs_review());
         server
             .call(
@@ -569,15 +809,17 @@ mod tests {
             .unwrap();
         drop(server);
         let homes = [a.clone(), b.clone()];
+        // `b` is fixable only because `a`'s own hook is trusted.
+        let audits = audit(&codex, &homes, cwd);
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].result, Ok((1, 0)));
         // `b` shares the file but not the key: carried over once, then trusted.
         let prepared = prepare(&codex, &b, cwd, &homes).unwrap();
         assert_eq!(prepared.copied, 1, "{prepared:?}");
-        let mut server = AppServer::open(&codex, &b).unwrap();
-        assert!(list_hooks(&mut server, cwd)
+        assert!(list_hooks(&codex, &b, cwd)
             .unwrap()
             .iter()
             .all(|h| !h.needs_review()));
-        drop(server);
         assert!(std::fs::symlink_metadata(b.join("config.toml"))
             .unwrap()
             .file_type()
@@ -586,100 +828,6 @@ mod tests {
             prepare(&codex, &b, cwd, &homes).unwrap(),
             Prepared::default()
         );
-    }
-
-    #[test]
-    fn trust_is_carried_only_from_an_identical_trusted_hook() {
-        let target = "/p/codex-b_codex/config.toml:stop:0:0";
-        let hooks = [hook(target, "stop", "modified")];
-        // Trusted under ~/.codex with the current hash: carried over.
-        let (copies, left) = plan(&hooks, &[trusted("/h/.codex/config.toml:stop:0:0", H)]);
-        assert_eq!(copies, [trusted(target, H)]);
-        assert!(left.is_empty());
-        // Only an old definition was ever trusted: left for the user.
-        let (copies, left) = plan(&hooks, &[trusted("/h/.codex/config.toml:stop:0:0", OLD)]);
-        assert!(copies.is_empty());
-        assert_eq!(left.len(), 1);
-        // The same hash for another event does not vouch for this one.
-        let (copies, _) = plan(
-            &hooks,
-            &[trusted("/h/.codex/config.toml:session_start:0:0", H)],
-        );
-        assert!(copies.is_empty());
-        // Its own stale entry is not a vouch either.
-        let (copies, _) = plan(&hooks, &[trusted(target, OLD)]);
-        assert!(copies.is_empty());
-        // A trusted hook needs nothing; a project hook is never vouched for.
-        assert_eq!(
-            plan(&[hook(target, "stop", "trusted")], &[]),
-            (vec![], vec![])
-        );
-        let mut project = hook(target, "stop", "untrusted");
-        project.source = "project".into();
-        let (copies, left) = plan(&[project], &[trusted("/h/.codex/config.toml:stop:0:0", H)]);
-        assert!(copies.is_empty());
-        assert_eq!(left.len(), 1);
-    }
-
-    #[test]
-    fn a_keys_event_is_its_third_segment_from_the_end() {
-        assert_eq!(
-            key_event("/a b/c:d/config.toml:permission_request:0:0"),
-            Some("permission_request")
-        );
-        assert_eq!(key_event("stop:0"), None);
-        assert_eq!(snake("permissionRequest"), "permission_request");
-        assert_eq!(snake("stop"), "stop");
-    }
-
-    #[test]
-    fn trust_entries_are_read_from_hooks_state() {
-        let config = format!(
-            r#"
-model = "x"
-[[hooks.Stop]]
-hooks = [{{ type = "command", command = "tend hook codex --event stop" }}]
-
-[hooks.state."/h/.codex/config.toml:stop:0:0"]
-trusted_hash = "{H}"
-
-[hooks.state."/p/x/config.toml:stop:0:0"]
-enabled = false
-"#
-        );
-        assert_eq!(
-            trusted_in(&config),
-            [trusted("/h/.codex/config.toml:stop:0:0", H)]
-        );
-        assert!(trusted_in("not = [toml").is_empty());
-    }
-
-    #[test]
-    fn hooks_list_results_are_read() {
-        let result = serde_json::json!({"data": [{"cwd": "/w", "hooks": [{
-            "key": "/p/b/config.toml:permission_request:0:0",
-            "eventName": "permissionRequest",
-            "command": "tend hook codex --event permission_request",
-            "currentHash": H,
-            "trustStatus": "untrusted",
-            "source": "user"
-        }], "warnings": [], "errors": []}]});
-        let hooks = parse_hooks(&result);
-        assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].event, "permission_request");
-        assert!(hooks[0].needs_review());
-    }
-
-    #[test]
-    fn the_report_says_what_was_carried_and_what_was_left() {
-        assert_eq!(Prepared::default().note(), None);
-        let note = Prepared {
-            copied: 6,
-            left: vec!["my-hook".into()],
-        }
-        .note()
-        .unwrap();
-        assert!(note.contains("carried over the trust of 6"), "{note}");
-        assert!(note.contains("will ask for review: my-hook"), "{note}");
+        assert!(audit(&codex, &homes, cwd).is_empty());
     }
 }
