@@ -1,6 +1,9 @@
-//! Supervision of the CLI worker that applies durable pipeline state.
+//! Supervision of the worker that applies durable pipeline state.
 //!
 //! The worker uses the same claim/adoption path as interactive `work up`.
+//! It runs in-process (`tend_work::work_up::run_reconcile`, as `tend work
+//! reconcile --all` does) unless `TEND_PIPELINE_CLI` names a program or
+//! `TEND_RECONCILE_CHILD=1` asks for the `tend` child it used to be.
 //! Stopping this supervisor must stop the worker, not the agents it already
 //! launched in tmux. The store and the next reconciliation recover those panes.
 
@@ -19,28 +22,52 @@ const LIMITS: WorkCommandLimits = WorkCommandLimits {
     max_output_bytes: 64 * 1024,
 };
 
+/// What applies a reconcile pass.
+#[derive(Debug, Clone)]
+pub(super) enum Worker {
+    /// `tend_work` inside tendd.
+    InProcess,
+    /// A `tend work reconcile --all` child.
+    Child(PathBuf),
+}
+
+impl std::fmt::Display for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InProcess => f.write_str("in-process"),
+            Self::Child(program) => write!(f, "{}", program.display()),
+        }
+    }
+}
+
+fn worker() -> Worker {
+    if let Some(program) = std::env::var_os("TEND_PIPELINE_CLI").filter(|v| !v.is_empty()) {
+        return Worker::Child(PathBuf::from(program));
+    }
+    if std::env::var_os("TEND_RECONCILE_CHILD").is_some_and(|v| !v.is_empty() && v != "0") {
+        return Worker::Child(
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.with_file_name("tend"))
+                .filter(|path| path.exists())
+                .unwrap_or_else(|| PathBuf::from("tend")),
+        );
+    }
+    Worker::InProcess
+}
+
 pub(super) fn spawn(
     runs: Arc<PipelineRunStore>,
     socket: PathBuf,
     shutdown: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
-    let program = std::env::var_os("TEND_PIPELINE_CLI").map_or_else(
-        || {
-            std::env::current_exe()
-                .ok()
-                .map(|path| path.with_file_name("tend"))
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| PathBuf::from("tend"))
-        },
-        PathBuf::from,
-    );
     let shutdown = shutdown.subscribe();
-    tokio::spawn(supervise(runs, program, socket, shutdown, LIMITS))
+    tokio::spawn(supervise(runs, worker(), socket, shutdown, LIMITS))
 }
 
 async fn supervise(
     runs: Arc<PipelineRunStore>,
-    program: PathBuf,
+    worker: Worker,
     socket: PathBuf,
     mut shutdown: broadcast::Receiver<()>,
     limits: WorkCommandLimits,
@@ -53,7 +80,7 @@ async fn supervise(
     loop {
         let pass = async {
             if runs.has_ready_alias().await {
-                reconcile(&program, &socket, limits).await
+                reconcile(&worker, &socket, limits).await
             } else {
                 Ok(())
             }
@@ -64,7 +91,7 @@ async fn supervise(
             result = pass => result,
         };
         if let Err(error) = result {
-            tracing::warn!(program = %program.display(), %error, "pipeline reconcile failed");
+            tracing::warn!(%worker, %error, "pipeline reconcile failed");
             // Claims can notify us while the worker is failing. Neither those
             // revisions nor an overdue safety tick may bypass failure backoff.
             tokio::select! {
@@ -88,10 +115,14 @@ async fn supervise(
 }
 
 async fn reconcile(
-    program: &std::path::Path,
+    worker: &Worker,
     socket: &std::path::Path,
     limits: WorkCommandLimits,
 ) -> Result<(), WorkCommandError> {
+    let program = match worker {
+        Worker::InProcess => return reconcile_in_process(socket, limits).await,
+        Worker::Child(program) => program,
+    };
     let output = execute_work_command(
         program,
         &["work".into(), "reconcile".into(), "--all".into()],
@@ -110,6 +141,64 @@ async fn reconcile(
     }
     tracing::debug!(program = %program.display(), "pipeline reconcile completed");
     Ok(())
+}
+
+/// `tend work reconcile --all` inside tendd, with what the child had: the
+/// CLI's config (`TEND_CONFIG`, else the default), a client on this daemon's
+/// socket, and for every git/tmux/`prepare` process a closed stdin,
+/// `TEND_SOCKET` and the child's deadline (`tend_work::subprocess`).
+/// Dropping the future (the supervisor shutting down) cancels the scope,
+/// which kills the running command and refuses the next, as the child used
+/// to be killed on drop.
+async fn reconcile_in_process(
+    socket: &std::path::Path,
+    limits: WorkCommandLimits,
+) -> Result<(), WorkCommandError> {
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let config_path = crate::work_up_in_process::cli_config_path(
+        std::env::var_os("TEND_CONFIG"),
+        tend::paths::default_config_file(),
+    );
+    let config = tend::Config::load_or_default(config_path.as_deref())
+        .map_err(|error| WorkCommandError::Failed(format!("pipeline reconcile config: {error}")))?;
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancel.clone());
+    let scope = tend_work::subprocess::Scope {
+        socket: socket.to_path_buf(),
+        deadline: std::time::Instant::now() + limits.timeout,
+        cancel: Some(cancel),
+    };
+    let socket = socket.to_path_buf();
+    let work = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| WorkCommandError::Failed(format!("reconcile runtime: {error}")))?;
+        tend_work::subprocess::with_scope(scope, || {
+            runtime.block_on(async move {
+                let client = tend::ipc::Client::new(socket);
+                let args = tend_work::work_up::ReconcileArgs {
+                    all: true,
+                    workspace: None,
+                    work: None,
+                };
+                tend_work::work_up::run_reconcile(args, &client, &config)
+                    .await
+                    .map_err(|error| {
+                        WorkCommandError::Failed(format!("pipeline reconcile: {error:#}"))
+                    })
+            })
+        })
+    });
+    match work.await {
+        Ok(result) => result,
+        Err(error) => Err(WorkCommandError::Failed(format!("reconcile task: {error}"))),
+    }
 }
 
 #[cfg(test)]
@@ -196,7 +285,9 @@ mod tests {
             dir.path(),
             "test \"$*\" = 'work reconcile --all' || exit 2\nread unexpected && exit 3\nprintf '%s' \"$TEND_SOCKET\" > \"$TEND_SOCKET.started\"",
         );
-        reconcile(&binary, &socket, LIMITS).await.unwrap();
+        reconcile(&Worker::Child(binary), &socket, LIMITS)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(socket.with_extension("started")).unwrap(),
             socket.to_str().unwrap()
@@ -212,7 +303,7 @@ mod tests {
             "printf '%s' \"$$\" > \"$TEND_SOCKET.started\"\nexec sleep 60",
         );
         let result = reconcile(
-            &binary,
+            &Worker::Child(binary),
             &socket,
             WorkCommandLimits {
                 timeout: Duration::from_secs(1),
@@ -238,7 +329,7 @@ mod tests {
         let (shutdown, _) = broadcast::channel(1);
         let task = tokio::spawn(supervise(
             runs,
-            binary,
+            Worker::Child(binary),
             socket.clone(),
             shutdown.subscribe(),
             LIMITS,
@@ -262,7 +353,14 @@ mod tests {
         let (shutdown, _) = broadcast::channel(1);
         let receiver = shutdown.subscribe();
         shutdown.send(()).unwrap();
-        supervise(runs, binary, socket.clone(), receiver, LIMITS).await;
+        supervise(
+            runs,
+            Worker::Child(binary),
+            socket.clone(),
+            receiver,
+            LIMITS,
+        )
+        .await;
         assert!(!socket.with_extension("started").exists());
     }
 
@@ -279,7 +377,7 @@ mod tests {
         let (shutdown, _) = broadcast::channel(1);
         let task = tokio::spawn(supervise(
             runs.clone(),
-            binary,
+            Worker::Child(binary),
             socket.clone(),
             shutdown.subscribe(),
             LIMITS,
@@ -306,7 +404,7 @@ mod tests {
         let socket = dir.path().join("socket");
         let binary = script(dir.path(), "printf '0123456789abcdef'");
         let result = reconcile(
-            &binary,
+            &Worker::Child(binary),
             &socket,
             WorkCommandLimits {
                 max_output_bytes: 8,
@@ -319,7 +417,9 @@ mod tests {
             Err(WorkCommandError::OutputTooLarge { .. })
         ));
         let binary = script(dir.path(), "echo 'cannot connect' >&2\nexit 7");
-        let error = reconcile(&binary, &socket, LIMITS).await.unwrap_err();
+        let error = reconcile(&Worker::Child(binary), &socket, LIMITS)
+            .await
+            .unwrap_err();
         assert!(matches!(&error, WorkCommandError::Failed(_)));
         assert_eq!(
             error.to_string(),

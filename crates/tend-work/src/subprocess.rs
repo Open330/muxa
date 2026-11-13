@@ -29,6 +29,29 @@ pub struct Scope {
     pub socket: PathBuf,
     /// When the operation's time is up.
     pub deadline: Instant,
+    /// Set when the operation is abandoned (tendd shutting down): the
+    /// running command is killed and no further one starts, as when the
+    /// `tend` child used to be killed.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Scope {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Time left, or `None` once the deadline passed or the scope was
+    /// cancelled.
+    fn remaining(&self) -> Option<Duration> {
+        if self.cancelled() {
+            return None;
+        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    }
 }
 
 thread_local! {
@@ -60,27 +83,13 @@ fn current() -> Option<Scope> {
 /// one, so none of them starts after the deadline.
 pub fn ensure_time_left() -> io::Result<()> {
     match current() {
-        Some(scope) => {
-            if scope
-                .deadline
-                .checked_duration_since(Instant::now())
-                .is_some_and(|left| !left.is_zero())
-            {
-                Ok(())
-            } else {
-                Err(timed_out())
-            }
-        }
-        None => Ok(()),
+        Some(scope) if scope.remaining().is_none() => Err(timed_out()),
+        _ => Ok(()),
     }
 }
 
-fn prepare(command: &mut Command, scope: &Scope) -> io::Result<Duration> {
-    let remaining = scope
-        .deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero())
-        .ok_or_else(timed_out)?;
+fn prepare(command: &mut Command, scope: &Scope) -> io::Result<()> {
+    scope.remaining().ok_or_else(timed_out)?;
     command
         .stdin(Stdio::null())
         .env("TEND_SOCKET", &scope.socket);
@@ -89,16 +98,13 @@ fn prepare(command: &mut Command, scope: &Scope) -> io::Result<Duration> {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    Ok(remaining)
+    Ok(())
 }
 
 fn timed_out() -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
-        format!(
-            "work up exceeded {}s and was stopped",
-            tend::work_control::WORK_UP_TIMEOUT.as_secs()
-        ),
+        "stopped: the operation ran out of time, or tendd is shutting down",
     )
 }
 
@@ -123,13 +129,12 @@ fn kill(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn wait(child: &mut std::process::Child, remaining: Duration) -> io::Result<ExitStatus> {
-    let started = Instant::now();
+fn wait(child: &mut std::process::Child, scope: &Scope) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if started.elapsed() >= remaining {
+        if scope.remaining().is_none() {
             kill(child);
             return Err(timed_out());
         }
@@ -142,7 +147,7 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     let Some(scope) = current() else {
         return command.output();
     };
-    let remaining = prepare(command, &scope)?;
+    prepare(command, &scope)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let drain = |pipe: Option<Box<dyn io::Read + Send>>| {
@@ -156,15 +161,14 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
-    let started = Instant::now();
-    let status = wait(&mut child, remaining)?;
+    let status = wait(&mut child, &scope)?;
     // A descendant can keep the pipes open after the command itself exits,
     // even one that left the process group (`setsid`), which killing the
     // group cannot reach. The deadline covers reading them to the end too:
     // past it the group is killed and the readers are left behind (they end
     // when the last holder closes the pipe) rather than waited on.
     while !(stdout.is_finished() && stderr.is_finished()) {
-        if started.elapsed() >= remaining {
+        if scope.remaining().is_none() {
             kill_group(child.id());
             return Err(timed_out());
         }
@@ -183,9 +187,9 @@ pub fn status(command: &mut Command) -> io::Result<ExitStatus> {
     let Some(scope) = current() else {
         return command.status();
     };
-    let remaining = prepare(command, &scope)?;
+    prepare(command, &scope)?;
     let mut child = command.spawn()?;
-    wait(&mut child, remaining)
+    wait(&mut child, &scope)
 }
 
 #[cfg(all(test, unix))]
@@ -196,6 +200,7 @@ mod tests {
         Scope {
             socket: socket.into(),
             deadline: Instant::now() + left,
+            cancel: None,
         }
     }
 
@@ -273,6 +278,34 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn cancelling_kills_the_running_command_and_refuses_the_next() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = Scope {
+            socket: "/s".into(),
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: Some(flag.clone()),
+        };
+        let setter = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let started = Instant::now();
+        let (running, next) = with_scope(scope, || {
+            (
+                status(&mut sh("sleep 30")).unwrap_err(),
+                ensure_time_left().unwrap_err(),
+            )
+        });
+        setter.join().unwrap();
+        assert_eq!(running.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(next.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

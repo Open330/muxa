@@ -74,8 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same as before. What changes: a daemon and CLI mid-upgrade no longer
   disagree about Work, errors carry their real cause rather than a stderr
   line, and a `tend` binary missing next to tendd no longer breaks it.
-  `TEND_WORK_UP_CHILD=1` brings back the CLI child. Reconcile, agent start,
-  snapshot restore and Fleet commands still use the child for now (see
+  `TEND_WORK_UP_CHILD=1` brings back the CLI child.
+- tendd also launches pipeline agents whose dependencies just finished
+  (`tend work reconcile --all`) itself, instead of starting the `tend` CLI.
+  `TEND_RECONCILE_CHILD=1` brings back the child; `TEND_PIPELINE_CLI` still
+  names a program to run instead. Agent start, snapshot restore and Fleet
+  commands still use the child for now (see
   `docs/proposals/WORK_IN_CORE.md`).
 - Account swap binds the conversation it resumes from the provider's own
   record for the exact process on macOS and for Codex too, not only for
