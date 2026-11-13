@@ -31,20 +31,6 @@
     {
       "builtin": true,
       "configured": false,
-      "credential_env": "GEMINI_API_KEY",
-      "credential_present": false,
-      "credential_required": false,
-      "engine": "gemini",
-      "executable": "gemini",
-      "id": "gemini",
-      "kind": "cli",
-      "model": null,
-      "selected": false,
-      "title": "Gemini CLI"
-    },
-    {
-      "builtin": true,
-      "configured": false,
       "credential_env": "ANTHROPIC_API_KEY",
       "credential_present": false,
       "credential_required": true,
