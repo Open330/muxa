@@ -231,15 +231,22 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             match parsed {
                 Ok(Some(ev)) => {
                     let ev = place.bind(ev);
-                    best_effort_ingest(client, &ev).await;
-                    best_effort_default_alias(client, &ev).await;
                     // Only the plugin knows a turn ended cleanly; asking
                     // tendd after Esc or a failure would spend the
                     // request's limited Stop offers on output it discards.
-                    if tend::adapters::opencode::is_turn_boundary(&text) {
-                        if let Some(output) = opencode_turn_delivery(client, &ev).await {
-                            println!("{output}");
-                        }
+                    // At that boundary the offers are asked for before the
+                    // idle is recorded, as `ingest_and_deliver` does at a
+                    // Claude/Codex Stop, so the waker cannot type a wake for
+                    // the same request first.
+                    let output = if tend::adapters::opencode::is_turn_boundary(&text) {
+                        opencode_turn_delivery(client, &ev).await
+                    } else {
+                        None
+                    };
+                    best_effort_ingest(client, &ev).await;
+                    best_effort_default_alias(client, &ev).await;
+                    if let Some(output) = output {
+                        println!("{output}");
                     }
                 }
                 Ok(None) => {}
