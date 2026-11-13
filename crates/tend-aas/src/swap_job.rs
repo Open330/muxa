@@ -363,6 +363,10 @@ pub(crate) enum Observation {
     FollowUpEvidence {
         kept: bool,
         evidence: TurnEvidence,
+        /// Whether the hook for the registered prompt came back; absent
+        /// when none was registered (and in journals written before it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<bool>,
     },
 }
 
@@ -516,6 +520,7 @@ fn follow_up_from_effects(
         kept: purpose == "kept_follow_up",
         submission: submission.to_string(),
         evidence: None,
+        receipt: None,
     }))
 }
 
@@ -530,17 +535,19 @@ fn follow_up_status(
     let Some(Observation::FollowUpSent { kept, submission }) = parse(sent) else {
         return None;
     };
-    let evidence = match parse(evidence) {
+    let (evidence, receipt) = match parse(evidence) {
         Some(Observation::FollowUpEvidence {
             kept: evidence_kept,
             evidence,
-        }) if evidence_kept == kept => Some(evidence.to_string()),
-        _ => None,
+            receipt,
+        }) if evidence_kept == kept => (Some(evidence.to_string()), receipt),
+        _ => (None, None),
     };
     Some(crate::account_swap::FollowUpReport {
         kept,
         submission: submission.to_string(),
         evidence,
+        receipt,
     })
 }
 

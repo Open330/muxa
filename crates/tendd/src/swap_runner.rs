@@ -61,9 +61,14 @@ pub(crate) async fn open_swap_service(
     collaboration: Arc<CollaborationStore>,
 ) -> Result<Arc<DaemonSwap>, String> {
     let runtime = tokio::runtime::Handle::current();
-    let receipts = Arc::new(tend_aas::swap_service::PromptReceipts::new(
-        store.prompt_sequence(),
-    ));
+    let receipts = Arc::new(
+        tend_aas::swap_service::PromptReceipts::new(store.prompt_sequence()).with_registry(
+            Arc::new(StoreRegistry {
+                runtime: runtime.clone(),
+                store: Arc::clone(&store),
+            }),
+        ),
+    );
     spawn_prompt_receipts(&store, Arc::clone(&receipts));
     let opened = tokio::task::spawn_blocking(move || {
         let path = paths::default_node_id_file().ok_or("no data directory for the node id")?;
@@ -265,6 +270,34 @@ pub(crate) fn spawn_prompt_receipts(
             }
         }
     });
+}
+
+/// The store's expected-prompt registry, lent to the swap executor: the
+/// follow-up is registered (as `tend`'s own) before it is typed, as every
+/// guarded delivery is, and forgotten if it was not submitted.
+struct StoreRegistry {
+    runtime: tokio::runtime::Handle,
+    store: tend::SharedStore,
+}
+
+impl tend_aas::swap_service::PromptRegistry for StoreRegistry {
+    fn expect(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64> {
+        // Called from the swap executor's own thread, never the reactor.
+        self.runtime.block_on(self.store.expect_prompt(
+            pane,
+            socket,
+            text,
+            tend::state::PromptOrigin::Tend,
+        ))
+    }
+
+    fn forget(&self, token: u64) {
+        self.store.forget_expected_prompt(token);
+    }
+
+    fn consumed(&self, token: u64) -> bool {
+        self.store.expected_prompt_consumed(token)
+    }
 }
 
 /// What the swap service reads of the daemon. Its methods block on the

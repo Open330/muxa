@@ -151,6 +151,18 @@ pub struct PromptReceipts {
     /// The store's own count of accepted prompt hooks: the cursor.
     source: Arc<std::sync::atomic::AtomicU64>,
     seen: Mutex<std::collections::VecDeque<Receipt>>,
+    /// The daemon's expected-prompt registry, when it lends one.
+    registry: Option<Arc<dyn PromptRegistry>>,
+}
+
+/// The daemon's expected-prompt registry (`Store::expect_prompt`): the
+/// guarded prompt path registers each prompt before typing it, so the hook
+/// that reports it is attributed to tend.
+pub trait PromptRegistry: Send + Sync {
+    fn expect(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64>;
+    fn forget(&self, token: u64);
+    /// Whether a hook consumed `token` (`Store::expected_prompt_consumed`).
+    fn consumed(&self, token: u64) -> bool;
 }
 
 struct Receipt {
@@ -189,7 +201,15 @@ impl PromptReceipts {
         Self {
             source,
             seen: Mutex::new(std::collections::VecDeque::new()),
+            registry: None,
         }
+    }
+
+    /// The same, registering follow-ups with the daemon's `registry`.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<dyn PromptRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Note one prompt hook, by who sent it and from where, under the number
@@ -233,6 +253,22 @@ impl account_swap::TurnProbe for PromptReceipts {
                     && receipt.endpoint == endpoint
             })
         })
+    }
+
+    fn expect_prompt(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64> {
+        self.registry.as_ref()?.expect(pane, socket, text)
+    }
+
+    fn forget_prompt(&self, token: u64) {
+        if let Some(registry) = &self.registry {
+            registry.forget(token);
+        }
+    }
+
+    fn registration_consumed(&self, token: u64) -> bool {
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| registry.consumed(token))
     }
 }
 

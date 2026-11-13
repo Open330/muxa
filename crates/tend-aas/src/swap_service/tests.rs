@@ -1593,6 +1593,48 @@ fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
     assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
 }
 
+/// tend's receipt is the store consuming this very registration: another
+/// registration's hook (an earlier tend prompt arriving late) is not it,
+/// and neither is a registration that was forgotten or expired.
+#[test]
+fn a_receipt_is_the_consumption_of_this_registration() {
+    use crate::account_swap::TurnProbe as _;
+    struct Registry {
+        next: std::sync::atomic::AtomicU64,
+        consumed: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    }
+    impl PromptRegistry for Registry {
+        fn expect(&self, _pane: &str, _socket: Option<&str>, _text: &str) -> Option<u64> {
+            Some(self.next.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        fn forget(&self, _token: u64) {}
+        fn consumed(&self, token: u64) -> bool {
+            self.consumed.lock().unwrap().contains(&token)
+        }
+    }
+    let registry = Arc::new(Registry {
+        next: std::sync::atomic::AtomicU64::new(0),
+        consumed: std::sync::Mutex::default(),
+    });
+    let receipts = PromptReceipts::new(Arc::default()).with_registry(registry.clone());
+    let earlier = receipts
+        .expect_prompt("%1", None, "earlier prompt")
+        .unwrap();
+    let ours = receipts.expect_prompt("%1", None, "continue").unwrap();
+    // Forgotten or expired: nothing consumed it.
+    receipts.forget_prompt(ours);
+    assert!(!receipts.registration_consumed(ours));
+    // The earlier prompt's hook arrives late and consumes its own token.
+    registry.consumed.lock().unwrap().insert(earlier);
+    assert!(receipts.registration_consumed(earlier));
+    assert!(!receipts.registration_consumed(ours));
+    registry.consumed.lock().unwrap().insert(ours);
+    assert!(receipts.registration_consumed(ours));
+    let bare = PromptReceipts::new(Arc::default());
+    assert_eq!(bare.expect_prompt("%1", None, "x"), None);
+    assert!(!bare.registration_consumed(1));
+}
+
 // --- cancel ------------------------------------------------------------------
 
 fn gated(pane: &str, gate: &Arc<Gate>) -> EngineStep<FakeTarget> {

@@ -1400,6 +1400,23 @@ pub trait TurnProbe: Send + Sync {
         conversation: &str,
         endpoint: &str,
     ) -> bool;
+    /// Register `text` as the prompt tend is about to type into `pane`, the
+    /// way every guarded delivery does, so its hook is attributed to tend.
+    /// `None`: nothing could be registered (not exactly one row there).
+    fn expect_prompt(&self, pane: &str, socket: Option<&str>, text: &str) -> Option<u64> {
+        let _ = (pane, socket, text);
+        None
+    }
+    /// Drop a registration whose prompt was not submitted.
+    fn forget_prompt(&self, token: u64) {
+        let _ = token;
+    }
+    /// Whether a hook consumed the registration `token` (the store matched
+    /// it to that very prompt: session, pane, exact text, after it was made).
+    fn registration_consumed(&self, token: u64) -> bool {
+        let _ = token;
+        false
+    }
 }
 
 /// One entry of a prepared swap, in report order: an outcome already
@@ -2049,11 +2066,15 @@ fn follow_up_report(observations: &[Observation]) -> Option<FollowUpReport> {
                     kept: *kept,
                     submission: submission.to_string(),
                     evidence: None,
+                    receipt: None,
                 });
             }
-            Observation::FollowUpEvidence { evidence, .. } => {
+            Observation::FollowUpEvidence {
+                evidence, receipt, ..
+            } => {
                 if let Some(report) = &mut report {
                     report.evidence = Some(evidence.to_string());
+                    report.receipt = *receipt;
                 }
             }
             _ => {}
@@ -3359,20 +3380,42 @@ fn follow_up_with_evidence(
 ) -> Option<(Submission, TurnEvidence)> {
     let io = runner.io;
     let cursor = io.prompt_cursor();
+    // Registered before typing, like every guarded delivery: the hook that
+    // reports this prompt is then tend's own receipt for it.
+    let token = io.expect_prompt(text);
     let group = runner.group();
     let _ = runner.send_prompt(group, purpose, text) && {
         io.sleep(io.submit_grace());
         runner.send_text(group, purpose, "\r")
     };
     let submission = submission_of(&runner.log(), group);
+    if let Some(token) = token.filter(|_| submission != Submission::Delivered) {
+        io.forget_prompt(token);
+    }
+    let registered = token.is_some() && submission == Submission::Delivered;
+    let mut receipt = registered.then_some(false);
     if !runner.observe(Observation::FollowUpSent { kept, submission }) {
         return None;
     }
     let started = io.now();
     let mut screen_since = None;
+    let mut hook_since = None;
     let evidence = loop {
+        // The registration consumed: the store matched a hook to this very
+        // prompt. That is tend's receipt.
+        if let Some(token) = token.filter(|_| registered) {
+            if io.registration_consumed(token) {
+                receipt = Some(true);
+                break TurnEvidence::PromptHook;
+            }
+        }
         if cursor.is_some_and(|cursor| io.prompt_seen_after(cursor)) {
-            break TurnEvidence::PromptHook;
+            // Another prompt of the conversation: still a prompt hook. A
+            // registered one waits a moment for its own.
+            let since = *hook_since.get_or_insert(io.now());
+            if !registered || io.now().saturating_duration_since(since) >= HOOK_GRACE {
+                break TurnEvidence::PromptHook;
+            }
         }
         let now = io.now();
         if screen_since.is_none() && io.capture().is_some_and(|screen| turn_running(&screen)) {
@@ -3381,15 +3424,29 @@ fn follow_up_with_evidence(
         let waited = now.saturating_duration_since(started);
         let grace_over =
             screen_since.is_some_and(|since| now.saturating_duration_since(since) >= HOOK_GRACE);
+        // A prompt hook already seen outranks the screen whatever ends the
+        // wait: only the stronger receipt was still being waited for.
         if grace_over || (waited >= FOLLOW_UP_WAIT && screen_since.is_some()) {
-            break TurnEvidence::ScreenActivity;
+            break if hook_since.is_some() {
+                TurnEvidence::PromptHook
+            } else {
+                TurnEvidence::ScreenActivity
+            };
         }
         if waited >= FOLLOW_UP_WAIT {
-            break TurnEvidence::NoneSeen;
+            break if hook_since.is_some() {
+                TurnEvidence::PromptHook
+            } else {
+                TurnEvidence::NoneSeen
+            };
         }
         io.sleep(Duration::from_millis(400));
     };
-    if !runner.observe(Observation::FollowUpEvidence { kept, evidence }) {
+    if !runner.observe(Observation::FollowUpEvidence {
+        kept,
+        evidence,
+        receipt,
+    }) {
         return None;
     }
     Some((submission, evidence))

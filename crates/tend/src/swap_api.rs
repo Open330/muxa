@@ -229,6 +229,12 @@ pub struct FollowUpReport {
     /// never) the wait for it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Whether a prompt hook came back for the very prompt tend registered
+    /// before typing it (that conversation, pane and exact text): `true`
+    /// matched, `false` none did within the wait. Absent when nothing could
+    /// be registered (no daemon, or not exactly one row on the pane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<bool>,
 }
 
 /// The evidence a swap resumed a conversation by.

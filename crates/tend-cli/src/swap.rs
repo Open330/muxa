@@ -1654,13 +1654,18 @@ fn render(outcomes: &[SwapOutcome]) -> String {
         {
             let _ = writeln!(
                 out,
-                "         follow-up{}: {}; {}",
+                "         follow-up{}: {}; {}{}",
                 if report.kept { " (kept session)" } else { "" },
                 report.submission,
                 report
                     .evidence
                     .as_deref()
-                    .unwrap_or("evidence not recorded")
+                    .unwrap_or("evidence not recorded"),
+                match report.receipt {
+                    Some(true) => " (tend's receipt)",
+                    Some(false) => " (no receipt for tend's registration)",
+                    None => "",
+                }
             );
         }
         if let Some(reason) = outcome
@@ -1980,10 +1985,11 @@ mod tests {
             kept: false,
             submission: "delivered".into(),
             evidence: Some("prompt_hook".into()),
+            receipt: Some(true),
         });
         let shown = render(&[entry_outcome(&entry)]);
         assert!(
-            shown.contains("follow-up: delivered; prompt_hook"),
+            shown.contains("follow-up: delivered; prompt_hook (tend's receipt)"),
             "{shown}"
         );
         entry.follow_up = None;

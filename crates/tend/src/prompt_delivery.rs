@@ -476,6 +476,41 @@ mod tests {
             .is_none());
     }
 
+    /// A registration is consumed only by the hook for its own prompt;
+    /// another registration's hook, or a forget, does not consume it.
+    #[tokio::test]
+    async fn a_registration_is_pending_until_its_own_hook() {
+        use crate::PromptOrigin;
+        let store = Store::shared();
+        start(&store).await;
+        let earlier = store
+            .expect_prompt("rmux:%7", Some("/test.sock"), "earlier", PromptOrigin::Tend)
+            .await
+            .unwrap();
+        let ours = store
+            .expect_prompt(
+                "rmux:%7",
+                Some("/test.sock"),
+                "continue",
+                PromptOrigin::Tend,
+            )
+            .await
+            .unwrap();
+        assert!(!store.expected_prompt_consumed(earlier) && !store.expected_prompt_consumed(ours));
+        submit(&store, "original", "/test.sock", "earlier").await;
+        assert!(store.expected_prompt_consumed(earlier));
+        assert!(!store.expected_prompt_consumed(ours));
+        submit(&store, "original", "/test.sock", "continue").await;
+        assert!(store.expected_prompt_consumed(ours));
+        // Forgotten (or expired) is not consumed.
+        let dropped = store
+            .expect_prompt("rmux:%7", Some("/test.sock"), "never", PromptOrigin::Tend)
+            .await
+            .unwrap();
+        store.forget_expected_prompt(dropped);
+        assert!(!store.expected_prompt_consumed(dropped));
+    }
+
     #[tokio::test]
     async fn cancelling_one_delivery_leaves_another_endpoints_alone() {
         use crate::PromptOrigin;

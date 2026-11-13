@@ -52,6 +52,12 @@ struct FakeIo {
     shell_cwd: RefCell<Option<super::io::ShellCwd>>,
     /// The line each respawn was given.
     respawned: RefCell<Vec<String>>,
+    /// Whether a follow-up can be registered with the daemon, the tokens
+    /// forgotten again, and whether the hook that comes back is the one
+    /// registered.
+    registers: Cell<bool>,
+    forgotten: RefCell<Vec<u64>>,
+    hook_is_registered: Cell<bool>,
 }
 
 impl FakeIo {
@@ -82,6 +88,9 @@ impl FakeIo {
             digests: RefCell::new(HashMap::new()),
             shell_cwd: RefCell::new(None),
             respawned: RefCell::new(Vec::new()),
+            registers: Cell::new(false),
+            forgotten: RefCell::new(Vec::new()),
+            hook_is_registered: Cell::new(false),
         }
     }
 
@@ -219,6 +228,19 @@ impl SwapIo for FakeIo {
 
     fn submit_grace(&self) -> Duration {
         Duration::from_millis(100)
+    }
+
+    fn expect_prompt(&self, _text: &str) -> Option<u64> {
+        self.registers.get().then_some(7)
+    }
+
+    fn forget_prompt(&self, token: u64) {
+        self.forgotten.borrow_mut().push(token);
+    }
+
+    fn registration_consumed(&self, _token: u64) -> bool {
+        let now = self.now.get();
+        self.hook_is_registered.get() && self.hooks.borrow().iter().any(|at| *at <= now)
     }
 }
 
@@ -699,6 +721,7 @@ fn a_swap_reports_what_it_saw_in_order() {
             Observation::FollowUpEvidence {
                 kept: false,
                 evidence: TurnEvidence::ScreenActivity,
+                receipt: None,
             },
         ]
     );
@@ -1174,7 +1197,8 @@ fn a_prompt_hook_during_the_enter_is_the_evidence() {
             },
             Observation::FollowUpEvidence {
                 kept: false,
-                evidence: TurnEvidence::PromptHook
+                evidence: TurnEvidence::PromptHook,
+                receipt: None,
             },
         ]
     );
@@ -1194,7 +1218,8 @@ fn a_stale_hook_or_no_probe_is_no_hook_evidence() {
     assert!(
         evidence_of(&observations).contains(&Observation::FollowUpEvidence {
             kept: false,
-            evidence: TurnEvidence::NoneSeen
+            evidence: TurnEvidence::NoneSeen,
+            receipt: None,
         })
     );
     // No probe: a fresh hook cannot be read, the screen's activity can.
@@ -1265,7 +1290,8 @@ fn a_refused_enter_with_a_hook_after_it_is_not_resent() {
             },
             Observation::FollowUpEvidence {
                 kept: false,
-                evidence: TurnEvidence::PromptHook
+                evidence: TurnEvidence::PromptHook,
+                receipt: None,
             },
         ]
     );
@@ -1742,4 +1768,113 @@ fn a_typed_relaunch_carries_its_launch_id() {
             "text \"\\r\"",
         ]
     );
+}
+
+/// A follow-up registered with the daemon before it is typed: the hook that
+/// reports it is tend's receipt for it, and one that is not still counts as
+/// a prompt hook, as before.
+#[test]
+fn a_registered_follow_up_reports_its_receipt() {
+    for registered_hook in [true, false] {
+        let io = FakeIo::new(CODEX_IDLE, codex_with_hook(CODEX_IDLE));
+        io.probe.set(true);
+        io.registers.set(true);
+        io.hook_is_registered.set(registered_hook);
+        let (result, observations) = follow_up_run(&io, &mut NoObserver);
+        result.unwrap();
+        assert_eq!(
+            evidence_of(&observations)[1],
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::PromptHook,
+                receipt: Some(registered_hook),
+            }
+        );
+        assert!(io.forgotten.borrow().is_empty());
+    }
+}
+
+/// A registered follow-up whose Enter did not land is forgotten again, and
+/// no receipt is claimed for it.
+#[test]
+fn an_unsubmitted_registered_follow_up_is_forgotten() {
+    let io = FakeIo::new(
+        CODEX_IDLE,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line.starts_with("signal TERM") {
+                io.kill(AGENT);
+            }
+            if line == "text \"\\r\"" && io.previous().as_deref() == Some("text \"RELAUNCH\"") {
+                io.agent_appears_in(Duration::from_secs(1));
+            }
+            // The relaunch's Enter lands; the follow-up's is refused.
+            if line == "prompt \"continue\"" {
+                io.enter_ok.set(false);
+            }
+        }),
+    );
+    io.probe.set(true);
+    io.registers.set(true);
+    let (result, observations) = follow_up_run(&io, &mut NoObserver);
+    result.unwrap();
+    assert_eq!(io.forgotten.borrow().as_slice(), [7]);
+    assert_eq!(
+        evidence_of(&observations),
+        [
+            Observation::FollowUpSent {
+                kept: false,
+                submission: Submission::Refused
+            },
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::NoneSeen,
+                receipt: None,
+            },
+        ]
+    );
+}
+
+/// A registered follow-up still waiting for its own hook keeps a prompt
+/// hook of the conversation that arrived meanwhile, whatever ends the wait:
+/// the screen's grace, or the deadline.
+#[test]
+fn a_prompt_hook_seen_while_waiting_for_the_receipt_is_kept() {
+    for (screen, hook_after) in [
+        (CODEX_WORKING, Duration::from_secs(2)),
+        (CODEX_IDLE, Duration::from_millis(19_600)),
+    ] {
+        let io = FakeIo::new(
+            CODEX_IDLE,
+            Box::new(move |io: &FakeIo, line: &str| {
+                if line.starts_with("signal TERM") {
+                    io.kill(AGENT);
+                }
+                if line == "text \"\\r\"" {
+                    match io.previous().as_deref() {
+                        Some("text \"RELAUNCH\"") => {
+                            io.agent_appears_in(Duration::from_secs(1));
+                        }
+                        Some("prompt \"continue\"") => {
+                            io.hooks.borrow_mut().push(io.now.get() + hook_after);
+                            io.show(screen);
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        io.probe.set(true);
+        io.registers.set(true);
+        let (result, observations) = follow_up_run(&io, &mut NoObserver);
+        result.unwrap();
+        assert_eq!(
+            evidence_of(&observations)[1],
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::PromptHook,
+                receipt: Some(false),
+            },
+            "{hook_after:?}"
+        );
+    }
 }
