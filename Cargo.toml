@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.16"
+version = "0.10.17"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -18,9 +18,9 @@ authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-tend = { path = "crates/tend", version = "0.10.16" }
-tend-aas = { path = "crates/tend-aas", version = "0.10.16" }
-tend-work = { path = "crates/tend-work", version = "0.10.16" }
+tend = { path = "crates/tend", version = "0.10.17" }
+tend-aas = { path = "crates/tend-aas", version = "0.10.17" }
+tend-work = { path = "crates/tend-work", version = "0.10.17" }
 
 # external
 anyhow = "1.0.103"

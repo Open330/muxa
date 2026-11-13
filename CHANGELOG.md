@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.17] - 2026-11-13
+
+### Added
+
+- Turn-boundary delivery for opencode. At a clean turn end, `tend hook
+  opencode` returns the requests the user authorized for the session, and
+  the plugin hands them to opencode's own prompt API (1.x `promptAsync`, 2.x
+  `session.prompt` with `queue` delivery) instead of typing into the pane.
+  An interrupted or failed turn gets none, and an offer is held back if the
+  session was prompted again first.
+
+### Changed
+
+- A Codex swap relaunch starts with `-c check_for_update_on_startup=false
+  -c tui.resume_cwd="session"`, so a relaunched pane never stops on Codex's
+  "Update available" menu or its session-directory question; both were
+  answered by keystroke before, the directory the same way (the session's).
+  Worker launches still meet them, so the dialog entries stay as their
+  fallback.
+
 ### Fixed
 
 - Codex hook trust (follow-up to #521): the audit and carry-over ask the
@@ -19,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   print the home as Codex resolves it (`…/aas/profiles/…` once `asx` links to
   `aas`), and `tend agent start` / work launches onto a Codex account carry
   trust over too, not only swaps.
+
+### Removed
+
+- The `gemini` engine for `tend ask` (headless `gemini -p`, `GEMINI_API_KEY`),
+  the last use of the Gemini CLI. A config written for it still loads with a
+  warning: `[ask] agent = "gemini"` starts on `claude`, and an
+  `[ask.providers.<id>]` table on the engine lists as no provider and can be
+  removed with `tend ask provider remove <id>`. Earlier Gemini answers stay in
+  Ask history; asking in one of those conversations says the provider was
+  retired. Tend for Mac drops the engine from its provider list.
 
 ## [0.10.16] - 2026-11-13
 
@@ -34,12 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Webhook messages link to the agent's card on the dashboard's "Needs you"
   page (`[sinks.webhook] dashboard_url`, defaulting to the sign-in public
   URL); the generic payload carries it as `link`.
-- Turn-boundary delivery for opencode. At a clean turn end, `tend hook
-  opencode` returns the requests the user authorized for the session, and
-  the plugin hands them to opencode's own prompt API (1.x `promptAsync`, 2.x
-  `session.prompt` with `queue` delivery) instead of typing into the pane.
-  An interrupted or failed turn gets none, and an offer is held back if the
-  session was prompted again first.
 - Decide from the web: the "Needs you" page answers questions (an option
   or your own words, or decline) and accepts, sends back or withdraws
   results, through the same daemon paths as the Mac app. Operator-only with
@@ -115,12 +139,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names a program to run instead. Agent start, snapshot restore and Fleet
   commands still use the child for now (see
   `docs/proposals/WORK_IN_CORE.md`).
-- A Codex swap relaunch starts with `-c check_for_update_on_startup=false
-  -c tui.resume_cwd="session"`, so a relaunched pane never stops on Codex's
-  "Update available" menu or its session-directory question; both were
-  answered by keystroke before, the directory the same way (the session's).
-  Worker launches still meet them, so the dialog entries stay as their
-  fallback.
 - Account swap binds the conversation it resumes from the provider's own
   record for the exact process on macOS and for Codex too, not only for
   Claude on Linux. On macOS Claude's `sessions/<pid>.json` `procStart`
@@ -131,16 +149,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   falls back to the registry and the command line as before; a record that
   disagrees with them leaves the agent alone, and so does a verified plan
   whose record cannot be read again right before the stop.
-
-### Removed
-
-- The `gemini` engine for `tend ask` (headless `gemini -p`, `GEMINI_API_KEY`),
-  the last use of the Gemini CLI. A config written for it still loads with a
-  warning: `[ask] agent = "gemini"` starts on `claude`, and an
-  `[ask.providers.<id>]` table on the engine lists as no provider and can be
-  removed with `tend ask provider remove <id>`. Earlier Gemini answers stay in
-  Ask history; asking in one of those conversations says the provider was
-  retired. Tend for Mac drops the engine from its provider list.
 
 ### Fixed
 
