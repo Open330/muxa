@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into. Every relaunch now exports a fresh `TEND_SWAP_LAUNCH_ID`, reported
   as the outcome's `launch_id`; a relaunched process whose environment names
   another one gets no follow-up or draft.
+- A Claude Code or Codex session that starts, resumes or compacts is told what it owes and awaits in the mailbox: requests it
+  claimed and still owes a reply to, requests queued for it, its own
+  requests waiting for replies, questions waiting for you, and replies ready
+  to read. A few lines from its `SessionStart` hook; nothing is claimed or
+  changed.
 
 ### Changed
 

@@ -8,6 +8,7 @@ mod database;
 use database::DurableDatabase;
 mod contract;
 pub mod instruction;
+mod obligations;
 pub mod turn_offer;
 pub(crate) use contract::deserialize_report_input;
 pub use contract::{

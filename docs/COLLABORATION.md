@@ -159,6 +159,14 @@ recorded on the request (`turn_offer`); they are attempts, not proof of
 delivery. A primary that is idle with no turn coming keeps the request queued
 until then.
 
+When a Claude Code or Codex session starts or resumes (and after Claude Code
+compacts its context), its `SessionStart` hook asks tendd what that session
+owes and awaits and hands the model a few lines: requests it claimed and still
+owes a reply to, requests queued for it, its own requests still waiting for a
+reply, its questions waiting for the person, and replies ready to read (up to
+five ids each, with a total). Reading it claims, marks and changes nothing; a
+daemon without it returns nothing.
+
 The same `Stop` hook also catches a recipient that claimed a request expecting
 a reply and then ended its turn without replying. It continues that turn once
 with a *reply reminder* naming the request id (at most three times, five

@@ -269,6 +269,7 @@ pub(super) async fn turn_boundary_delivery(
     let boundary = match event {
         "stop" => tend::collaboration::turn_offer::TurnBoundaryEvent::Stop,
         "user_prompt_submit" => tend::collaboration::turn_offer::TurnBoundaryEvent::PromptSubmit,
+        "session_start" => tend::collaboration::turn_offer::TurnBoundaryEvent::SessionStart,
         _ => return None,
     };
     let origin = turn_boundary_origin(ev.id())?;
@@ -308,7 +309,79 @@ fn turn_boundary_origin(
     })
 }
 
+/// The few lines a starting (or compacted) session gets about what it owes
+/// and awaits.
+fn obligations_text(summary: &serde_json::Value) -> String {
+    let list = |key: &str| {
+        let section = &summary[key];
+        let total = section["total"].as_u64().unwrap_or(0);
+        let ids: Vec<String> = section["listed"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let id = item["request_id"].as_str()?;
+                        Some(match item["peer"].as_str() {
+                            Some(peer) => format!("{id} ({peer})"),
+                            None => id.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let more = total.saturating_sub(ids.len() as u64);
+        (
+            total,
+            if more > 0 {
+                format!("{}, and {more} more", ids.join(", "))
+            } else {
+                ids.join(", ")
+            },
+        )
+    };
+    let mut lines =
+        vec!["Tend mailbox state for this session (nothing was claimed or changed):".to_string()];
+    for (key, label) in [
+        ("owed_replies", "You claimed and still owe a reply to"),
+        (
+            "queued_for_you",
+            "Queued for you (claim with tend_inbox(request_id))",
+        ),
+        ("waiting_on", "You are waiting for replies to"),
+        ("waiting_on_person", "Waiting for the person on"),
+        (
+            "unread_replies",
+            "Replies ready to read (tend_inbox(view=report, request_id) or tend_wait)",
+        ),
+    ] {
+        let (total, ids) = list(key);
+        if total > 0 {
+            lines.push(format!("- {label}: {ids}."));
+        }
+    }
+    lines.push(
+        "Re-read an owed request with tend_inbox(view=all, request_id, include_body=true) before \
+         acting; finish each with one tend_reply. Do not resend requests you are waiting on, and \
+         reuse an existing question to the person instead of asking again."
+            .into(),
+    );
+    lines.join("\n")
+}
+
 fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<String> {
+    if event == "session_start" {
+        let summary = offers
+            .iter()
+            .find(|offer| offer["offer"] == "obligations")?;
+        return Some(
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": obligations_text(summary),
+            }})
+            .to_string(),
+        );
+    }
     let (reminders, offers): (Vec<_>, Vec<_>) = offers
         .iter()
         .cloned()
@@ -402,5 +475,41 @@ mod turn_boundary_tests {
         assert!(reason.contains("tend_reply(request_id=ID, status=completed"));
         assert!(reason.contains("offering 1 request(s)"));
         assert!(reason.contains("req_new"));
+    }
+
+    #[test]
+    fn session_start_lists_obligations_in_a_few_lines() {
+        let summary = serde_json::json!({
+            "offer": "obligations",
+            "owed_replies": {"total": 1, "listed": [{"request_id": "req_a", "peer": "codex@%3"}]},
+            "queued_for_you": {"total": 0, "listed": []},
+            "waiting_on": {"total": 7, "listed": [
+                {"request_id": "req_b", "peer": "claude@%5"},
+                {"request_id": "req_c", "peer": "claude@%5"}]},
+            "waiting_on_person": {"total": 1, "listed": [{"request_id": "req_h"}]},
+            "unread_replies": {"total": 0, "listed": []},
+        });
+        let output: serde_json::Value =
+            serde_json::from_str(&turn_boundary_output("session_start", &[summary]).unwrap())
+                .unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        let text = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("still owe a reply to: req_a (codex@%3)."),
+            "{text}"
+        );
+        assert!(
+            text.contains("req_b (claude@%5), req_c (claude@%5), and 5 more"),
+            "{text}"
+        );
+        assert!(text.contains("person on: req_h."), "{text}");
+        assert!(!text.contains("Queued for you"), "{text}");
+        assert!(text.lines().count() <= 7);
+        assert!(turn_boundary_output("session_start", &[]).is_none());
     }
 }
