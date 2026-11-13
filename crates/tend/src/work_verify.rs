@@ -338,14 +338,16 @@ fn run_check(check: &WorkCheck, dir: &std::path::Path, limit: std::time::Duratio
         }
     };
     let timed_out = status.is_none();
+    // Stop the whole process group the check started (see `process_group`)
+    // however it ended: a check must not leave processes behind, and one
+    // left in the background would hold the output pipes open forever.
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     if timed_out {
-        // The whole process group the check started (see `process_group`).
-        #[cfg(unix)]
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -726,5 +728,21 @@ mod tests {
             verify(&store, &runs, &identity).await,
             Gate::Passed(_)
         ));
+    }
+
+    /// A check that leaves a process in the background holding its output
+    /// returns when the check ends, and the process is stopped.
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_cannot_keep_a_check_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = &run_checks(
+            &[WorkCheck::new("sleep 30 & echo started background; exit 0")],
+            dir.path(),
+        )[0];
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(outcome.passed, "{}", outcome.tail);
+        assert_eq!(outcome.tail, "started background");
     }
 }
