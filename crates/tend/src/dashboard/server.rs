@@ -3364,6 +3364,152 @@ mod tests {
         assert_eq!(body["hosts"][0]["alias"], "prod");
     }
 
+    /// Fleet hosts in the decision queue: what each covers, a control host's
+    /// console question answered over Fleet, and every way a remote answer
+    /// is refused before anything is sent.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fake Fleet, every host kind
+    async fn the_decision_queue_covers_fleet_hosts_and_answers_only_their_console() {
+        use crate::collaboration::{HumanAction, NewRequest};
+        use crate::fleet::{FleetCommandResult, FleetHostState, HostAccessMode};
+        // Requests as a remote host's store would hold them.
+        let remote = CollaborationStore::in_memory(CollaborationOptions::default());
+        let agent = collaboration_participant("%1", "agent", "@1");
+        let peer = collaboration_participant("%2", "peer", "@1");
+        let question = remote
+            .create(
+                agent.clone(),
+                Participant::console(agent.room.clone()),
+                NewRequest {
+                    body: "Deploy now?".into(),
+                    human_action: Some(HumanAction::Choice),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let between_agents = remote
+            .create(
+                agent,
+                peer,
+                NewRequest {
+                    body: "review this".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let store = Arc::new(crate::fleet::FleetStore::new());
+        let mut here = fleet_host("here", "dev");
+        here.local = true;
+        let mut mini = fleet_host("mini", "dev");
+        mini.mode = HostAccessMode::Control;
+        let observe = fleet_host("obs", "dev");
+        let mut offline = fleet_host("off", "dev");
+        offline.state = FleetHostState::Offline;
+        for host in [here, mini, observe, offline] {
+            store.upsert_host(host).await;
+        }
+        let (runtime, mut commands) = FleetRuntime::new(store);
+        let replies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = replies.clone();
+        let (q, a) = (question.clone(), between_agents.clone());
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let result = match command.operation {
+                    FleetOperation::CollaborationMailbox { operator_only, .. } => {
+                        assert!(operator_only, "the web reads only the operator's mailbox");
+                        let mut result = FleetCommandResult::accepted("mailbox");
+                        // An agent-to-agent request in the reply is ignored.
+                        result.collaboration_incoming = vec![q.clone(), a.clone()];
+                        Ok(result)
+                    }
+                    FleetOperation::CollaborationGet { request_id, .. } => {
+                        let request = if request_id == q.id {
+                            q.clone()
+                        } else {
+                            a.clone()
+                        };
+                        Ok(FleetCommandResult::collaboration_request(request))
+                    }
+                    FleetOperation::CollaborationReply {
+                        request_id, body, ..
+                    } => {
+                        seen.lock()
+                            .unwrap()
+                            .push((command.host.clone(), request_id, body));
+                        Ok(FleetCommandResult::accepted("replied"))
+                    }
+                    other => Err(format!("unexpected {other:?}")),
+                };
+                let _ = command.reply.send(result);
+            }
+        });
+        let app = router(state_with_token("s3cret").with_fleet(Some(runtime)));
+        let call = |method: &'static str, uri: String, body: Option<Value>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .header(header::CONTENT_TYPE, "application/json");
+                if body.is_some() {
+                    request = request.header("x-tend-operator", "1");
+                }
+                let body = body.map_or_else(Body::empty, |b| Body::from(b.to_string()));
+                app.oneshot(request.body(body).unwrap()).await.unwrap()
+            }
+        };
+        let body = body_json(call("GET", "/api/decisions".into(), None).await).await;
+        let hosts = body["hosts"].as_array().unwrap();
+        let alias = |i: usize| hosts[i]["alias"].as_str().unwrap().to_owned();
+        assert_eq!(
+            (0..4).map(alias).collect::<Vec<_>>(),
+            ["here", "mini", "obs", "off"]
+        );
+        assert_eq!(hosts[1]["covers"], json!(["questions", "waiting agents"]));
+        assert_eq!(
+            hosts[1]["unavailable"],
+            json!(["review items: not read over Fleet"])
+        );
+        let items = hosts[1]["queue"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "only the console question: {items:?}");
+        assert_eq!(items[0]["request_id"], question.id.as_str());
+        assert_eq!(hosts[2]["control"], false);
+        assert_eq!(hosts[3]["covers"], json!([]));
+        assert_eq!(hosts[3]["unavailable"], json!(["host is offline"]));
+
+        let answer = |host: &str, id: &str| {
+            call(
+                "POST",
+                format!("/api/decisions/requests/{id}"),
+                Some(json!({ "answer": "yes", "host": host })),
+            )
+        };
+        // Refused before anything is sent: an observe-only host, an unknown
+        // host, a request between agents on a control host.
+        assert_eq!(
+            answer("obs", &question.id).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            answer("nowhere", &question.id).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            answer("mini", &between_agents.id).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(replies.lock().unwrap().is_empty());
+        // The console question on the control host is answered there.
+        assert_eq!(answer("mini", &question.id).await.status(), StatusCode::OK);
+        assert_eq!(
+            *replies.lock().unwrap(),
+            vec![("mini".to_owned(), question.id.clone(), "yes".to_owned())]
+        );
+    }
+
     #[tokio::test]
     async fn fleet_command_endpoint_is_pat_gated_and_dispatches() {
         let (runtime, mut commands) = FleetRuntime::new(Arc::new(crate::fleet::FleetStore::new()));
@@ -4081,9 +4227,11 @@ mod tests {
         let response = get(app.clone(), "/api/decisions", Some("s3cret")).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["covers"], "this host");
-        assert_eq!(body["queue"]["items"][0]["kind"], "review");
-        assert_eq!(body["queue"]["items"][0]["summary"], "check the migration");
+        assert_eq!(body["hosts"][0]["alias"], "this host");
+        assert_eq!(body["hosts"][0]["local"], true);
+        let items = &body["hosts"][0]["queue"]["items"];
+        assert_eq!(items[0]["kind"], "review");
+        assert_eq!(items[0]["summary"], "check the migration");
         let response = get(app.clone(), "/api/decisions/history", Some("s3cret")).await;
         assert_eq!(response.status(), StatusCode::OK);
         // The page itself is a static asset, like `/`.

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ago, decidedCard, evidenceLine, pendingCard, safeHref } from "../src/dashboard/web/needs-model.mjs";
+import { ago, decidedCard, evidenceLine, hostSections, pendingCard, safeHref } from "../src/dashboard/web/needs-model.mjs";
 
 const now = Date.parse("2026-11-12T12:00:00Z");
 
@@ -86,4 +86,31 @@ test("only web links are clickable", () => {
   assert.equal(evidenceLine({ kind: "pull_request", url: "javascript:alert(1)" }).href, null);
   assert.equal(evidenceLine({ kind: "commit", sha: "abc", repo: "/r" }).text, "commit abc in /r");
   assert.equal(ago("not a date"), "");
+});
+
+test("the queue is per host, and only allowed actions are offered", () => {
+  const ask = { kind: "human_request", request_id: "rq_1", body: "Merge?", from_session_id: "s", created_at: "2026-11-12T11:00:00Z" };
+  const waiting = { kind: "agent_waiting", session_id: "s", agent_kind: "codex", pane: "%4", state: "waiting_input", since: "2026-11-12T11:00:00Z" };
+  const review = { kind: "review", id: "rv_1", summary: "x", target: { kind: "session", session_id: "s" }, requested_at: "2026-11-12T11:00:00Z" };
+  const sections = hostSections({
+    hosts: [
+      { alias: "june-mba", local: true, control: true, covers: ["questions", "waiting agents", "review items"], queue: { items: [review, waiting] } },
+      { alias: "jiun-mini", local: false, control: true, covers: ["questions", "waiting agents"], unavailable: ["review items: not read over Fleet"], queue: { items: [ask, waiting] } },
+      { alias: "rtzr", local: false, control: false, covers: [], unavailable: ["host is offline"], queue: { items: [] } },
+      { alias: "obs", local: false, control: false, covers: ["questions"], queue: { items: [ask] } },
+    ],
+  }, now);
+  assert.deepEqual(sections.map((s) => s.alias), ["june-mba", "jiun-mini", "rtzr", "obs"]);
+  const [local, mini, rtzr, obs] = sections;
+  assert.equal(local.cards[1].pane, "%4", "a local pane opens here");
+  assert.equal(mini.cards[1].pane, null, "a remote pane does not");
+  assert.equal(mini.cards[0].host, "jiun-mini");
+  assert.equal(mini.cards[0].actionable, true, "a control host's question can be answered");
+  assert.equal(mini.cards[1].actionable, false, "a remote waiting agent cannot be acted on here");
+  assert.deepEqual(rtzr.notes, ["unavailable: host is offline", "observe-only: answer on that host"]);
+  assert.equal(obs.cards[0].actionable, false, "an observe-only host's question cannot be answered");
+  // An older single-queue response is one local section.
+  const old = hostSections({ covers: "this host", queue: { items: [review] } }, now);
+  assert.equal(old.length, 1);
+  assert.equal(old[0].cards[0].actionable, true);
 });

@@ -38,7 +38,20 @@
 //! name `web:<email>` for a signed-in operator or `web:token` for the bearer
 //! token.
 //!
-//! The queue covers this daemon's host only; the response says so.
+//! # Fleet
+//!
+//! The queue is per host. This host contributes everything (questions,
+//! waiting agents, review items). Each connected Fleet host contributes the
+//! questions addressed to its operator console (the operator-only mailbox
+//! read) and its agents waiting in their panes (from the Fleet snapshot);
+//! review items are not read over Fleet. Every host section names what it
+//! covers and what could not be read, and a host that is not online is
+//! listed as such, so nothing is silently missing.
+//!
+//! A remote question is answered over Fleet only on a control-mode host,
+//! and only after reading the request back from that host and checking it
+//! is addressed to the operator console: a Fleet reply to anything else
+//! would be sent as the agent in that pane. The history covers this host.
 
 use axum::{
     extract::{Path, Query, State},
@@ -48,6 +61,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::server::AppState;
 use crate::collaboration::CollaborationError as E;
@@ -60,21 +74,140 @@ pub(super) struct DecisionsQuery {
     limit: Option<usize>,
 }
 
-/// `GET /api/decisions`: what is waiting on the person, in queue order.
+const FLEET_READ_TIMEOUT: Duration = Duration::from_secs(6);
+const FLEET_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The routing envelope for operator-console reads and replies on a Fleet
+/// host: not a terminal, so it works after the host's last pane closed.
+fn console_route() -> crate::PaneKey {
+    crate::PaneKey {
+        window: crate::WindowKey {
+            session: crate::SessionKey {
+                endpoint: crate::BackendEndpoint {
+                    host: crate::backend::HostKind::Tmux,
+                    socket: "default".into(),
+                },
+                session_id: "console".into(),
+            },
+            window_id: "console".into(),
+        },
+        pane_id: "console".into(),
+    }
+}
+
+async fn fleet_hosts(state: &AppState) -> Vec<crate::fleet::FleetHostSnapshot> {
+    match &state.fleet {
+        Some(fleet) => fleet.store.snapshot_selected(None).await.hosts,
+        None => Vec::new(),
+    }
+}
+
+/// This host's Fleet alias, when the Fleet manager knows one.
+fn local_alias(hosts: &[crate::fleet::FleetHostSnapshot]) -> String {
+    hosts
+        .iter()
+        .find(|host| host.local)
+        .map_or_else(|| "this host".into(), |host| host.alias.clone())
+}
+
+fn state_label(state: crate::fleet::FleetHostState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// One Fleet host's part of the queue.
+async fn remote_section(
+    fleet: &crate::fleet::FleetRuntime,
+    host: crate::fleet::FleetHostSnapshot,
+    limit: usize,
+) -> serde_json::Value {
+    use crate::fleet::{FleetHostState, FleetOperation, HostAccessMode};
+    let control = host.mode == HostAccessMode::Control;
+    if !matches!(
+        host.state,
+        FleetHostState::Online | FleetHostState::Degraded
+    ) {
+        return json!({
+            "alias": host.alias, "local": false, "control": control,
+            "covers": [], "unavailable": [format!("host is {}", state_label(host.state))],
+            "queue": crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
+        });
+    }
+    let agents = host
+        .remote
+        .as_ref()
+        .map(|remote| remote.agents.clone())
+        .unwrap_or_default();
+    let mut covers = vec!["waiting agents"];
+    let mut unavailable = vec!["review items: not read over Fleet".to_owned()];
+    let human = match fleet
+        .execute(
+            host.alias.clone(),
+            FleetOperation::CollaborationMailbox {
+                pane: console_route(),
+                operator_only: true,
+                if_unchanged: None,
+            },
+            FLEET_READ_TIMEOUT,
+        )
+        .await
+    {
+        Ok(result) => {
+            covers.insert(0, "questions");
+            // Only what is addressed to the operator console counts.
+            result
+                .collaboration_incoming
+                .into_iter()
+                .filter(|request| request.to.console)
+                .collect()
+        }
+        Err(error) => {
+            unavailable.insert(0, format!("questions: {error}"));
+            Vec::new()
+        }
+    };
+    let queue = crate::decision_queue::assemble_queue(&human, &agents, Vec::new(), limit);
+    json!({
+        "alias": host.alias, "local": false, "control": control,
+        "covers": covers, "unavailable": unavailable, "queue": queue,
+    })
+}
+
+/// `GET /api/decisions`: what is waiting on the person, per host, each in
+/// queue order.
 pub(super) async fn queue_handler(
     State(state): State<AppState>,
     Query(query): Query<DecisionsQuery>,
 ) -> Response {
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
     let agents = state.store.snapshot().await;
-    let queue = crate::decision_queue::read_pending(
+    let local = crate::decision_queue::read_pending(
         &state.reviews,
         &state.collaboration,
         &agents,
-        query.limit.unwrap_or(DEFAULT_LIMIT),
+        limit,
         true,
     )
     .await;
-    Json(json!({ "covers": "this host", "queue": queue })).into_response()
+    let fleet_hosts = fleet_hosts(&state).await;
+    let mut hosts = vec![json!({
+        "alias": local_alias(&fleet_hosts), "local": true, "control": true,
+        "covers": ["questions", "waiting agents", "review items"],
+        "unavailable": local.unavailable.clone(), "queue": local,
+    })];
+    if let Some(fleet) = &state.fleet {
+        let sections = futures::future::join_all(
+            fleet_hosts
+                .into_iter()
+                .filter(|host| !host.local)
+                .map(|host| remote_section(fleet, host, limit)),
+        )
+        .await;
+        hosts.extend(sections);
+    }
+    Json(json!({ "hosts": hosts })).into_response()
 }
 
 /// `GET /api/decisions/history`: past decisions, newest first.
@@ -89,7 +222,8 @@ pub(super) async fn history_handler(
         true,
     )
     .await;
-    Json(json!({ "covers": "this host", "history": history })).into_response()
+    let covers = local_alias(&fleet_hosts(&state).await);
+    Json(json!({ "covers": covers, "history": history })).into_response()
 }
 
 /// `GET /needs`: the phone-first page that renders the two reads above.
@@ -261,6 +395,10 @@ pub(super) async fn review_handler(
 #[serde(deny_unknown_fields)]
 pub(super) struct HumanAnswer {
     answer: String,
+    /// The Fleet host the question is on; absent (or this host's alias)
+    /// for one asked here.
+    #[serde(default)]
+    host: Option<String>,
     /// `completed` (the default) for an answer, `declined` for a refusal.
     #[serde(default)]
     declined: bool,
@@ -286,6 +424,30 @@ pub(super) async fn answer_handler(
     } else {
         crate::collaboration::RequestStatus::Completed
     };
+    let hosts = fleet_hosts(&state).await;
+    if let Some(remote) = answer
+        .host
+        .as_deref()
+        .filter(|alias| *alias != local_alias(&hosts) && *alias != "this host")
+    {
+        let remote = remote.to_owned();
+        let (code, outcome) =
+            answer_remote(&state, &hosts, &remote, &id, status, &answer.answer).await;
+        audit(
+            state.decision_audit.as_ref(),
+            json!({
+                "at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
+                "by": by, "account": account, "action": "answer", "host": remote, "id": id, "declined": answer.declined,
+                "outcome": outcome, "status": code.as_u16(),
+            }),
+        )
+        .await;
+        return if code == StatusCode::OK {
+            Json(json!({ "request_id": id, "host": remote, "status": status })).into_response()
+        } else {
+            error(code, outcome)
+        };
+    }
     // The console of any room is the operator: the store checks that the
     // request is addressed to the console at all.
     let console = crate::collaboration::Participant::console(crate::collaboration::RoomId {
@@ -323,5 +485,90 @@ pub(super) async fn answer_handler(
         }))
         .into_response(),
         Err(_) => error(code, outcome),
+    }
+}
+
+/// Answer a question on a Fleet host as its operator console: refused for
+/// an unknown or observe-only host, and for any request that is not
+/// addressed to the console there (a Fleet reply to an agent's request
+/// would be sent as that agent).
+async fn answer_remote(
+    state: &AppState,
+    hosts: &[crate::fleet::FleetHostSnapshot],
+    alias: &str,
+    id: &str,
+    status: crate::collaboration::RequestStatus,
+    body: &str,
+) -> (StatusCode, String) {
+    use crate::fleet::{FleetOperation, HostAccessMode};
+    let Some(fleet) = &state.fleet else {
+        return (StatusCode::NOT_FOUND, "Fleet is not enabled here".into());
+    };
+    let Some(host) = hosts.iter().find(|host| host.alias == alias && !host.local) else {
+        return (StatusCode::NOT_FOUND, format!("no Fleet host {alias}"));
+    };
+    if host.mode != HostAccessMode::Control {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("{alias} is observe-only; answer it there, or set mode = \"control\""),
+        );
+    }
+    let stored = match fleet
+        .execute(
+            alias.to_owned(),
+            FleetOperation::CollaborationGet {
+                pane: console_route(),
+                request_id: id.to_owned(),
+            },
+            FLEET_WRITE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(result) => result.collaboration_request,
+        Err(error) => return (StatusCode::BAD_GATEWAY, format!("{alias}: {error}")),
+    };
+    let Some(stored) = stored else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("{alias} has no request {id}"),
+        );
+    };
+    if !stored.to.console {
+        return (
+            StatusCode::FORBIDDEN,
+            "that request is not addressed to you".into(),
+        );
+    }
+    if stored.status.is_terminal() {
+        let same = stored
+            .reply
+            .as_ref()
+            .is_some_and(|reply| reply.status == status && reply.body == body.trim());
+        return if same {
+            (StatusCode::OK, "recorded".into())
+        } else {
+            (
+                StatusCode::CONFLICT,
+                format!("request {id} is already answered"),
+            )
+        };
+    }
+    match fleet
+        .execute(
+            alias.to_owned(),
+            FleetOperation::CollaborationReply {
+                pane: console_route(),
+                request_id: id.to_owned(),
+                status,
+                body: body.to_owned(),
+                report: None,
+            },
+            FLEET_WRITE_TIMEOUT,
+        )
+        .await
+    {
+        Ok(_) => (StatusCode::OK, "recorded".into()),
+        Err(error) if error.contains("already") => (StatusCode::CONFLICT, error),
+        Err(error) => (StatusCode::BAD_GATEWAY, format!("{alias}: {error}")),
     }
 }

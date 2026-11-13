@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- "Needs you" covers the Fleet: one section per host, each saying what it
+  covers. Fleet hosts contribute their operator questions and waiting
+  agents (review items are this host's only), and a question on a
+  control-mode host can be answered from the page after tend checks it is
+  addressed to the operator console there.
 - Decide from the web: the "Needs you" page answers questions (an option
   or your own words, or decline) and accepts, sends back or withdraws
   results, through the same daemon paths as the Mac app. Operator-only with

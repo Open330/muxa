@@ -147,3 +147,37 @@ export function decidedCard(item, now = Date.now()) {
   }
   return null;
 }
+
+/// The per-host queue as sections of cards. Each card knows its host;
+/// cards from another host carry `remote` (no local pane link) and can be
+/// acted on only where the host allows it (`control`). An older response
+/// with a single top-level `queue` reads as one local section.
+export function hostSections(data, now = Date.now()) {
+  const hosts = Array.isArray(data?.hosts)
+    ? data.hosts
+    : [{ alias: data?.covers || "this host", local: true, control: true, covers: [], unavailable: data?.queue?.unavailable || [], queue: data?.queue }];
+  return hosts.map((host) => {
+    const remote = !host.local;
+    const cards = (host.queue?.items || [])
+      .map((item) => pendingCard(item, now))
+      .filter(Boolean)
+      .map((card) => ({
+        ...card,
+        host: host.alias,
+        remote,
+        actionable: !remote || (host.control && card.kind === "ask"),
+        pane: remote ? null : card.pane,
+      }));
+    const notes = [];
+    if (host.queue?.truncated) notes.push("more than shown");
+    for (const source of host.unavailable || []) notes.push(`unavailable: ${source}`);
+    if (remote && !host.control) notes.push("observe-only: answer on that host");
+    return {
+      alias: host.alias,
+      local: !remote,
+      covers: Array.isArray(host.covers) ? host.covers : [],
+      notes,
+      cards,
+    };
+  });
+}
