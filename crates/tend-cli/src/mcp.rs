@@ -3732,6 +3732,7 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
         planned_cwd: None,
         // An MCP server's stdin is the JSON-RPC channel, never a person.
         non_interactive: true,
+        subprocess_socket: None,
         work,
         external: text("external"),
         pipeline: text("pipeline"),

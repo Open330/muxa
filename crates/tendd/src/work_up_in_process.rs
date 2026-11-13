@@ -4,23 +4,28 @@
 //!
 //! - the argv `WorkUpRequest::arguments` builds, parsed by the CLI's own
 //!   `UpArgs`;
-//! - the CLI's default config file (`paths::default_config_file`), not
-//!   tendd's `--config`, exactly as the child read it;
+//! - the config file the child's CLI chose: `TEND_CONFIG` (inherited),
+//!   else the default path, and never tendd's own `--config`;
 //! - the daemon's own environment and working directory, which the child
 //!   inherited;
-//! - an IPC client on the socket the child had pinned as `TEND_SOCKET`;
-//! - no prompts (the child's stdin was null).
+//! - an IPC client on the socket the child had pinned as `TEND_SOCKET`,
+//!   which a route's `prepare` script also gets;
+//! - no prompts, and a closed stdin and the old deadline for `prepare`
+//!   (the child's stdin was null and it was killed at the deadline);
+//! - the agent-directory invalidation the CLI sent after every `work up`.
 //!
 //! The work is synchronous in places (tmux and git subprocesses, blocking
 //! IPC back to this daemon), so it runs on a blocking thread with its own
 //! single-threaded runtime and never on the daemon's async workers.
 //! Anything that fails before the first effect (unparseable argv, unreadable
-//! config) declines, and the caller runs the child instead.
+//! config) declines, and the caller runs the child instead. There is no
+//! outer timeout: the operation stays running (and counted) until the work
+//! really ends, and its one unbounded step, `prepare`, carries the deadline.
 //! `TEND_WORK_UP_CHILD=1` forces the child.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tend::work_control::{InProcessWorkUp, WorkUpError, WorkUpRequest, WORK_UP_TIMEOUT};
+use tend::work_control::{InProcessWorkUp, WorkUpError, WorkUpRequest};
 
 pub(crate) fn install(own_socket: PathBuf) {
     let run: InProcessWorkUp = Arc::new(move |request: WorkUpRequest, socket: Option<PathBuf>| {
@@ -41,7 +46,10 @@ async fn run(
             return None;
         }
     };
-    let config_path = tend::paths::default_config_file();
+    let config_path = cli_config_path(
+        std::env::var_os("TEND_CONFIG"),
+        tend::paths::default_config_file(),
+    );
     let config = match tend::Config::load_or_default(config_path.as_deref()) {
         Ok(config) => config,
         Err(error) => {
@@ -56,19 +64,26 @@ async fn run(
             .map_err(|error| WorkUpError::Failed(format!("work up runtime: {error}")))?;
         runtime.block_on(async move {
             let client = tend::ipc::Client::new(socket);
-            let result = tend_work::work_up::run_noninteractive(args, &config, &client)
-                .await
-                .map_err(|error| WorkUpError::Failed(last_line(&format!("{error:?}"))))?;
+            let result = tend_work::work_up::run_noninteractive(args, &config, &client).await;
+            // As the CLI did after every `work up`, success or not.
+            let _ = client.invalidate_agent_directory().await;
+            let result =
+                result.map_err(|error| WorkUpError::Failed(last_line(&format!("{error:?}"))))?;
             serde_json::to_value(result).map_err(WorkUpError::InvalidJson)
         })
     });
-    // Like the child's deadline, but a blocking thread cannot be killed: past
-    // it the caller gets the timeout and the work finishes on its own.
-    Some(match tokio::time::timeout(WORK_UP_TIMEOUT, work).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(WorkUpError::Failed(format!("work up task: {error}"))),
-        Err(_) => Err(WorkUpError::Timeout),
+    Some(match work.await {
+        Ok(result) => result,
+        Err(error) => Err(WorkUpError::Failed(format!("work up task: {error}"))),
     })
+}
+
+/// The config path the `tend` child chose: `--config` (never passed) or
+/// `TEND_CONFIG`, else the default.
+fn cli_config_path(env: Option<std::ffi::OsString>, default: Option<PathBuf>) -> Option<PathBuf> {
+    env.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(default)
 }
 
 /// The child's error was the last line of its stderr, where `tend` printed
@@ -80,4 +95,29 @@ fn last_line(text: &str) -> String {
         .unwrap_or("no error detail")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_config_is_the_one_the_cli_child_read() {
+        let default = Some(PathBuf::from("/home/u/.config/tend/config.toml"));
+        assert_eq!(
+            cli_config_path(Some("/custom/tend.toml".into()), default.clone()),
+            Some(PathBuf::from("/custom/tend.toml"))
+        );
+        assert_eq!(cli_config_path(Some("".into()), default.clone()), default);
+        assert_eq!(cli_config_path(None, default.clone()), default);
+    }
+
+    #[test]
+    fn the_error_detail_is_the_last_line_the_cli_printed() {
+        assert_eq!(
+            last_line("no route\n\nCaused by:\n    0: bad cwd\n"),
+            "0: bad cwd"
+        );
+        assert_eq!(last_line(""), "no error detail");
+    }
 }
