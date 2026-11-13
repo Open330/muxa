@@ -41,7 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tend work plan --accept TEXT --check CMD` (repeatable; `--no-acceptance`,
   `--no-checks`), the same flags on `tend work up`, and `acceptance` /
   `checks` on `tend_start_work`. They are stored on the Work's plan
-  (`work_verify_v1`) and shown by `tend work show`.
+  (`work_verify_v1`) with who declared them, run where the Work last started,
+  and shown by `tend work show`. An agent cannot change acceptance or checks
+  the person or another agent declared.
 
 ### Changed
 

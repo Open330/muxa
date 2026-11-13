@@ -16,6 +16,33 @@ pub const MAX_CHECKS: usize = 8;
 pub const DEFAULT_CHECK_TIMEOUT_SECS: u32 = 300;
 pub const MAX_CHECK_TIMEOUT_SECS: u32 = 3_600;
 
+/// Who declared a Work's acceptance criteria and checks, as tendd saw the
+/// caller: the person (any caller not running in a tracked agent's pane),
+/// or the agent session whose pane the caller runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Declarer {
+    Operator,
+    Agent { session_id: String },
+}
+
+impl Declarer {
+    /// Whether `self` may change a declaration `current` made. The person
+    /// may always; an agent only its own, or one nobody has made yet. This
+    /// keeps the agent whose work is checked from rewriting its own checks;
+    /// it is not authentication, since every caller runs as the same user.
+    #[must_use]
+    pub fn may_replace(&self, current: Option<&Self>) -> bool {
+        match (self, current) {
+            (Self::Operator, _) | (_, None) => true,
+            (Self::Agent { session_id }, Some(Self::Agent { session_id: owner })) => {
+                session_id == owner
+            }
+            (Self::Agent { .. }, Some(Self::Operator)) => false,
+        }
+    }
+}
+
 /// One command tend runs to verify a result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

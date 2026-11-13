@@ -3846,6 +3846,8 @@ fn start_work_verification(
             .map(tend::work_verify::WorkCheck::new)
             .collect()
     });
+    crate::work_backlog::validate_verify_edit(acceptance.as_ref(), checks.as_ref())
+        .map_err(|error| error.to_string())?;
     Ok((acceptance, checks))
 }
 

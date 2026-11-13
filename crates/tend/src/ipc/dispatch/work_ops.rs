@@ -297,3 +297,29 @@ async fn work_compose(
     };
     Ok(Flow::Respond(response))
 }
+
+/// Who is declaring a Work's acceptance and checks: the agent whose pane
+/// the caller runs in, as tendd observes the caller's process, or else the
+/// person.
+pub(super) async fn declarer(ctx: &ServerCtx, conn: &mut Conn) -> crate::work_verify::Declarer {
+    conn.collaboration_actor.observe_pane(&ctx.backends).await;
+    let Some(pane) = conn.collaboration_actor.observed_pane.clone() else {
+        return crate::work_verify::Declarer::Operator;
+    };
+    ctx.store
+        .by_pane(&pane)
+        .await
+        .into_iter()
+        .filter(|agent| agent.state != crate::AgentState::Stopped)
+        .filter(|agent| {
+            !agent
+                .session_id
+                .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX)
+        })
+        .max_by_key(|agent| agent.last_activity_at)
+        .map_or(crate::work_verify::Declarer::Operator, |agent| {
+            crate::work_verify::Declarer::Agent {
+                session_id: agent.session_id,
+            }
+        })
+}

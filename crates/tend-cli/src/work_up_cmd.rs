@@ -40,6 +40,7 @@ pub async fn run(
         std::mem::take(&mut args.checks),
         false,
     );
+    crate::work_backlog::validate_verify_edit(acceptance.as_ref(), checks.as_ref())?;
     if let (Some(client), true) = (client, acceptance.is_some() || checks.is_some()) {
         crate::work_backlog::require_verify(client).await?;
     }

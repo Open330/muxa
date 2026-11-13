@@ -75,11 +75,19 @@ tend work up ENG-2 --check "npm test"        # recorded on the Work it starts
 `--accept` adds a criterion and `--check` a shell command; repeating a flag
 gives the whole list, which replaces the Work's (`--no-acceptance`,
 `--no-checks` clear them). `tend_start_work` takes the same lists as
-`acceptance` and `checks`. Checks need a directory to run in: the plan's
-`cwd`, or, from `work up`, the directory the Work started in. The commands
-come only from this declaration by the person or the agent that started the
-Work, never from repository content. They are stored on the plan
-(`work_verify_v1`) and shown by `tend work show`.
+`acceptance` and `checks`, and both refuse a bad list before anything
+starts. Checks run in the directory the Work last started in (`work up`
+records it, so a route worktree or `--cwd` is what gets verified), else the
+plan's `cwd`. The commands come only from this declaration, never from
+repository content. They are stored on the plan (`work_verify_v1`) with who
+declared them, and shown by `tend work show`.
+
+tendd records the declarer from the caller it observes: the agent whose pane
+the caller runs in, or else the person. The person may always change a
+Work's acceptance and checks; an agent may set them where nobody has, or
+change its own, but not the person's or another agent's. This keeps the agent
+whose work is checked from rewriting its own checks. It is not
+authentication: every caller runs as the same user.
 
 ### External issues
 
