@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- tendd runs `work up` itself instead of starting the `tend` CLI and
+  waiting on it. This covers `work up` from the Mac app, the dashboard and
+  IPC. The request, the config file, the environment and the result are the
+  same as before. What changes: a daemon and CLI mid-upgrade no longer
+  disagree about Work, errors carry their real cause rather than a stderr
+  line, and a `tend` binary missing next to tendd no longer breaks it.
+  `TEND_WORK_UP_CHILD=1` brings back the CLI child. Reconcile, agent start,
+  snapshot restore and Fleet commands still use the child for now (see
+  `docs/proposals/WORK_IN_CORE.md`).
 - Account swap binds the conversation it resumes from the provider's own
   record for the exact process on macOS and for Codex too, not only for
   Claude on Linux. On macOS Claude's `sessions/<pid>.json` `procStart`

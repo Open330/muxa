@@ -76,15 +76,15 @@ fn save(pane: &str, provenance: &SpawnProvenance) -> Result<()> {
         .join("spawns");
     archive(&directory, provenance, &json)?;
     let value = std::str::from_utf8(&json)?;
-    let output = crate::mux_control::ambient_command_with_args(&[
-        "set-option",
-        "-p",
-        "-t",
-        pane,
-        "@tend_spawn",
-        value,
-    ])?
-    .output()?;
+    let output =
+        crate::subprocess::output(&mut crate::mux_control::ambient_command_with_args(&[
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            "@tend_spawn",
+            value,
+        ])?)?;
     anyhow::ensure!(
         output.status.success(),
         "cannot stamp creation metadata: {}",

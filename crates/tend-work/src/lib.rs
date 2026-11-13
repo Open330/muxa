@@ -7,9 +7,11 @@
 
 pub mod account_module;
 pub mod agent_launch;
+pub mod backlog;
 pub mod caller;
 pub mod mux_control;
 pub mod spawn_provenance;
+pub mod subprocess;
 pub mod tmux_work;
 pub mod work_up;
 pub mod worker_startup;

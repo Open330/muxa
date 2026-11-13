@@ -3732,6 +3732,8 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
     let up = crate::work_up::UpArgs {
         body_from_plan: false,
         planned_cwd: None,
+        // An MCP server's stdin is the JSON-RPC channel, never a person.
+        non_interactive: true,
         work,
         external: text("external"),
         pipeline: text("pipeline"),
