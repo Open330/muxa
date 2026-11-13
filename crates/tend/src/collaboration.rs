@@ -24,8 +24,9 @@ pub use mailbox_snapshot::{MailboxSnapshot, MAILBOX_SNAPSHOT_CAPABILITY};
 pub use open_counts::{CollaborationOpenCounts, HUMAN_QUERY_CAPABILITY, OPEN_COUNTS_CAPABILITY};
 mod health;
 pub use health::{
-    CollaborationHealth, ExpireSample, ExpireSummary, COLLABORATION_HEALTH_CAPABILITY,
-    EXPIRE_SUMMARY_CAPABILITY, FILTERED_EXPIRE_CAPABILITY,
+    CollaborationHealth, ExpireSample, ExpireSummary, WeeklyOutcome,
+    COLLABORATION_HEALTH_CAPABILITY, EXPIRE_SUMMARY_CAPABILITY, FILTERED_EXPIRE_CAPABILITY,
+    OUTCOME_WEEKS,
 };
 mod overview;
 pub use overview::{
