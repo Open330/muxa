@@ -27,6 +27,17 @@ use time::OffsetDateTime;
 pub const MAX_STOP_OFFERS: u32 = 3;
 /// Minimum gap between two offers of one request through the same event.
 pub const OFFER_BACKOFF: time::Duration = time::Duration::minutes(5);
+/// The waker's final transport decision for one request (see
+/// [`CollaborationStore::reserve_typed_wake`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedWake {
+    /// Its own hook was offered it within the backoff: type nothing.
+    Refused,
+    /// Type it. `reserved_at` names the reservation to release if the
+    /// attempt types nothing (`None` with the transport off).
+    Allowed { reserved_at: Option<OffsetDateTime> },
+}
+
 /// Offer kind telling a sender its reply is ready. Older hooks render every
 /// unknown offer as work to claim, so it is sent only to hooks that list it.
 pub const REPLY_READY_OFFER: &str = "reply_ready";
@@ -204,23 +215,26 @@ impl CollaborationStore {
     /// and typed wakes are chosen under the same transaction lock, so one
     /// request is never both offered and typed. Always true (and writes
     /// nothing) with the transport off.
-    pub async fn reserve_typed_wake(&self, request_id: &str) -> Result<bool, CollaborationError> {
+    pub async fn reserve_typed_wake(
+        &self,
+        request_id: &str,
+    ) -> Result<TypedWake, CollaborationError> {
         if !self.hook_transport_enabled() {
-            return Ok(true);
+            return Ok(TypedWake::Allowed { reserved_at: None });
         }
         let _transaction = self.transaction_lock.lock().await;
         let now = OffsetDateTime::now_utc();
         let row = {
             let requests = self.requests.read().await;
             let Some(request) = requests.get(request_id) else {
-                return Ok(false);
+                return Ok(TypedWake::Refused);
             };
             if request
                 .turn_offer
                 .as_ref()
                 .is_some_and(|offer| offer.offered_recently(now))
             {
-                return Ok(false);
+                return Ok(TypedWake::Refused);
             }
             let mut row = request.clone();
             row.turn_offer
@@ -229,7 +243,40 @@ impl CollaborationStore {
             row
         };
         self.commit_request_rows(std::slice::from_ref(&row)).await?;
-        Ok(true)
+        Ok(TypedWake::Allowed {
+            reserved_at: Some(now),
+        })
+    }
+
+    /// Undo a typed-wake reservation whose attempt typed nothing, so a
+    /// failing backend cannot keep the hook from offering the request. Only
+    /// the reservation taken at `reserved_at` is released.
+    pub async fn release_typed_wake(
+        &self,
+        request_id: &str,
+        reserved_at: OffsetDateTime,
+    ) -> Result<(), CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let row = {
+            let requests = self.requests.read().await;
+            let Some(request) = requests.get(request_id) else {
+                return Ok(());
+            };
+            if request
+                .turn_offer
+                .as_ref()
+                .and_then(|offer| offer.typed_wake_at)
+                != Some(reserved_at)
+            {
+                return Ok(());
+            }
+            let mut row = request.clone();
+            if let Some(offer) = row.turn_offer.as_mut() {
+                offer.typed_wake_at = None;
+            }
+            row
+        };
+        self.commit_request_rows(std::slice::from_ref(&row)).await
     }
 
     /// `collaboration.hook_transport = "primary"`: workers are offered
@@ -381,11 +428,7 @@ impl CollaborationStore {
                         // requests at its own turn boundary too.
                         || (hook_transport
                             && caller.accepts_peer_work()
-                            && request.wake_delivery.is_none()
-                            && !request
-                                .turn_offer
-                                .as_ref()
-                                .is_some_and(|offer| offer.typed_wake_recent(now)))
+                            && request.wake_delivery.is_none())
                         // A wake that was typed but never submitted also
                         // rides along with whatever prompt is submitted
                         // next, as a structured offer.
@@ -395,6 +438,12 @@ impl CollaborationStore {
                                     || retry.attempts >= super::wake_retry::MAX_WAKE_ATTEMPTS
                             })))
                     && (event == TurnBoundaryEvent::PromptSubmit || request.should_notify())
+                    // Reserved for a typed wake: no candidate mode offers it.
+                    && !(hook_transport
+                        && request
+                            .turn_offer
+                            .as_ref()
+                            .is_some_and(|offer| offer.typed_wake_recent(now)))
                     && request
                         .turn_offer
                         .as_ref()
@@ -1113,17 +1162,51 @@ mod tests {
         // Offered first: the waker's final reservation is refused.
         let offered = create("offered").await;
         assert_eq!(ids(&stop(&store, &worker()).await), vec![offered.clone()]);
-        assert!(!store.reserve_typed_wake(&offered).await.unwrap());
+        assert_eq!(
+            store.reserve_typed_wake(&offered).await.unwrap(),
+            TypedWake::Refused
+        );
         // Reserved first: the hook does not offer it.
         let typed = create("typed").await;
-        assert!(store.reserve_typed_wake(&typed).await.unwrap());
+        let TypedWake::Allowed {
+            reserved_at: Some(reserved_at),
+        } = store.reserve_typed_wake(&typed).await.unwrap()
+        else {
+            panic!("reserved");
+        };
         age_offers(&store, OFFER_BACKOFF).await;
         assert!(
             !ids(&stop(&store, &worker()).await).contains(&typed),
             "a request reserved for a typed wake is not also offered"
         );
+        // A wake-retry request is excluded too, whichever mode would offer it.
+        {
+            let mut requests = store.requests.write().await;
+            requests.get_mut(&typed).unwrap().wake_retry =
+                Some(crate::collaboration::wake_retry::WakeRetry {
+                    attempt_started_at: OffsetDateTime::now_utc(),
+                    attempts: 2,
+                    redeliver: false,
+                });
+        }
+        assert!(!ids(&store
+            .offer_turn_boundary(&worker(), TurnBoundaryEvent::PromptSubmit, None, None)
+            .await
+            .unwrap())
+        .contains(&typed));
+        // A typed attempt that typed nothing releases its reservation, and
+        // the hook may offer the request again.
+        store.release_typed_wake(&typed, reserved_at).await.unwrap();
+        assert!(ids(&store
+            .offer_turn_boundary(&worker(), TurnBoundaryEvent::PromptSubmit, None, None)
+            .await
+            .unwrap())
+        .contains(&typed));
         // With the transport off nothing is reserved or written.
         store.set_hook_transport(false);
-        assert!(store.reserve_typed_wake(&offered).await.unwrap());
+        assert_eq!(
+            store.reserve_typed_wake(&offered).await.unwrap(),
+            TypedWake::Allowed { reserved_at: None }
+        );
     }
 }
