@@ -92,9 +92,19 @@ pub fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     if route.module_off {
         return Err(tend::swap_api::module_unavailable(true));
     }
-    decide_with(route, |aas, provider| {
+    let routed = decide_with(route, |aas, provider| {
         query_candidates_within(aas, provider, QUERY_TIMEOUT)
-    })
+    })?;
+    // A Codex launch on an account home meets the same "Hooks need review"
+    // menu a swap would: carry over trust the user gave elsewhere first.
+    if route.provider == "codex" {
+        if let Some(note) =
+            crate::codex_hook_trust::prepare_launch(&route.profiles, &routed, &route.aas)
+        {
+            eprintln!("tend: {note}");
+        }
+    }
+    Ok(routed)
 }
 
 fn decide_with(

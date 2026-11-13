@@ -564,6 +564,14 @@ never trusted anywhere. tend never trusts a hook the user did not, and never
 answers the menu: when it shows anyway, the swap ends
 `hook_review_pending: … waits on "Hooks need review"`, naming the pane.
 
+The same carry-over runs before `tend agent start` or a work launch starts
+Codex on an account (the launch routing in `account_route::decide`). Codex is
+asked from an empty directory, so only each home's own user hooks count, and
+it is asked with the release the agent runs (the swapped agent's own binary,
+aas's shim otherwise): older releases hash hooks differently. Paths are shown
+as Codex resolves them (`…/aas/profiles/…` when `asx` links to `aas`); trust
+keys written by hand must use that path.
+
 `tend doctor` checks every Codex home it knows (`~/.codex`, `$CODEX_HOME`,
 configured accounts, `asx/profiles/codex-*`) and warns about homes whose
 hooks would ask; `tend init` does the same after rewriting the Codex hooks.

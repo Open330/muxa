@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex hook trust (follow-up to #521): the audit and carry-over ask the
+  Codex release an agent actually runs (the swapped agent's own binary;
+  aas's shim for launches and `tend doctor`) instead of whichever `codex`
+  comes first on `PATH`: older releases hash hooks differently and reported
+  trusted homes as stale. Codex is asked from an empty directory, so a
+  home's own hooks are not mixed with the project hooks of `$HOME/.codex`
+  (rtzr's "never trusted" hooks were those). `tend doctor` and the swap note
+  print the home as Codex resolves it (`…/aas/profiles/…` once `asx` links to
+  `aas`), and `tend agent start` / work launches onto a Codex account carry
+  trust over too, not only swaps.
+
 ## [0.10.16] - 2026-11-13
 
 ### Added

@@ -2014,7 +2014,8 @@ fn swap_one(
                 request,
                 profiles.map_or(&[][..], |(profiles, _)| profiles),
                 &account,
-                &target.cwd,
+                launch.agent_pid,
+                planned.process_start.as_deref(),
             )
         })
         .flatten();
@@ -2037,7 +2038,8 @@ fn carry_codex_hook_trust(
     request: &SwapRequest,
     profiles: &[tend::accounts::AccountProfile],
     account: &str,
-    cwd: &str,
+    agent_pid: u32,
+    agent_start: Option<&str>,
 ) -> Option<String> {
     use crate::codex_hook_trust as trust;
     let codex_profiles: Vec<tend::accounts::AccountProfile> = profiles.to_vec();
@@ -2047,11 +2049,14 @@ fn carry_codex_hook_trust(
                 .into(),
         );
     };
-    let Some(codex) = trust::find_codex() else {
-        return Some("no codex program found to check hook trust with".into());
+    // The release the agent runs: older ones hash hooks differently.
+    let Some(codex) = trust::codex_of(agent_pid, agent_start) else {
+        return Some(
+            "could not tell which codex the agent runs, so Codex hook trust was not checked".into(),
+        );
     };
     let homes = trust::known_homes(&codex_profiles);
-    match trust::prepare(&codex, &home, cwd, &homes) {
+    match trust::prepare(&codex, &home, &homes, trust::BUDGET) {
         Ok(prepared) => prepared.note(),
         Err(error) => Some(format!("Codex hook trust was not checked ({error})")),
     }
