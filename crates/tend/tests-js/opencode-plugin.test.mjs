@@ -19,21 +19,28 @@ writeFileSync(file, body.replace(spawnImport, "const spawn = (...args) => global
 const plugin = await import(pathToFileURL(file).href);
 const { TendPlugin } = plugin;
 
-function fakeSpawn(sent) {
+function fakeSpawn(sent, answer) {
   return (command, args) => {
     assert.equal(command, "tend");
     assert.deepEqual(args, ["hook", "opencode", "--event", "event"]);
     const handlers = {};
+    const stdout = {};
     const child = {
       on: (name, fn) => {
         handlers[name] = fn;
         return child;
       },
+      stdout: { on: (name, fn) => (stdout[name] = fn) },
       stdin: {
         on: () => {},
         end: (text) => {
-          sent.push(JSON.parse(text));
-          setTimeout(() => handlers.close && handlers.close(0), 0);
+          const payload = JSON.parse(text);
+          sent.push(payload);
+          setTimeout(() => {
+            const out = answer(payload);
+            if (out && stdout.data) stdout.data(out);
+            if (handlers.close) handlers.close(0);
+          }, 0);
         },
       },
     };
@@ -49,13 +56,26 @@ test("one file loads under both plugin APIs", () => {
   assert.equal(plugin.default.setup(), undefined);
 });
 
-async function harness() {
+async function harness(answer = () => "") {
   const sent = [];
-  globalThis.__tendSpawn = fakeSpawn(sent);
-  const hooks = await TendPlugin({ client: { app: { log: async () => {} } }, directory: "/w" });
+  const prompted = [];
+  globalThis.__tendSpawn = fakeSpawn(sent, answer);
+  const client = {
+    app: { log: async () => {} },
+    session: { promptAsync: async (options) => prompted.push(options) },
+  };
+  const hooks = await TendPlugin({ client, directory: "/w" });
   const emit = (type, properties) => hooks.event({ event: { type, properties } });
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
-  return { sent, hooks, emit, settle };
+  // The plugin forwards on a timer, one child at a time: wait until nothing
+  // new has been sent for a while rather than for a fixed delay.
+  const settle = async () => {
+    let seen = -1;
+    while (seen !== sent.length + prompted.length) {
+      seen = sent.length + prompted.length;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+  };
+  return { sent, prompted, hooks, emit, settle };
 }
 
 const bind = (hooks, sessionID) =>
@@ -189,4 +209,68 @@ test("a session the pane no longer drives cannot revive its row", async () => {
   await settle();
   const after = sent.slice(before);
   assert.deepEqual(after.map((p) => [p.type, p.properties.sessionID]), [["session.idle", "A"]]);
+});
+
+const offer = (payload) => (payload.type === "session.idle" ? JSON.stringify({ prompt: "Tend is offering req_1" }) : "");
+
+test("a turn-boundary offer goes to opencode's prompt API for the bound session", async () => {
+  const { prompted, hooks, emit, settle } = await harness(offer);
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  await settle();
+  assert.deepEqual(prompted, [{ path: { id: "s" }, body: { parts: [{ type: "text", text: "Tend is offering req_1" }] } }]);
+});
+
+test("an offer never lands after the user prompted again", async () => {
+  const { prompted, hooks, emit, settle } = await harness(offer);
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  // Typed before the idle's hook call finished.
+  await bind(hooks, "s");
+  await settle();
+  assert.deepEqual(prompted, []);
+});
+
+test("no offer, or a non-idle event, prompts nothing", async () => {
+  const { prompted, hooks, emit, settle } = await harness((payload) => (payload.type === "tend.prompt" ? '{"prompt":"x"}' : "not json"));
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  await settle();
+  assert.deepEqual(prompted, []);
+});
+
+test("an aborted or failed turn gets no offer", async () => {
+  const { prompted, hooks, emit, settle } = await harness(offer);
+  await bind(hooks, "s");
+  await emit("session.error", { sessionID: "s", error: { name: "MessageAbortedError" } });
+  await emit("session.idle", { sessionID: "s" });
+  await settle();
+  assert.deepEqual(prompted, []);
+});
+
+// From the #514 review (Codex): opencode 1.x sends session.idle again after an
+// abort's cleanup; that idle must not turn the aborted turn into a boundary.
+test("a repeated idle after an abort or a failure is never a boundary", async () => {
+  for (const error of [{ name: "MessageAbortedError" }, { name: "APIError", data: { message: "overloaded" } }]) {
+    const { sent, prompted, hooks, emit, settle } = await harness(offer);
+    await bind(hooks, "s");
+    await emit("session.error", { sessionID: "s", error });
+    await emit("session.idle", { sessionID: "s" });
+    await emit("session.idle", { sessionID: "s" });
+    await settle();
+    assert.deepEqual(prompted, [], error.name);
+    assert.ok(sent.filter((p) => p.type === "session.idle").every((p) => p.tend.boundary !== true), error.name);
+  }
+});
+
+test("only the first idle of a clean turn is flagged as a boundary", async () => {
+  const { sent, hooks, emit, settle } = await harness();
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  await emit("session.idle", { sessionID: "s" });
+  await bind(hooks, "s");
+  await emit("session.idle", { sessionID: "s" });
+  await settle();
+  const flags = sent.filter((p) => p.type === "session.idle").map((p) => p.tend.boundary === true);
+  assert.deepEqual(flags, [true, false, true]);
 });

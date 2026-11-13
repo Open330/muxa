@@ -34,24 +34,41 @@ const BODY: &str = r#"// Forward opencode's own events to tend, without blocking
 // state. Child sessions (subagent tasks) never reach tend.
 import { spawn } from "node:child_process";
 
-// One `tend hook opencode` per payload, on stdin. Bun's `$` has no stdin
-// method, so this uses node's spawn, which opencode's Bun runtime provides.
+// One `tend hook opencode` per payload, on stdin; resolves with its
+// stdout. Bun's `$` has no stdin method, so this uses node's spawn, which
+// opencode's Bun runtime provides.
 const forward = (payload) =>
   new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn("tend", ["hook", "opencode", "--event", "event"], {
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: ["pipe", "pipe", "ignore"],
       });
     } catch (error) {
       reject(error);
       return;
     }
+    let out = "";
+    child.stdout.on("data", (chunk) => {
+      if (out.length < 65536) out += chunk;
+    });
     child.on("error", reject);
-    child.on("close", () => resolve());
+    child.on("close", () => resolve(out));
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(payload));
   });
+
+// At a turn boundary `tend hook opencode` may answer `{"prompt": TEXT}`:
+// requests the user authorized for this session, offered the way Claude
+// Code's Stop hook carries them. TEXT goes to opencode's prompt API.
+const offeredPrompt = (out) => {
+  try {
+    const value = JSON.parse(out);
+    return value && typeof value.prompt === "string" && value.prompt.trim() ? value.prompt : undefined;
+  } catch (_) {
+    return undefined;
+  }
+};
 
 export const TendPlugin = async ({ client, directory }) => {
   const queue = [];
@@ -63,6 +80,12 @@ export const TendPlugin = async ({ client, directory }) => {
   const completed = new Map(); // assistant messageIDs already reported
   let owner = null; // the session the pane's user last prompted
   const incomplete = new Set(); // sessionIDs whose current turn failed or was aborted
+  let prompts = 0; // prompts seen, so an offer never lands after the user typed
+  // sessionIDs whose current turn already reported its idle. opencode sends
+  // `session.idle` again after an abort's cleanup; only the first idle of a
+  // turn may be a boundary, and a failed turn stays failed until the next
+  // prompt starts a new one.
+  const settled = new Set();
 
   const remember = (map, key, value, cap = 512) => {
     map.set(key, value);
@@ -73,9 +96,17 @@ export const TendPlugin = async ({ client, directory }) => {
     if (flushing) return;
     flushing = true;
     while (queue.length > 0) {
-      const payload = queue.shift();
+      const { payload, seq, boundary } = queue.shift();
       try {
-        await forward(payload);
+        const out = await forward(payload);
+        const text = boundary ? offeredPrompt(out) : undefined;
+        // The user prompted after this idle: the offer waits for the next
+        // boundary instead of racing their turn (nothing is consumed yet).
+        if (text && seq === prompts) {
+          client.session
+            .promptAsync({ path: { id: payload.properties.sessionID }, body: { parts: [{ type: "text", text }] } })
+            .catch(() => {});
+        }
       } catch (error) {
         try {
           await client.app.log({
@@ -92,7 +123,9 @@ export const TendPlugin = async ({ client, directory }) => {
     flushing = false;
   };
 
-  const send = (type, properties, extra) => {
+  // `boundary`: a turn that ended cleanly, where tend may offer requests.
+  // Esc and failures are not: the user stopped it, or it needs them.
+  const send = (type, properties, extra, boundary = false) => {
     const sessionID = properties && properties.sessionID;
     if (sessionID && children.has(sessionID)) return;
     // opencode hands the plugin every session's events in its directory,
@@ -102,10 +135,11 @@ export const TendPlugin = async ({ client, directory }) => {
     // session's late idle or tool event must not revive its row here.
     if (type === "tend.prompt" && sessionID && sessionID !== owner) {
       owner = sessionID;
-      queue.push({ type: "tend.session.active", properties: { sessionID }, tend: { directory } });
+      queue.push({ payload: { type: "tend.session.active", properties: { sessionID }, tend: { directory } }, seq: prompts });
     }
     if (!sessionID || sessionID !== owner) return;
-    queue.push({ type, properties, tend: { directory, ...extra } });
+    const tend = boundary ? { directory, ...extra, boundary: true } : { directory, ...extra };
+    queue.push({ payload: { type, properties, tend }, seq: prompts, boundary });
     if (queue.length > 256) queue.shift();
     setTimeout(flush, 0);
   };
@@ -135,6 +169,8 @@ export const TendPlugin = async ({ client, directory }) => {
       // A new turn: nothing captured earlier belongs to it.
       replies.delete(input.sessionID);
       incomplete.delete(input.sessionID);
+      settled.delete(input.sessionID);
+      prompts += 1;
       send("tend.prompt", { sessionID: input.sessionID, text });
     },
     event: async ({ event }) => {
@@ -154,11 +190,13 @@ export const TendPlugin = async ({ client, directory }) => {
           send(event.type, { sessionID });
           if (sessionID === owner) owner = null;
           return;
-        case "session.idle":
-          send(event.type, { sessionID }, { response: replyText(sessionID) });
+        case "session.idle": {
+          const clean = !incomplete.has(sessionID) && !settled.has(sessionID);
+          send(event.type, { sessionID }, { response: replyText(sessionID) }, clean);
           replies.delete(sessionID);
-          incomplete.delete(sessionID);
+          if (sessionID) settled.add(sessionID);
           return;
+        }
         case "session.error":
           if (sessionID) incomplete.add(sessionID);
           send(event.type, p);
@@ -250,22 +288,40 @@ const TUI_BODY: &str = r#"// Forward opencode 2.x's own events to tend, from the
 // (other TUIs, subagents) are dropped.
 import { spawn } from "node:child_process";
 
+// One `tend hook opencode` per payload; resolves with its stdout, or ""
+// when tend cannot be run.
 const run = (payload) =>
   new Promise((resolve) => {
     let child;
     try {
       child = spawn("tend", ["hook", "opencode", "--event", "event"], {
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: ["pipe", "pipe", "ignore"],
       });
     } catch (_) {
-      resolve();
+      resolve("");
       return;
     }
-    child.on("error", () => resolve());
-    child.on("close", () => resolve());
+    let out = "";
+    child.stdout.on("data", (chunk) => {
+      if (out.length < 65536) out += chunk;
+    });
+    child.on("error", () => resolve(""));
+    child.on("close", () => resolve(out));
     child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(payload));
   });
+
+// At a turn boundary `tend hook opencode` may answer `{"prompt": TEXT}`:
+// requests the user authorized for this session, offered the way Claude
+// Code's Stop hook carries them. TEXT goes to opencode's prompt API.
+const offeredPrompt = (out) => {
+  try {
+    const value = JSON.parse(out);
+    return value && typeof value.prompt === "string" && value.prompt.trim() ? value.prompt : undefined;
+  } catch (_) {
+    return undefined;
+  }
+};
 
 export default {
   id: "tend",
@@ -281,6 +337,7 @@ export default {
     // TUI's own location follows whatever it shows, which may be another
     // project's session by now.
     let ownerDirectory = null;
+    let prompts = 0; // user prompts into the owner, so an offer never lands after the user typed
     const directory = () => {
       const location = ctx.location || {};
       return ownerDirectory || location.directory || process.cwd();
@@ -289,11 +346,29 @@ export default {
     const flush = async () => {
       if (flushing) return;
       flushing = true;
-      while (queue.length > 0) await run(queue.shift());
+      while (queue.length > 0) {
+        const { payload, seq, boundary } = queue.shift();
+        const out = await run(payload);
+        const text = boundary ? offeredPrompt(out) : undefined;
+        // The user prompted after this idle: the offer waits for the next
+        // boundary (nothing is consumed until the model claims it). `queue`
+        // delivery never steers a turn that started in between.
+        if (text && seq === prompts) {
+          try {
+            Promise.resolve(
+              ctx.client.session.prompt({ sessionID: payload.properties.sessionID, text, delivery: "queue" }),
+            ).catch(() => {});
+          } catch (_) {}
+        }
+      }
       flushing = false;
     };
-    const send = (type, properties, extra) => {
-      queue.push({ type, properties, tend: { directory: directory(), ...extra } });
+    // `boundary`: a turn that ended cleanly, where tend may offer requests.
+    // Esc and failures are not: the user stopped it, or it needs them.
+    const send = (type, properties, extra, boundary = false) => {
+      const tend = { directory: directory(), ...extra };
+      if (boundary) tend.boundary = true;
+      queue.push({ payload: { type, properties, tend }, seq: prompts, boundary });
       if (queue.length > 256) queue.shift();
       setTimeout(flush, 0);
     };
@@ -311,8 +386,10 @@ export default {
       const sessionID = d.sessionID || (d.form && d.form.sessionID);
       if (event.type === "session.inbox.enqueued") {
         const item = d.item || {};
+        if (item.type === "user" && sessionID && sessionID === owner) prompts += 1;
         // A prompt into the session this TUI shows binds the pane to it.
         if (item.type !== "user" || !sessionID || sessionID !== shown()) return;
+        if (sessionID !== owner) prompts += 1;
         if (sessionID !== owner) {
           owner = sessionID;
           ownerDirectory = (event.location && event.location.directory) || null;
@@ -426,7 +503,7 @@ export default {
           reply = null;
           return;
         case "session.execution.succeeded":
-          send("session.idle", { sessionID }, failed ? {} : { response: replyText() });
+          send("session.idle", { sessionID }, failed ? {} : { response: replyText() }, !failed);
           reply = null;
           failed = false;
           return;

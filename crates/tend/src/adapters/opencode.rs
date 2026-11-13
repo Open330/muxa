@@ -76,6 +76,11 @@ struct TendExtra {
     /// Text of the turn's last assistant message, on `session.idle`.
     #[serde(default)]
     response: Option<String>,
+    /// Set on the one `session.idle` that ends a turn cleanly: not after
+    /// Esc or a failure, and not a repeated idle. Only such an idle asks
+    /// tendd for turn-boundary offers.
+    #[serde(default)]
+    boundary: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +109,16 @@ pub fn check_flag(flag: &str) -> Result<(), OpencodeError> {
         "event" | "plugin" => Ok(()),
         other => Err(OpencodeError::UnknownFlag(other.into())),
     }
+}
+
+/// Whether a forwarded payload is a clean turn boundary, where tend may
+/// offer the session queued requests (see `tend hook opencode`). The plugin
+/// decides: only it knows whether the turn was aborted or failed, and an
+/// idle opencode repeats after an abort's cleanup is not a boundary.
+#[must_use]
+pub fn is_turn_boundary(text: &str) -> bool {
+    serde_json::from_str::<Envelope>(text)
+        .is_ok_and(|envelope| envelope.ty == "session.idle" && envelope.tend.boundary)
 }
 
 /// Parse one forwarded payload. `Ok(None)` means a well-formed event that
@@ -655,6 +670,20 @@ mod tests {
         ])
         .await;
         assert_eq!(state, crate::event::AgentState::Working);
+    }
+
+    #[test]
+    fn only_a_flagged_idle_is_a_turn_boundary() {
+        let idle = |tend: Value| {
+            json!({ "type": "session.idle", "properties": { "sessionID": "s" }, "tend": tend })
+                .to_string()
+        };
+        assert!(is_turn_boundary(&idle(json!({ "boundary": true }))));
+        assert!(!is_turn_boundary(&idle(json!({}))));
+        assert!(!is_turn_boundary(&idle(json!({ "boundary": false }))));
+        let prompt = json!({ "type": "tend.prompt", "properties": { "sessionID": "s" }, "tend": { "boundary": true } });
+        assert!(!is_turn_boundary(&prompt.to_string()));
+        assert!(!is_turn_boundary("not json"));
     }
 
     #[test]

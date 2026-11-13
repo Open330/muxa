@@ -20,22 +20,30 @@ const file = join(mkdtempSync(join(tmpdir(), "tend-opencode-tui-")), "tui.mjs");
 writeFileSync(file, body.replace(spawnImport, "const spawn = (...args) => globalThis.__tendSpawn(...args);"));
 const { default: plugin } = await import(pathToFileURL(file).href);
 
-async function harness() {
+async function harness(answer = () => "") {
   const sent = [];
+  const prompted = [];
   globalThis.__tendSpawn = (command, args) => {
     assert.equal(command, "tend");
     assert.deepEqual(args, ["hook", "opencode", "--event", "event"]);
     const handlers = {};
+    const stdout = {};
     const child = {
       on: (name, fn) => {
         handlers[name] = fn;
         return child;
       },
+      stdout: { on: (name, fn) => (stdout[name] = fn) },
       stdin: {
         on: () => {},
         end: (text) => {
-          sent.push(JSON.parse(text));
-          setTimeout(() => handlers.close && handlers.close(0), 0);
+          const payload = JSON.parse(text);
+          sent.push(payload);
+          setTimeout(() => {
+            const out = answer(payload);
+            if (out && stdout.data) stdout.data(out);
+            if (handlers.close) handlers.close(0);
+          }, 0);
         },
       },
     };
@@ -44,6 +52,7 @@ async function harness() {
   let route = { type: "home" };
   let listener;
   const ctx = {
+    client: { session: { prompt: async (input) => prompted.push(input) } },
     location: { directory: "/w" },
     ui: { router: { current: () => route } },
     data: {
@@ -66,8 +75,16 @@ async function harness() {
   };
   const prompt = (sessionID, text = "go") =>
     emit("session.inbox.enqueued", { sessionID, item: { type: "user", payload: { text } } });
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
-  return { sent, emit, show, prompt, settle, changeDirectory };
+  // The plugin forwards on a timer, one child at a time: wait until nothing
+  // new has been sent for a while rather than for a fixed delay.
+  const settle = async () => {
+    let seen = -1;
+    while (seen !== sent.length + prompted.length) {
+      seen = sent.length + prompted.length;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+  };
+  return { sent, prompted, emit, show, prompt, settle, changeDirectory };
 }
 
 const types = (sent) => sent.map((payload) => payload.type);
@@ -253,4 +270,62 @@ test("viewing another project keeps the bound session's directory", async () => 
   emit("session.execution.succeeded", { sessionID: "A" });
   await settle();
   assert.equal(sent.at(-1).tend.directory, "/w");
+});
+
+const offer = (payload) => (payload.type === "session.idle" ? JSON.stringify({ prompt: "Tend is offering req_1" }) : "");
+
+test("a turn-boundary offer is queued into the bound session through opencode's API", async () => {
+  const { prompted, emit, show, prompt, settle } = await harness(offer);
+  show("s");
+  prompt("s");
+  emit("session.execution.succeeded", { sessionID: "s" });
+  await settle();
+  assert.deepEqual(prompted, [{ sessionID: "s", text: "Tend is offering req_1", delivery: "queue" }]);
+});
+
+test("an offer never lands after anyone prompted the session again", async () => {
+  const { prompted, emit, show, prompt, settle } = await harness(offer);
+  show("s");
+  prompt("s");
+  emit("session.execution.succeeded", { sessionID: "s" });
+  // Another TUI on the shared server prompts the same session.
+  show("other");
+  prompt("s");
+  await settle();
+  assert.deepEqual(prompted, []);
+});
+
+test("only a clean turn end delivers, and only when tend offers", async () => {
+  const { prompted, emit, show, prompt, settle } = await harness(offer);
+  show("s");
+  prompt("s");
+  // Esc: the user stopped the turn; an offer must not start another.
+  emit("session.execution.interrupted", { sessionID: "s", reason: "user" });
+  prompt("s");
+  emit("session.execution.failed", { sessionID: "s", error: { type: "api", message: "x" } });
+  await settle();
+  assert.deepEqual(prompted, []);
+  const quiet = await harness(() => "");
+  quiet.show("s");
+  quiet.prompt("s");
+  quiet.emit("session.execution.succeeded", { sessionID: "s" });
+  await quiet.settle();
+  assert.deepEqual(quiet.prompted, []);
+});
+
+test("only a clean execution end is flagged as a boundary for the hook", async () => {
+  const { sent, emit, show, prompt, settle } = await harness();
+  show("s");
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  emit("session.execution.interrupted", { sessionID: "s", reason: "user" });
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  emit("session.execution.failed", { sessionID: "s", error: { type: "api", message: "x" } });
+  prompt("s");
+  emit("session.execution.started", { sessionID: "s" });
+  emit("session.execution.succeeded", { sessionID: "s" });
+  await settle();
+  const flags = sent.filter((p) => p.type === "session.idle").map((p) => p.tend.boundary === true);
+  assert.deepEqual(flags, [false, false, true]);
 });

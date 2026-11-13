@@ -101,16 +101,33 @@ opencode 2.x:
   only when the first prompt is sent, so until then the row has a placeholder
   id; the first event replaces it.
 
+## Turn-boundary delivery
+
+Requests the user authorized for an opencode session reach it the way they
+reach Claude Code and Codex: at the end of a turn, through opencode itself,
+never typed into the terminal where an unsent draft could merge with them.
+When a turn ends cleanly, `tend hook opencode` asks tendd for turn-boundary
+offers (the same ones Claude Code's Stop hook carries) and prints them as
+`{"prompt": TEXT}`. The plugin then prompts the bound session with TEXT
+through opencode's API: `client.session.promptAsync` on 1.x,
+`client.session.prompt` with `delivery: "queue"` on 2.x.
+
+- Only a clean turn end delivers. An Esc-interrupted or failed turn does not,
+  so an offer never restarts a turn the user stopped.
+- If anyone prompted the session after that turn ended, the offer waits for
+  the next boundary. Nothing is consumed until the model claims a request by
+  id (`tend msg accept ID`), so a skipped offer loses nothing.
+- Requests that are not turn-boundary offers still reach the pane the way
+  they reach any pane-based agent: delivered when its row is idle.
+
+Checked against the real opencode 1.19.5 and 2.2.7 TUIs: an offered prompt
+returned at the first turn's end ran as the session's next turn.
+
 ## Not available
 
 - **Rate limits and context usage.** opencode's events carry cost and model
   but no quota windows, so `rate_limit_*` and `context_used_pct` stay empty
   and usage-limit recovery does not apply to opencode.
-- **Turn-boundary prompt delivery.** Claude Code and Codex hooks can hand a
-  queued collaboration prompt back to the agent at a turn boundary. The
-  opencode bridge is one-way, so peer requests reach an opencode pane the way
-  they reach any pane-based agent without that hook: delivered into the pane
-  when its row is idle.
 - **Account routing** is Claude/Codex only.
 - **Modes.** Discovery sees the process name only, so it cannot tell the
   interactive TUI from `opencode serve` or `opencode run`, and registers a
