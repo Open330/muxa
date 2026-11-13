@@ -3,14 +3,14 @@
 // token kept by the main page, or the OIDC operator session cookie.
 // Everything an agent wrote is rendered with textContent, never as HTML.
 
-import { decidedCard, draftKey, hostSections } from "./needs-model.mjs";
+import { decidedCard, draftKey, hostSections, linkedItemOf, needsReturnPath } from "./needs-model.mjs";
 import { withPaneHash } from "./pane-drawer.mjs";
 
 const TOKEN_KEY = "tend.token";
 const REFRESH_MS = 10000;
 
 const $ = (id) => document.getElementById(id);
-const state = { tab: "queue", timer: null, generation: 0 };
+const state = { tab: "queue", timer: null, generation: 0, revealed: false };
 /// Unsent answers and notes by card, kept across re-renders.
 const drafts = new Map();
 
@@ -245,8 +245,26 @@ function lostAccess(error) {
   forget();
   $("status").textContent = error.message;
   const login = $("login");
-  login.href = `/auth/login?return_to=${encodeURIComponent("/needs")}`;
+  // Back to the same card after signing in.
+  login.href = `/auth/login?return_to=${encodeURIComponent(needsReturnPath(window.location.hash))}`;
   login.hidden = false;
+}
+
+function linkedItem() {
+  return linkedItemOf(window.location.hash);
+}
+
+/// Bring the linked card into view once per visit: only on the queue tab,
+/// never under someone typing, and only counted once the card was there
+/// (an unauthorized or empty first read does not use it up).
+function revealLinkedItem() {
+  const id = linkedItem();
+  if (!id || state.revealed || state.tab !== "queue" || composing()) return;
+  const card = [...document.querySelectorAll("#queue .card")].find((node) => node.dataset.id === id);
+  if (!card) return;
+  state.revealed = true;
+  card.classList.add("linked");
+  card.scrollIntoView({ block: "center" });
 }
 
 async function refresh() {
@@ -289,13 +307,13 @@ function select(tab) {
   $("tab-history").setAttribute("aria-selected", String(tab === "history"));
   $("queue").hidden = tab !== "queue";
   $("history").hidden = tab !== "history";
-  refresh();
+  refresh().then(revealLinkedItem);
 }
 
 $("tab-queue").addEventListener("click", () => select("queue"));
 $("tab-history").addEventListener("click", () => select("history"));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
+  if (!document.hidden) refresh().then(revealLinkedItem);
 });
 /// Typing in a card: a re-render now would move the cursor.
 function composing() {
@@ -305,4 +323,4 @@ function composing() {
 state.timer = setInterval(() => {
   if (!document.hidden) refresh();
 }, REFRESH_MS);
-refresh();
+refresh().then(revealLinkedItem);

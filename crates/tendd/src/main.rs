@@ -2135,6 +2135,13 @@ fn spawn_webhook_sink(
 ) -> Result<()> {
     match WebhookSink::resolve(&cfg.sinks.webhook) {
         Ok(Some(sink)) => {
+            let sink = sink.with_dashboard(
+                cfg.sinks.webhook.dashboard_url.as_deref(),
+                cfg.dashboard
+                    .login
+                    .as_ref()
+                    .map(|login| login.public_origin()),
+            );
             let transition_rx = store.subscribe();
             let shutdown_rx = shutdown_tx.subscribe();
             // `webhook_sink::spawn` returns the JoinHandle; we drop it

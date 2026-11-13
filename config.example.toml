@@ -497,6 +497,8 @@
 # flavor          = "slack"            # slack | discord | generic
 # on_states       = ["WaitingInput", "Error"]
 # rate_limit_secs = 60                 # per (kind, session, state)
+# dashboard_url   = "https://tend.example.com"  # link messages to /needs; default
+#                                      # [dashboard.login] public_url, "" = off
 
 # ---------------------------------------------------------------------------
 # `tend work up` — declarative work pipelines

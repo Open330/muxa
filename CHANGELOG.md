@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   questions may be missing. A question on a control-mode host can be
   answered from the page after tend checks it is addressed to the operator
   console there.
+- Webhook messages link to the agent's card on the dashboard's "Needs you"
+  page (`[sinks.webhook] dashboard_url`, defaulting to the sign-in public
+  URL); the generic payload carries it as `link`.
 - Decide from the web: the "Needs you" page answers questions (an option
   or your own words, or decline) and accepts, sends back or withdraws
   results, through the same daemon paths as the Mac app. Operator-only with
