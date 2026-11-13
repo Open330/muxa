@@ -143,15 +143,49 @@ pub fn plan(hooks: &[Hook], home: &Path, trusted: &[Trusted]) -> (Vec<Trusted>, 
     (copies, left)
 }
 
-/// The `CODEX_HOME` a profile launches with: its `env`, then its
-/// `env_file`, the later one winning as it does at launch.
+/// The `CODEX_HOME` a profile launches with, read without running
+/// anything: its explicit `env` wins (the launch line sets it after the
+/// file is sourced); otherwise a plain `CODEX_HOME=…` assignment in its
+/// `env_file`. A value the shell would compute (`$`, backticks) is not
+/// guessed: `None`.
 fn profile_home(profile: &tend::accounts::AccountProfile) -> Option<PathBuf> {
-    profile
-        .resolved_env()
-        .into_iter()
-        .rfind(|(key, _)| key == "CODEX_HOME")
-        .map(|(_, value)| PathBuf::from(value))
-        .filter(|path| path.is_absolute())
+    let value = if let Some(value) = profile.env.get("CODEX_HOME") {
+        value.clone()
+    } else {
+        let file = expand_home(profile.env_file.as_deref()?);
+        assigned_home(&std::fs::read_to_string(file).ok()?)?
+    };
+    let path = expand_home(&value);
+    path.is_absolute().then_some(path)
+}
+
+/// The last plain `CODEX_HOME=<value>` (optionally `export`ed, optionally
+/// quoted) in an env file. `None` if it is absent or computed.
+fn assigned_home(text: &str) -> Option<String> {
+    let mut found = None;
+    for line in text.lines().map(str::trim) {
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some(value) = line.strip_prefix("CODEX_HOME=").map(str::trim) else {
+            continue;
+        };
+        found = if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            // Single quotes are literal.
+            Some(inner.to_owned())
+        } else if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            (!inner.contains(['$', '`', '\\', '"'])).then(|| inner.to_owned())
+        } else {
+            (!value.contains(['$', '`', '\\', '"', '\'', ' ', ';', '&', '|']))
+                .then(|| value.to_owned())
+        };
+    }
+    found.filter(|value| !value.is_empty())
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match (path.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
 }
 
 /// The account homes on this machine whose own hooks can vouch for a hook:
@@ -654,11 +688,22 @@ mod tests {
         assert!(vouched_by(&[project, untrusted, mismatched], home).is_empty());
     }
 
+    /// The launch's own precedence, read without running anything: an
+    /// explicit `env` wins over the file; a file is read as text, a plain
+    /// assignment only.
     #[test]
     fn a_profiles_codex_home_follows_its_launch_environment() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("acct.env");
-        std::fs::write(&file, "export CODEX_HOME=\"/tmp/from-env-file\"\n").unwrap();
+        let marker = dir.path().join("ran");
+        std::fs::write(
+            &file,
+            format!(
+                "touch {}\nexport CODEX_HOME=\"/tmp/from-env-file\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
         let profile = tend::accounts::AccountProfile {
             name: "work".into(),
             env: std::collections::BTreeMap::from([(
@@ -667,15 +712,23 @@ mod tests {
             )]),
             env_file: Some(file.display().to_string()),
         };
-        assert_eq!(
-            profile_home(&profile),
-            Some(PathBuf::from("/tmp/from-env-file"))
-        );
-        let plain = tend::accounts::AccountProfile {
-            env_file: None,
+        assert_eq!(profile_home(&profile), Some(PathBuf::from("/tmp/from-env")));
+        let file_only = tend::accounts::AccountProfile {
+            env: std::collections::BTreeMap::new(),
             ..profile
         };
-        assert_eq!(profile_home(&plain), Some(PathBuf::from("/tmp/from-env")));
+        assert_eq!(
+            profile_home(&file_only),
+            Some(PathBuf::from("/tmp/from-env-file"))
+        );
+        assert!(!marker.exists(), "the env file must not be run");
+        assert_eq!(
+            assigned_home("CODEX_HOME=/a\nCODEX_HOME='/b c'\n").as_deref(),
+            Some("/b c")
+        );
+        assert_eq!(assigned_home("export CODEX_HOME=\"$HOME/x\"\n"), None);
+        assert_eq!(assigned_home("CODEX_HOME=`pick`\n"), None);
+        assert_eq!(assigned_home("OTHER=1\n"), None);
     }
 
     #[test]
