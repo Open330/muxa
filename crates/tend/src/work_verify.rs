@@ -435,7 +435,6 @@ pub enum Gate {
 /// record) is [`Gate::NoChecks`].
 pub async fn verify(
     store: &crate::dashboard::work_store::SharedWorkStore,
-    runs: &crate::pipeline_run::PipelineRunStore,
     identity: &crate::work::WorkIdentity,
 ) -> Gate {
     let plan = store
@@ -446,7 +445,6 @@ pub async fn verify(
     let Some(plan) = plan.filter(|plan| !plan.checks.is_empty()) else {
         return Gate::NoChecks;
     };
-    let generation = runs.get(identity).await.map(|run| run.generation);
     let Some(dir) = plan.checks_dir().map(str::to_owned) else {
         // Refused at edit time; kept as a failure rather than a pass.
         return Gate::Failed(vec![CheckOutcome {
@@ -458,94 +456,17 @@ pub async fn verify(
             tail: "not run: the Work has no directory".into(),
         }]);
     };
-    let fingerprint = PassKey {
-        identity: identity.clone(),
-        checks: plan.checks.clone(),
-        dir: dir.clone(),
-        generation,
-    };
     let checks = plan.checks;
     let outcomes =
         tokio::task::spawn_blocking(move || run_checks(&checks, std::path::Path::new(&dir)))
             .await
             .unwrap_or_default();
     let passed = !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.passed);
-    record_result(&fingerprint, passed);
     if passed {
         Gate::Passed(outcomes)
     } else {
         Gate::Failed(outcomes)
     }
-}
-
-/// What a pass was for: the same Work, the same checks, the same
-/// directory and the same durable Run generation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PassKey {
-    identity: crate::work::WorkIdentity,
-    checks: Vec<WorkCheck>,
-    dir: String,
-    generation: Option<u64>,
-}
-
-/// How long a pass can stand in for the completion that follows it: the
-/// pair `tend work done --summary` sends back to back.
-const PASS_REUSE: std::time::Duration = std::time::Duration::from_secs(120);
-
-fn passes() -> &'static std::sync::Mutex<std::collections::HashMap<PassKey, std::time::Instant>> {
-    static PASSES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PassKey, std::time::Instant>>,
-    > = std::sync::OnceLock::new();
-    PASSES.get_or_init(Default::default)
-}
-
-/// Remember a pass for its exact [`PassKey`]; a failure forgets every
-/// pass of that Work.
-fn record_result(key: &PassKey, passed: bool) {
-    let mut table = passes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    table.retain(|_, at| at.elapsed() < PASS_REUSE);
-    if passed {
-        table.insert(key.clone(), std::time::Instant::now());
-    } else {
-        table.retain(|pass, _| pass.identity != key.identity);
-    }
-}
-
-/// [`verify`] for a completion: a pass of the very same checks, directory
-/// and Run generation within [`PASS_REUSE`] stands in once and is used up;
-/// anything else runs the checks again.
-pub async fn verify_for_completion(
-    store: &crate::dashboard::work_store::SharedWorkStore,
-    runs: &crate::pipeline_run::PipelineRunStore,
-    identity: &crate::work::WorkIdentity,
-) -> Gate {
-    let plan = store
-        .lock()
-        .await
-        .get(identity)
-        .and_then(|record| record.plan)
-        .filter(|plan| !plan.checks.is_empty());
-    if let Some(plan) = &plan {
-        if let Some(dir) = plan.checks_dir() {
-            let key = PassKey {
-                identity: identity.clone(),
-                checks: plan.checks.clone(),
-                dir: dir.to_owned(),
-                generation: runs.get(identity).await.map(|run| run.generation),
-            };
-            let reused = passes()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key)
-                .is_some_and(|at| at.elapsed() < PASS_REUSE);
-            if reused {
-                return Gate::Passed(Vec::new());
-            }
-        }
-    }
-    verify(store, runs, identity).await
 }
 
 /// Put tend's own check results at the head of a result record's
@@ -753,9 +674,8 @@ mod tests {
         let store = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::dashboard::work_store::WorkStore::memory(),
         ));
-        let runs = crate::pipeline_run::PipelineRunStore::in_memory();
         let identity = WorkIdentity::new("verify-test", "ENG-1");
-        assert_eq!(verify(&store, &runs, &identity).await, Gate::NoChecks);
+        assert_eq!(verify(&store, &identity).await, Gate::NoChecks);
         store
             .lock()
             .await
@@ -771,41 +691,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            verify(&store, &runs, &identity).await,
-            Gate::Failed(_)
-        ));
+        assert!(matches!(verify(&store, &identity).await, Gate::Failed(_)));
         std::fs::write(dir.path().join("ready"), b"").unwrap();
-        assert!(matches!(
-            verify(&store, &runs, &identity).await,
-            Gate::Passed(_)
-        ));
-        // A completion right after reuses that exact pass once, without
-        // rerunning; the next one runs the checks again.
-        assert!(matches!(
-            verify_for_completion(&store, &runs, &identity).await,
-            Gate::Passed(outcomes) if outcomes.is_empty()
-        ));
-        assert!(matches!(
-            verify_for_completion(&store, &runs, &identity).await,
-            Gate::Passed(outcomes) if !outcomes.is_empty()
-        ));
-        // A failure in between forgets the pass: completion re-checks.
+        assert!(matches!(verify(&store, &identity).await, Gate::Passed(_)));
+        // Nothing is reused: once the result is gone, the next
+        // verification (a completion, say) fails.
         std::fs::remove_file(dir.path().join("ready")).unwrap();
-        assert!(matches!(
-            verify(&store, &runs, &identity).await,
-            Gate::Failed(_)
-        ));
-        assert!(matches!(
-            verify_for_completion(&store, &runs, &identity).await,
-            Gate::Failed(_)
-        ));
-        // A pass of other checks does not stand in for the current ones.
+        assert!(matches!(verify(&store, &identity).await, Gate::Failed(_)));
+        // Changed checks are what runs next.
         std::fs::write(dir.path().join("ready"), b"").unwrap();
-        assert!(matches!(
-            verify(&store, &runs, &identity).await,
-            Gate::Passed(_)
-        ));
+        assert!(matches!(verify(&store, &identity).await, Gate::Passed(_)));
         store
             .lock()
             .await
@@ -819,10 +714,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            verify_for_completion(&store, &runs, &identity).await,
-            Gate::Failed(_)
-        ));
+        assert!(matches!(verify(&store, &identity).await, Gate::Failed(_)));
     }
 
     #[cfg(unix)]
@@ -865,10 +757,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            verify(&store, &runs, &identity).await,
-            Gate::Passed(_)
-        ));
+        assert!(matches!(verify(&store, &identity).await, Gate::Passed(_)));
         // A pipeline registration naming another directory (one any client
         // can send) does not move the checks there either.
         let routed = tempfile::tempdir().unwrap();
@@ -895,10 +784,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(matches!(
-            verify(&store, &runs, &identity).await,
-            Gate::Failed(_)
-        ));
+        assert!(matches!(verify(&store, &identity).await, Gate::Failed(_)));
     }
 
     /// A check that leaves a process in the background holding its output

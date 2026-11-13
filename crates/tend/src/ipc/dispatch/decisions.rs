@@ -146,7 +146,7 @@ async fn verify_result(
     let Some(identity) = identity else {
         return Ok(());
     };
-    match crate::work_verify::verify(&ctx.work_store, &ctx.pipeline_runs, &identity).await {
+    match crate::work_verify::verify(&ctx.work_store, &identity).await {
         crate::work_verify::Gate::NoChecks => Ok(()),
         crate::work_verify::Gate::Passed(outcomes) => {
             crate::work_verify::attach(&mut review.decision, &outcomes);

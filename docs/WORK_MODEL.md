@@ -112,9 +112,9 @@ than holding it.
   stays open, and the agent gets `checks_failed` with each check's output to
   fix and report again. The person is not asked.
 
-A completion right after a passing result reuses that pass once instead of
-running the checks again, only within two minutes and only for the same
-checks, directory and Run generation; a failing run in between cancels it.
+Every result and every completion runs the checks afresh: a pass from an
+earlier call cannot show that what is completed now is what was checked, so
+`tend work done --summary` (file, then complete) runs them twice.
 
 ### External issues
 
