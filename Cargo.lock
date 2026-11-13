@@ -3944,6 +3944,7 @@ dependencies = [
  "cliclack",
  "crossterm",
  "dirs",
+ "nix 0.29.0",
  "serde",
  "serde_json",
  "tempfile",

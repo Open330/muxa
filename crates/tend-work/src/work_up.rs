@@ -103,12 +103,6 @@ pub struct UpArgs {
     /// daemon.
     #[arg(skip)]
     pub non_interactive: bool,
-    /// Set only by tendd's in-process `work up`: the daemon a nested `tend`
-    /// (a route's `prepare` script) must reach. The `tend` child it replaces
-    /// carried the socket as `TEND_SOCKET` and had a closed stdin and a
-    /// deadline; `prepare` gets the same three when this is set.
-    #[arg(skip)]
-    pub subprocess_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -265,7 +259,6 @@ pub async fn run_noninteractive(
     client: &tend::ipc::Client,
 ) -> Result<UpResult> {
     args.non_interactive = true;
-    args.subprocess_socket = Some(client.socket().to_path_buf());
     let planned = if crate::backlog::backlog_supported(client).await {
         let records = client
             .work_backlog(None)
@@ -922,7 +915,7 @@ fn prepared_cwd(
     }
     if !target.exists() {
         println!("preparing: {command}");
-        run_prepare(&command, args, PREPARE_DEADLINE)?;
+        run_prepare(&command)?;
     }
     let cwd = tend::paths::canonicalize(&target).with_context(|| {
         format!(
@@ -933,48 +926,12 @@ fn prepared_cwd(
     Ok((cwd, None, true))
 }
 
-/// How long a non-interactive `prepare` may run: the deadline the `tend`
-/// child tendd used to run `work up` in had.
-pub const PREPARE_DEADLINE: std::time::Duration = tend::work_control::WORK_UP_TIMEOUT;
-
-fn run_prepare(command: &str, args: &UpArgs, deadline: std::time::Duration) -> Result<()> {
+fn run_prepare(command: &str) -> Result<()> {
     // `sh -c` on Unix, PowerShell on Windows: a route's `prepare` is written
-    // for the shell of the host it runs on.
-    let mut script = tend::shell::script_command(command);
-    let Some(socket) = &args.subprocess_socket else {
-        let status = script
-            .status()
-            .with_context(|| format!("running prepare: {command}"))?;
-        if !status.success() {
-            bail!("prepare command failed ({status}): {command}");
-        }
-        return Ok(());
-    };
-    // Inside tendd: what the `tend` child gave every nested process. Stdin
-    // is closed (the daemon's own may be a terminal), the daemon socket is
-    // pinned, and the script is killed at the child's old deadline rather
-    // than outliving the operation that reported it.
-    script
-        .stdin(std::process::Stdio::null())
-        .env("TEND_SOCKET", socket);
-    let mut child = script
-        .spawn()
+    // for the shell of the host it runs on. Inside tendd the subprocess scope
+    // closes its stdin, pins `TEND_SOCKET` and holds it to the deadline.
+    let status = crate::subprocess::status(&mut tend::shell::script_command(command))
         .with_context(|| format!("running prepare: {command}"))?;
-    let started = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "prepare command exceeded {}s and was stopped: {command}",
-                deadline.as_secs()
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
     if !status.success() {
         bail!("prepare command failed ({status}): {command}");
     }
@@ -1198,12 +1155,9 @@ fn default_base(repo: &Path) -> Option<String> {
 }
 
 fn git(repo: &Path, args: &[String]) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .context("run git")?;
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    let output = crate::subprocess::output(&mut command).context("run git")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!(
@@ -1773,10 +1727,13 @@ fn send_prompt(pane: &str, text: &str) -> Result<()> {
     }
     // Native hosts have an explicit paste end; other hosts use a fallback.
     std::thread::sleep(tend::backend::prompt_submit_grace(pane));
-    let output =
-        crate::mux_control::ambient_command_with_args(&["send-keys", "-t", pane, "Enter"])?
-            .output()
-            .context("submit prompt")?;
+    let output = crate::subprocess::output(&mut crate::mux_control::ambient_command_with_args(&[
+        "send-keys",
+        "-t",
+        pane,
+        "Enter",
+    ])?)
+    .context("submit prompt")?;
     if !output.status.success() {
         bail!("tmux could not submit the prompt to {pane}");
     }
@@ -1784,10 +1741,13 @@ fn send_prompt(pane: &str, text: &str) -> Result<()> {
 }
 
 fn apply_layout(window: &str, layout: &str) -> Result<()> {
-    let output =
-        crate::mux_control::ambient_command_with_args(&["select-layout", "-t", window, layout])?
-            .output()
-            .context("apply pipeline layout")?;
+    let output = crate::subprocess::output(&mut crate::mux_control::ambient_command_with_args(&[
+        "select-layout",
+        "-t",
+        window,
+        layout,
+    ])?)
+    .context("apply pipeline layout")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("tmux select-layout {layout} failed: {stderr}");
@@ -1927,30 +1887,6 @@ async fn require_pipeline_purpose_support(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[test]
-    fn an_in_daemon_prepare_gets_a_closed_stdin_the_pinned_socket_and_a_deadline() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out");
-        let socket = dir.path().join("tendd.sock");
-        let mut args = up_args(None);
-        args.subprocess_socket = Some(socket.clone());
-        // `read` must see end-of-file at once, not wait on a terminal.
-        let script = format!(
-            "read line; echo \"[$line]$TEND_SOCKET\" > '{}'",
-            out.display()
-        );
-        run_prepare(&script, &args, Duration::from_secs(10)).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&out).unwrap().trim(),
-            format!("[]{}", socket.display())
-        );
-        let started = std::time::Instant::now();
-        let error = run_prepare("sleep 30", &args, Duration::from_millis(300)).unwrap_err();
-        assert!(error.to_string().contains("exceeded"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
     /// tendd's in-process `work up` reads the argv the daemon used to hand
     /// the CLI. Every request field must survive that round trip.
     #[test]
@@ -1999,7 +1935,6 @@ mod tests {
             body_from_plan: false,
             planned_cwd: None,
             non_interactive: false,
-            subprocess_socket: None,
             work: "eng-1".into(),
             external: None,
             pipeline: None,

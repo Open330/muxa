@@ -8,19 +8,22 @@
 //!   else the default path, and never tendd's own `--config`;
 //! - the daemon's own environment and working directory, which the child
 //!   inherited;
-//! - an IPC client on the socket the child had pinned as `TEND_SOCKET`,
-//!   which a route's `prepare` script also gets;
-//! - no prompts, and a closed stdin and the old deadline for `prepare`
-//!   (the child's stdin was null and it was killed at the deadline);
+//! - an IPC client on the socket the child had pinned as `TEND_SOCKET`;
+//! - no prompts;
+//! - for every git, tmux and `prepare` process it starts, what the child's
+//!   own processes had: a closed stdin, `TEND_SOCKET`, and the 600 s
+//!   deadline, enforced by killing the process group and refusing new
+//!   commands once it has passed (`tend_work::subprocess`);
 //! - the agent-directory invalidation the CLI sent after every `work up`.
 //!
 //! The work is synchronous in places (tmux and git subprocesses, blocking
 //! IPC back to this daemon), so it runs on a blocking thread with its own
 //! single-threaded runtime and never on the daemon's async workers.
 //! Anything that fails before the first effect (unparseable argv, unreadable
-//! config) declines, and the caller runs the child instead. There is no
-//! outer timeout: the operation stays running (and counted) until the work
-//! really ends, and its one unbounded step, `prepare`, carries the deadline.
+//! config, or a ticket lookup, which starts an agent outside that scope)
+//! declines, and the caller runs the child instead. There is no outer
+//! timeout: the operation stays running, and counted, until the work really
+//! ends, which the subprocess deadline bounds.
 //! `TEND_WORK_UP_CHILD=1` forces the child.
 
 use std::path::PathBuf;
@@ -46,6 +49,12 @@ async fn run(
             return None;
         }
     };
+    // A ticket lookup starts a headless agent through `tend::ask`, outside
+    // the subprocess scope below, so it would miss the socket the child
+    // pinned for its hooks. Leave those to the child.
+    if args.external.is_some() && !args.no_ticket {
+        return None;
+    }
     let config_path = cli_config_path(
         std::env::var_os("TEND_CONFIG"),
         tend::paths::default_config_file(),
@@ -62,14 +71,20 @@ async fn run(
             .enable_all()
             .build()
             .map_err(|error| WorkUpError::Failed(format!("work up runtime: {error}")))?;
-        runtime.block_on(async move {
-            let client = tend::ipc::Client::new(socket);
-            let result = tend_work::work_up::run_noninteractive(args, &config, &client).await;
-            // As the CLI did after every `work up`, success or not.
-            let _ = client.invalidate_agent_directory().await;
-            let result =
-                result.map_err(|error| WorkUpError::Failed(last_line(&format!("{error:?}"))))?;
-            serde_json::to_value(result).map_err(WorkUpError::InvalidJson)
+        let scope = tend_work::subprocess::Scope {
+            socket: socket.clone(),
+            deadline: std::time::Instant::now() + tend::work_control::WORK_UP_TIMEOUT,
+        };
+        tend_work::subprocess::with_scope(scope, || {
+            runtime.block_on(async move {
+                let client = tend::ipc::Client::new(socket);
+                let result = tend_work::work_up::run_noninteractive(args, &config, &client).await;
+                // As the CLI did after every `work up`, success or not.
+                let _ = client.invalidate_agent_directory().await;
+                let result = result
+                    .map_err(|error| WorkUpError::Failed(last_line(&format!("{error:?}"))))?;
+                serde_json::to_value(result).map_err(WorkUpError::InvalidJson)
+            })
         })
     });
     Some(match work.await {

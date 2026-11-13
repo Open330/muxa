@@ -246,16 +246,15 @@ impl SplitDirection {
 /// `#{pane_width}x#{pane_height}` for a target pane, or `None` when tmux
 /// cannot answer (no server, unknown target).
 fn pane_shape(target: &str) -> Option<(u32, u32)> {
-    let output = crate::mux_control::ambient_command_with_args(&[
+    let mut command = crate::mux_control::ambient_command_with_args(&[
         "display",
         "-p",
         "-t",
         target,
         "#{pane_width}x#{pane_height}",
     ])
-    .ok()?
-    .output()
     .ok()?;
+    let output = crate::subprocess::output(&mut command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -907,9 +906,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             &tend::collaboration::WorkerSpawnAction::Begin,
         )?;
     }
-    let output = crate::mux_control::ambient_command_with_args(&args)?
-        .output()
-        .context("run tmux agent launcher")?;
+    let output =
+        crate::subprocess::output(&mut crate::mux_control::ambient_command_with_args(&args)?)
+            .context("run tmux agent launcher")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if create_was_rejected(&output) {
@@ -969,7 +968,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         "#{socket_path}",
     ])
     .ok()
-    .and_then(|mut command| command.output().ok())
+    .and_then(|mut command| crate::subprocess::output(&mut command).ok())
     .filter(|out| out.status.success())
     .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
     .filter(|endpoint| !endpoint.is_empty() && !endpoint.contains("#{"));
@@ -982,7 +981,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         &launch_id,
     ])
     .ok()
-    .and_then(|mut command| command.status().ok())
+    .and_then(|mut command| crate::subprocess::status(&mut command).ok())
     .is_some_and(|status| status.success());
     if let Some(directory) = &archive {
         if let Err(error) = tend::launch_identity::complete(directory, receipt.clone()) {
@@ -996,15 +995,14 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         // Launching was persisted before creation. A crash in the small
         // create-to-stamp gap remains Uncertain and cannot trigger a respawn.
         // Once stamped, any daemon client can reconcile this exact launch.
-        crate::mux_control::ambient_command_with_args(&[
+        crate::subprocess::output(&mut crate::mux_control::ambient_command_with_args(&[
             "set-option",
             "-p",
             "-t",
             &pane,
             "@tend_worker_launch",
             &launch_id,
-        ])?
-        .output()
+        ])?)
         .and_then(|output| {
             if output.status.success() {
                 Ok(())
@@ -1510,14 +1508,13 @@ fn resolve_window_session(target: &str) -> Result<String> {
 /// refused with. The outer `Result` is reserved for not being able to run tmux
 /// at all, which is not something another spelling can recover from.
 fn session_id_of(target: &str) -> Result<std::result::Result<String, String>> {
-    let output = crate::mux_control::ambient_command_with_args(&[
+    let output = crate::subprocess::output(&mut crate::mux_control::ambient_command_with_args(&[
         "display-message",
         "-p",
         "-t",
         target,
         "#{session_id}",
-    ])?
-    .output()
+    ])?)
     .context("resolve tmux window target")?;
     if !output.status.success() {
         return Ok(Err(String::from_utf8_lossy(&output.stderr)
@@ -1643,9 +1640,9 @@ fn sanitize_session_name(name: &str) -> String {
 }
 
 fn existing_session_names() -> Vec<String> {
-    crate::mux_control::ambient_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
+    let mut command = crate::mux_control::ambient_command();
+    command.args(["list-sessions", "-F", "#{session_name}"]);
+    crate::subprocess::output(&mut command)
         .map(|output| {
             String::from_utf8_lossy(&output.stdout)
                 .lines()
