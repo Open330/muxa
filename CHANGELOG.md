@@ -65,7 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too, from `Get-NetTCPConnection`. Because a process whose directory tend
   cannot read (an elevated one) is skipped there, a delete on Windows first
   moves the set-aside tree to a fresh name, which Windows refuses while any
-  process works inside, and deletes only the moved tree.
+  process works inside, and deletes only the moved tree. Worktree receipts
+  save on Windows at all now (they failed to sync their folder there).
 
 - An agent launched on a named tmux server (MCP `tend_start_agent`, and
   now tendd) looks up its new pane on that server only. A pane with the
