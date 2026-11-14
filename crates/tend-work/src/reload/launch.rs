@@ -208,7 +208,8 @@ pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustPrompt> {
     if claude_started(screen) {
         return None;
     }
-    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let raw: Vec<&str> = screen.lines().collect();
+    let lines: Vec<&str> = raw.iter().map(|line| line.trim()).collect();
     let header = lines
         .iter()
         .position(|line| *line == "Accessing workspace:")?;
@@ -221,8 +222,20 @@ pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustPrompt> {
         .iter()
         .position(|line| line.is_empty())
         .unwrap_or(lines.len() - path_start);
-    // A long path wraps across rows of the capture.
-    let workspace: String = lines[path_start..path_start + path_len].concat();
+    // The path keeps every character but the dialog's ASCII indent and
+    // padding: a name may end in other whitespace (Windows keeps a trailing
+    // no-break space), and trimming it would name another folder.
+    let rows: Vec<&str> = raw[path_start..path_start + path_len]
+        .iter()
+        .map(|row| row.trim_matches([' ', '\r']))
+        .collect();
+    // A long path wraps across rows of the capture. Where a row breaks, a
+    // space may have been dropped, so a wrapped Windows path (where names
+    // with spaces are the rule) is not trusted automatically.
+    if rows.len() > 1 && !rows[0].starts_with('/') {
+        return None;
+    }
+    let workspace: String = rows.concat();
     if !is_absolute_dir(&workspace) {
         return None;
     }
@@ -623,6 +636,33 @@ mod tests {
             let screen = TRUST_PROMPT_NO.replace("/tmp/untrusted-probe", relative);
             assert_eq!(claude_trust_prompt(&screen), None, "{relative}");
         }
+    }
+
+    #[test]
+    fn a_windows_path_is_never_rebuilt_into_another_trusted_folder() {
+        let trusted = r"C:\Users\j\trusted";
+        // A folder named like the trusted one plus a trailing no-break
+        // space (Windows keeps it): the space is part of the name.
+        let nbsp = moved_to_yes().replace("/tmp/untrusted-probe", &format!("{trusted}\u{a0}"));
+        assert_eq!(
+            claude_trust_prompt(&nbsp).map(|prompt| prompt.workspace),
+            Some(format!("{trusted}\u{a0}"))
+        );
+        assert_eq!(watch(&[trusted]).observe("=a:0.0", ms(0), &nbsp), None);
+        // `trust ed` wrapped at its space would join up as `trusted`.
+        let wrapped = moved_to_yes().replace(
+            " /tmp/untrusted-probe",
+            r" C:\Users\j\trust
+ ed",
+        );
+        assert_eq!(claude_trust_prompt(&wrapped), None);
+        assert_eq!(watch(&[trusted]).observe("=a:0.0", ms(0), &wrapped), None);
+        // The exact folder on one row is still answered.
+        let exact = moved_to_yes().replace("/tmp/untrusted-probe", trusted);
+        assert_eq!(
+            watch(&[trusted]).observe("=a:0.0", ms(0), &exact),
+            Some(TrustKey::Enter)
+        );
     }
 
     #[test]

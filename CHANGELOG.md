@@ -79,7 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows: the tmux sidebar hooks keep their inner quoting under
   PowerShell, so new and selected windows get a sidebar again on rmux.
   `~` in account paths expands against `USERPROFILE` when `HOME` is unset,
-  and Claude's folder-trust prompt is read for drive and UNC paths.
+  and Claude's folder-trust prompt is read for drive and UNC paths (on one
+  row, character for character, so a wrapped or look-alike path is left for
+  a person).
 
 - An agent launched on a named tmux server (MCP `tend_start_agent`, and
   now tendd) looks up its new pane on that server only. A pane with the
