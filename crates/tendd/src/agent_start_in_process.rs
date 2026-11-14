@@ -111,9 +111,9 @@ async fn run(
                     // As the CLI did after every `agent start`, success or not.
                     let _ = client.invalidate_agent_directory().await;
                     let value = result.map_err(|error| {
-                        AgentStartError::Failed(crate::work_up_in_process::last_line(&format!(
-                            "{error:?}"
-                        )))
+                        AgentStartError::Failed(crate::work_up_in_process::last_line(
+                            &crate::work_up_in_process::printed(&error),
+                        ))
                     })?;
                     serde_json::from_value::<AgentStartResult>(value)
                         .map_err(AgentStartError::InvalidJson)

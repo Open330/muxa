@@ -34,6 +34,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# `reload` reads each pane's argv with its argument boundaries (macOS `ps`
+# only reports them joined) and when the agent in it started. Linux reads
+# both from `/proc`.
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+
 [target.'cfg(unix)'.dependencies]
 # Kill a timed-out command's whole process group (`subprocess`).
 nix = { version = "0.29", features = ["signal"] }

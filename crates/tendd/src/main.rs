@@ -55,6 +55,7 @@ mod fleet_manager;
 mod herdr_bridge;
 mod pipeline_reconciler;
 mod screen_detect;
+mod snapshot_in_process;
 mod synthetic;
 mod work_up_in_process;
 
@@ -256,6 +257,7 @@ async fn run() -> Result<()> {
         .unwrap_or_else(paths::default_socket);
     work_up_in_process::install(socket.clone());
     agent_start_in_process::install(socket.clone());
+    snapshot_in_process::install();
     tracing::info!(
         socket = %socket.display(),
         generation = restart_generation(),

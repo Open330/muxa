@@ -52,8 +52,6 @@ mod time_range;
 mod timeline;
 mod upgrade;
 mod watch;
-#[cfg(windows)]
-mod windows_detach;
 mod work_backlog;
 mod work_cmds;
 mod work_compose;

@@ -273,7 +273,7 @@ pub(crate) fn start_detached(
         // redirection opens it exclusively, and the next daemon to start — a
         // restart overlapping its predecessor — then could not start.
         command.arg("--log-file").arg(&log_path);
-        crate::windows_detach::spawn(&command).context("spawning detached tendd")?;
+        tend_work::windows_detach::spawn(&command).context("spawning detached tendd")?;
         let started = Instant::now();
         while started.elapsed() < timeout {
             if socket_responding(socket) {

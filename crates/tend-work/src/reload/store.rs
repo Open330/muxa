@@ -69,6 +69,7 @@ pub(super) fn valid_id(id: &str) -> bool {
 /// Remove one snapshot directory. Refuses anything that is not a snapshot
 /// directly under `root`, however the id is spelled.
 pub(super) fn delete(root: &Path, id: &str) -> Result<PathBuf> {
+    crate::subprocess::ensure_time_left()?;
     if !valid_id(id) {
         bail!("{id:?} is not a snapshot id");
     }
