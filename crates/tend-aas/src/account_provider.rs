@@ -216,7 +216,7 @@ mod tests {
             .accounts
             .entry("claude/b".into())
             .or_default()
-            .capped_until = Some(now + hour);
+            .hold("test", now + hour);
         ledger
             .accounts
             .entry("claude/c".into())
@@ -228,7 +228,7 @@ mod tests {
             .accounts
             .entry("codex/d".into())
             .or_default()
-            .capped_until = Some(now + hour);
+            .hold("test", now + hour);
         let profiles = [profile("a"), profile("b"), profile("c"), profile("d")];
         let ranked = configured("claude", &profiles, &[], &ledger, now);
         assert_eq!(

@@ -78,9 +78,26 @@ impl WindowReading {
 pub struct AccountUsage {
     #[serde(default)]
     pub windows: BTreeMap<Window, WindowReading>,
-    /// Until when an agent on this account was seen capped.
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub capped_until: Option<OffsetDateTime>,
+    /// Caps agents on this account reported, each under its own source
+    /// (one process of one row): a source updates only its own, so a
+    /// sooner reset one process learns never shortens another's cap.
+    #[serde(default)]
+    pub caps: BTreeMap<String, Cap>,
+}
+
+/// One source's cap on an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cap {
+    #[serde(with = "time::serde::rfc3339")]
+    pub until: OffsetDateTime,
+}
+
+impl AccountUsage {
+    /// Record that `source` holds this account capped until `until`,
+    /// replacing what that source held before.
+    pub fn hold(&mut self, source: impl Into<String>, until: OffsetDateTime) {
+        self.caps.insert(source.into(), Cap { until });
+    }
 }
 
 /// An account's standing now, as the ranking reads it.
@@ -137,9 +154,10 @@ impl Ledger {
             })
             .max();
         let capped_until = usage
-            .capped_until
+            .caps
+            .values()
+            .map(|cap| cap.until)
             .filter(|until| *until > now)
-            .into_iter()
             .chain(full_until)
             .max();
         let used_pct = current
@@ -158,10 +176,10 @@ impl Ledger {
             usage
                 .windows
                 .retain(|window, reading| reading.current(*window, now));
-            usage.capped_until = usage.capped_until.filter(|until| *until > now);
+            usage.caps.retain(|_, cap| cap.until > now);
         }
         self.accounts
-            .retain(|_, usage| !usage.windows.is_empty() || usage.capped_until.is_some());
+            .retain(|_, usage| !usage.windows.is_empty() || !usage.caps.is_empty());
     }
 }
 
@@ -241,10 +259,6 @@ struct Seen {
     asked: bool,
     /// The account this process runs on: `None` for none, or unreadable.
     account: Option<String>,
-    /// The cap this process last put on its account, so its own later,
-    /// better evidence (a reset that became known, or moved) replaces it
-    /// rather than only extending it.
-    held: Option<OffsetDateTime>,
 }
 
 /// Turns successive passes over the agent rows into ledger credits.
@@ -282,7 +296,6 @@ impl Recorder {
                             last: reading,
                             asked: false,
                             account: None,
-                            held: None,
                         },
                     );
                     continue;
@@ -322,16 +335,10 @@ impl Recorder {
                         );
                     }
                     if let Some(until) = capped {
-                        // Still this process's own hold: its newer reset
-                        // replaces it, sooner or later. Anything else (a
-                        // cap another agent reported) is only extended.
-                        usage.capped_until =
-                            if seen.held.is_some() && usage.capped_until == seen.held {
-                                Some(until)
-                            } else {
-                                usage.capped_until.max(Some(until))
-                            };
-                        seen.held = Some(until);
+                        // This process's own cap: its newer reset replaces
+                        // it, sooner or later; others' caps stand.
+                        let (pid, start) = &reading.process;
+                        usage.hold(format!("{}|{pid}|{start}", reading.row), until);
                     }
                     changed = true;
                 }
@@ -694,7 +701,7 @@ mod tests {
             .accounts
             .entry(key("claude", "a"))
             .or_default()
-            .capped_until = Some(at(5));
+            .hold("test", at(5));
         save(&path, &ledger).unwrap();
         assert_eq!(load(&path), ledger);
         std::fs::write(&path, r#"{"version":2,"accounts":{}}"#).unwrap();
@@ -769,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn a_known_reset_replaces_the_same_processs_fallback_hold_but_not_anothers_cap() {
+    fn a_known_reset_replaces_the_same_processs_fallback_hold() {
         let mut recorder = Recorder::default();
         let mut ledger = Ledger::default();
         let by_pid = [(10, "a")];
@@ -790,14 +797,64 @@ mod tests {
             Some(at(30))
         );
         assert_eq!(ledger.standing("claude", "a", at(31)).capped_until, None);
+    }
 
-        // A later cap from elsewhere is not shortened by this process.
-        ledger.accounts.get_mut("claude/a").unwrap().capped_until = Some(at(500));
-        capped.capped_until = Some(at(40));
-        recorder.observe(vec![capped], accounts(&by_pid), &mut ledger, at(3));
-        assert_eq!(
-            ledger.standing("claude", "a", at(100)).capped_until,
-            Some(at(500))
+    #[test]
+    fn one_process_learning_a_sooner_reset_leaves_another_processs_cap() {
+        // Two rows, both on account a, both capped.
+        let mut a_row = reading(10, None, None);
+        let mut b_row = reading(20, None, None);
+        b_row.row = "%2@default/t".into();
+        let by_pid = [(10, "a"), (20, "a")];
+        let mut recorder = Recorder::default();
+        let mut ledger = Ledger::default();
+        recorder.observe(
+            vec![a_row.clone(), b_row.clone()],
+            accounts(&by_pid),
+            &mut ledger,
+            at(0),
         );
+        for (row, until) in [(&mut a_row, 300), (&mut b_row, 200)] {
+            row.capped = true;
+            row.capped_until = Some(at(until));
+        }
+        recorder.observe(
+            vec![a_row.clone(), b_row.clone()],
+            accounts(&by_pid),
+            &mut ledger,
+            at(1),
+        );
+        assert_eq!(
+            ledger.standing("claude", "a", at(2)).capped_until,
+            Some(at(300))
+        );
+        // a learns its reset is sooner; b's cap still holds.
+        a_row.capped_until = Some(at(30));
+        recorder.observe(
+            vec![a_row.clone(), b_row.clone()],
+            accounts(&by_pid),
+            &mut ledger,
+            at(2),
+        );
+        assert_eq!(
+            ledger.standing("claude", "a", at(31)).capped_until,
+            Some(at(200))
+        );
+        // Equal resets are two holds too.
+        b_row.capped_until = Some(at(30));
+        recorder.observe(
+            vec![a_row.clone(), b_row.clone()],
+            accounts(&by_pid),
+            &mut ledger,
+            at(3),
+        );
+        a_row.capped_until = Some(at(10));
+        recorder.observe(vec![a_row, b_row], accounts(&by_pid), &mut ledger, at(4));
+        assert_eq!(
+            ledger.standing("claude", "a", at(15)).capped_until,
+            Some(at(30))
+        );
+        ledger.prune(at(31));
+        assert!(ledger.accounts.is_empty());
     }
 }

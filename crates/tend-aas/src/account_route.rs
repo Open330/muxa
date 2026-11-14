@@ -336,7 +336,7 @@ mod tests {
             .accounts
             .entry("claude/work".into())
             .or_default()
-            .capped_until = Some(now + time::Duration::hours(1));
+            .hold("test", now + time::Duration::hours(1));
         assert_eq!(
             from_profiles_with(&route, &usage, now).unwrap().account,
             "home"
@@ -345,7 +345,7 @@ mod tests {
             .accounts
             .entry("claude/home".into())
             .or_default()
-            .capped_until = Some(now + time::Duration::hours(1));
+            .hold("test", now + time::Duration::hours(1));
         // Every account held capped: the first, as before ranking.
         assert_eq!(
             from_profiles_with(&route, &usage, now).unwrap().account,
