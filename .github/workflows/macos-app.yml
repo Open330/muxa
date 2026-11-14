@@ -92,6 +92,13 @@ jobs:
           Scripts/build-libghostty.sh
           xcodegen generate
 
+      # Zig leaves its archive indexes (`__.SYMDEF`) unreadable, so tar
+      # failed on them and the save was dropped with only a warning: no
+      # release ever found this cache. Make the tree readable first.
+      - name: Make libghostty readable for the cache
+        if: steps.libghostty.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        run: chmod -R u+rX apps/tend-macos/.build/dependencies apps/tend-macos/.build/toolchains
+
       - name: Save libghostty
         if: steps.libghostty.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
