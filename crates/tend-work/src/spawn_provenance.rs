@@ -2,7 +2,6 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
-use tend::backend::PaneBackend;
 use tend::collaboration::CollaborationEndpoint;
 use tend::tmux::layout::SpawnProvenance;
 
@@ -42,12 +41,7 @@ pub fn record(request: &crate::agent_launch::StartRequest, pane: &str, launch_id
     let Some(creator) = request.creator.clone() else {
         return;
     };
-    let child = if let Some(rmux) = crate::mux_control::ambient_rmux() {
-        rmux.resolve_pane(&format!("rmux:{pane}"))
-    } else {
-        tend::TmuxBackend::new().resolve_pane(pane)
-    };
-    let Some(child) = child else {
+    let Some(child) = crate::mux_control::resolve_pane(pane) else {
         eprintln!(
             "warning: pane {pane} started, but creation provenance could not resolve its endpoint"
         );

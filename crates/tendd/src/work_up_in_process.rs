@@ -107,7 +107,7 @@ pub(crate) fn cli_config_path(
 
 /// The child's error was the last line of its stderr, where `tend` printed
 /// the error chain; keep that same detail.
-fn last_line(text: &str) -> String {
+pub(crate) fn last_line(text: &str) -> String {
     text.trim()
         .lines()
         .next_back()

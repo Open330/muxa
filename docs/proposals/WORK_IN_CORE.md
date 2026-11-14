@@ -1,7 +1,7 @@
 # Work in core: tendd stops running `tend` for Work logic
 
 Status: in progress. Step 1 (the move into `crates/tend-work`) is #502.
-`work up` and pipeline reconcile run in-process (step 3); see "Done so far".
+`work up`, pipeline reconcile and `agent start` run in-process (step 3); see "Done so far".
 
 ## Problem
 
@@ -146,3 +146,31 @@ pub struct WorkContext {
   - Proven on a scratch daemon, with the `tend` binary moved away: a `duo`
     pipeline's `review` (after `impl`) launched once `impl` reported done.
     The forced child did the same.
+- `agent start` (IPC `agent_start`, the Mac app's New Agent) runs
+  `agent_launch::launch_json` in tendd (`crates/tendd/src/agent_start_in_process.rs`,
+  hook `agent_control::install_in_process_agent_start`). What the child got
+  from its environment is passed explicitly:
+  - the target's tmux server, which was `TEND_TMUX_SOCKET`, is the selected
+    mux endpoint, and the new pane is looked up on that server only
+    (`mux_control::resolve_pane`);
+  - a native session's environment, which the child's `caller_env` read, is
+    the daemon's with `TEND_SOCKET` pinned;
+  - every tmux command runs under the subprocess scope with the child's 30 s
+    deadline, and dropping the call cancels the scope (no further tmux
+    command or native spawn), as the child was killed on drop.
+
+  Two cases decline and run the child, because the child had a different
+  process environment that code outside the mux endpoint reads:
+  - an rmux server (`$RMUX` set, pane variables cleared: backend detection,
+    the caller's pane);
+  - a native request whose `env` changes a daemon variable (the Mac app's
+    `PATH`/`TERM`: finding `aas` and the provider, the terminal size).
+
+  Both need the environment passed explicitly through those lookups, which
+  is the `WorkContext` step. `TEND_AGENT_START_CHILD=1` forces the child.
+  - Proven on a scratch daemon with `TEND_CLI` pointing nowhere: window
+    (full socket path), session (short socket name) and native launches (a
+    native one with a changed `TERM`, before that case declined); an
+    unknown server refused before anything ran; `health` answering in under
+    10 ms during a launch; the forced child failing without a CLI and
+    succeeding with one.

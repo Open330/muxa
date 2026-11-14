@@ -372,15 +372,93 @@ pub fn validate_relay_argv(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Run `binary agent start …` on this host with `TEND_SOCKET` pinned to the
-/// accepting daemon, the target's tmux server pinned when known, and the
-/// native environment allowlist applied.
+/// `agent start` run inside the calling process instead of as a `tend`
+/// child. tendd installs one at startup, as it does for `work up`
+/// ([`crate::work_control::InProcessWorkUp`]). It gets the validated request
+/// and the daemon socket to call back on. `None` means it declined before
+/// doing anything, and the caller runs the child.
+pub type InProcessAgentStart = std::sync::Arc<
+    dyn Fn(
+            AgentStartRequest,
+            Option<PathBuf>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<Result<AgentStartResult, AgentStartError>>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+static IN_PROCESS_AGENT_START: std::sync::OnceLock<InProcessAgentStart> =
+    std::sync::OnceLock::new();
+
+/// Set the in-process `agent start` once, at daemon startup. Later calls are
+/// ignored.
+pub fn install_in_process_agent_start(run: InProcessAgentStart) {
+    let _ = IN_PROCESS_AGENT_START.set(run);
+}
+
+/// Whether `TEND_AGENT_START_CHILD` forces the `tend` child, the path every
+/// release before this one used.
+fn agent_start_child_forced() -> bool {
+    std::env::var_os("TEND_AGENT_START_CHILD")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Start the agent on this host: in-process when tendd installed it, else
+/// `binary agent start …` as a child (see [`execute_child`]).
 pub async fn execute_local(
     binary: &Path,
     request: &AgentStartRequest,
     socket_path: Option<&Path>,
 ) -> Result<AgentStartResult, AgentStartError> {
     request.validate()?;
+    if let Some(run) = IN_PROCESS_AGENT_START
+        .get()
+        .filter(|_| !agent_start_child_forced())
+    {
+        if let Some(result) = run(request.clone(), socket_path.map(Path::to_path_buf)).await {
+            return result;
+        }
+        tracing::info!("in-process agent start declined; running the tend CLI");
+    }
+    execute_child(binary, request, socket_path).await
+}
+
+/// The short socket name a request's `tmux_socket` names, resolved to the
+/// live server's path the way the child is pointed at it. A full path is
+/// taken as is; a short name that matches no live server fails closed
+/// rather than landing on the default server, where the same `%N` may
+/// exist. `None` for an rmux endpoint or no socket.
+pub fn tmux_socket_path(request: &AgentStartRequest) -> Result<Option<PathBuf>, AgentStartError> {
+    let Some(socket) = present(request.tmux_socket.as_deref())
+        .filter(|socket| !crate::backend::rmux::is_endpoint(socket))
+    else {
+        return Ok(None);
+    };
+    if socket.starts_with('/') {
+        return Ok(Some(PathBuf::from(socket)));
+    }
+    crate::tmux::resolve_socket_path(socket)
+        .map(Some)
+        .ok_or_else(|| AgentStartError::Failed(format!("tmux server {socket:?} is not running")))
+}
+
+/// Whether the request targets an rmux server (`tmux_socket` names one).
+#[must_use]
+pub fn targets_rmux(request: &AgentStartRequest) -> bool {
+    present(request.tmux_socket.as_deref()).is_some_and(crate::backend::rmux::is_endpoint)
+}
+
+/// Run `binary agent start …` on this host with `TEND_SOCKET` pinned to the
+/// accepting daemon, the target's tmux server pinned when known, and the
+/// native environment allowlist applied.
+async fn execute_child(
+    binary: &Path,
+    request: &AgentStartRequest,
+    socket_path: Option<&Path>,
+) -> Result<AgentStartResult, AgentStartError> {
     let args = request.arguments();
     let mut command = tokio::process::Command::new(binary);
     command.args(&args);
@@ -394,17 +472,7 @@ pub async fn execute_local(
         // launcher's ambient multiplexer follows `$RMUX`.
         command.env("RMUX", socket).env_remove("RMUX_PANE");
         command.env_remove("TMUX").env_remove("TMUX_PANE");
-    } else if let Some(socket) = present(request.tmux_socket.as_deref()) {
-        // A full path is taken as is; a short name is looked up among the
-        // live servers, failing closed rather than landing on the default
-        // server where the same `%N` may exist.
-        let path = if socket.starts_with('/') {
-            PathBuf::from(socket)
-        } else {
-            crate::tmux::resolve_socket_path(socket).ok_or_else(|| {
-                AgentStartError::Failed(format!("tmux server {socket:?} is not running"))
-            })?
-        };
+    } else if let Some(path) = tmux_socket_path(request)? {
         command.env("TEND_TMUX_SOCKET", path);
     }
     for (key, value) in &request.env {
