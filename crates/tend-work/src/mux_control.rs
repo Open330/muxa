@@ -36,6 +36,27 @@ pub fn rmux_endpoint() -> Option<String> {
     }
 }
 
+/// `pane` as the selected server reports it: the rmux endpoint, the one
+/// tmux server the selected endpoint names, else every tmux server this
+/// process scans (one, under `TEND_TMUX_SOCKET`). Pane ids repeat across
+/// servers, so a launch on a pinned server must not read another's `%N`.
+pub fn resolve_pane(pane: &str) -> Option<tend::tmux::PaneInfo> {
+    use tend::backend::PaneBackend;
+    if let Some(rmux) = ambient_rmux() {
+        return rmux.resolve_pane(&format!("rmux:{pane}"));
+    }
+    match selected_endpoint() {
+        Some(endpoint) if endpoint.host == HostKind::Tmux => {
+            let socket = match tmux_socket_path(&endpoint) {
+                Some(path) => path.to_path_buf(),
+                None => tend::tmux::resolve_socket_path(&endpoint.socket)?,
+            };
+            tend::tmux::resolve_pane_at(&socket, pane)
+        }
+        _ => tend::TmuxBackend::new().resolve_pane(pane),
+    }
+}
+
 pub fn supported(host: HostKind) -> bool {
     matches!(host, HostKind::Tmux | HostKind::Rmux)
 }

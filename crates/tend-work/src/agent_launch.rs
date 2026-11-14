@@ -507,6 +507,27 @@ struct AgentStartOutput {
 }
 
 impl AgentStartOutput {
+    /// The line `tend agent start` prints without `--json`.
+    fn describe(&self) -> String {
+        let account = account_suffix(self.account.as_ref());
+        let agent = self.agent.label();
+        let cwd = self.cwd.display();
+        match (self.host, self.session.as_deref(), self.pane.as_deref()) {
+            (LaunchHost::Native, Some(session), _) => format!(
+                "started {agent}{account} in native session {session} (cwd {cwd})\nattach with: tend proc attach {session}"
+            ),
+            (_, _, pane) => format!(
+                "started {agent}{account} in {} {} (cwd {cwd})",
+                match self.placement {
+                    Placement::Pane => "pane",
+                    Placement::Window => "window pane",
+                    Placement::Session => "session pane",
+                },
+                pane.unwrap_or_default(),
+            ),
+        }
+    }
+
     fn tmux(result: &StartResult) -> Self {
         Self {
             input_readiness: result.input_readiness.clone(),
@@ -534,56 +555,88 @@ impl AgentStartOutput {
     }
 }
 
+#[derive(clap::Parser)]
+#[command(name = "tend agent start", no_binary_name = true)]
+struct StartCommand {
+    #[command(flatten)]
+    args: StartArgs,
+}
+
+/// Parse the `["agent", "start", …]` argv tendd would hand the CLI.
+pub fn parse_start_argv(argv: &[String]) -> Result<StartArgs> {
+    let [command, subcommand, rest @ ..] = argv else {
+        bail!("expected `agent start …`, got {argv:?}");
+    };
+    if command != "agent" || subcommand != "start" {
+        bail!("expected `agent start …`, got {argv:?}");
+    }
+    <StartCommand as clap::Parser>::try_parse_from(rest)
+        .map(|command| command.args)
+        .map_err(|error| anyhow::anyhow!("{}", error.render()))
+}
+
 pub async fn run(
     args: StartArgs,
     client: &Client,
     socket_path: &Path,
     cfg: &tend::config::Config,
 ) -> Result<()> {
+    let json = args.json;
+    let env = crate::caller::caller_env(socket_path);
+    let result = launch(args, client, socket_path, cfg, env).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", result.describe());
+    }
+    Ok(())
+}
+
+/// `tend agent start --json` without printing: the envelope the CLI would
+/// write to stdout. tendd calls this in-process. `native_env` is the
+/// environment a native session gets, which the CLI takes from its own
+/// (`caller::caller_env`). Synchronous tmux work runs on the calling
+/// thread, so an async caller runs this on a blocking thread.
+pub async fn launch_json(
+    args: StartArgs,
+    client: &Client,
+    socket_path: &Path,
+    cfg: &tend::config::Config,
+    native_env: Vec<(String, String)>,
+) -> Result<serde_json::Value> {
+    let result = launch(args, client, socket_path, cfg, native_env).await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+async fn launch(
+    args: StartArgs,
+    client: &Client,
+    socket_path: &Path,
+    cfg: &tend::config::Config,
+    native_env: Vec<(String, String)>,
+) -> Result<AgentStartOutput> {
     match args.host.resolve(tend::backend::detect_host_env()) {
         LaunchHost::Native => {
             anyhow::ensure!(
                 args.purpose == tend::collaboration::LaunchPurpose::Primary,
                 "worker purpose currently requires a tmux/rmux agent pane"
             );
-            run_native(args, client, socket_path, cfg).await
+            launch_native(args, client, cfg, native_env).await
         }
-        LaunchHost::Tmux => run_tmux(args, socket_path, cfg),
+        LaunchHost::Tmux => {
+            let result = start(StartRequest::from_args(&args, socket_path, cfg))?;
+            Ok(AgentStartOutput::tmux(&result))
+        }
         LaunchHost::Auto => unreachable!("auto launch host is resolved above"),
     }
 }
 
-fn run_tmux(args: StartArgs, socket: &Path, cfg: &tend::config::Config) -> Result<()> {
-    let json = args.json;
-    let result = start(StartRequest::from_args(&args, socket, cfg))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&AgentStartOutput::tmux(&result))?
-        );
-    } else {
-        println!(
-            "started {}{} in {} {} (cwd {})",
-            result.agent.label(),
-            account_suffix(result.account.as_ref()),
-            match result.placement {
-                Placement::Pane => "pane",
-                Placement::Window => "window pane",
-                Placement::Session => "session pane",
-            },
-            result.pane,
-            result.cwd.display()
-        );
-    }
-    Ok(())
-}
-
-async fn run_native(
+async fn launch_native(
     args: StartArgs,
     client: &Client,
-    socket_path: &Path,
     cfg: &tend::config::Config,
-) -> Result<()> {
+    env: Vec<(String, String)>,
+) -> Result<AgentStartOutput> {
     if let Some(refusal) = native_refusal(&args) {
         bail!(refusal);
     }
@@ -612,7 +665,7 @@ async fn run_native(
         .spawn_session(tend::SpawnSession {
             command: launch.command,
             args: launch.args,
-            env: crate::caller::caller_env(socket_path),
+            env,
             cwd: Some(cwd.clone()),
             name: args
                 .name
@@ -623,7 +676,7 @@ async fn run_native(
         })
         .await
         .context("spawning native tend agent session")?;
-    let result = AgentStartOutput {
+    Ok(AgentStartOutput {
         input_readiness: None,
         launch_id: None,
         launch_receipt: None,
@@ -645,26 +698,7 @@ async fn run_native(
         cwd,
         prompt_supplied: prompt.is_some(),
         account: routed.as_ref().map(tend::swap_api::report),
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!(
-            "started {}{} in native session {} (cwd {})\nattach with: tend proc attach {}",
-            result.agent.label(),
-            account_suffix(result.account.as_ref()),
-            result
-                .session
-                .as_deref()
-                .expect("native result has a session"),
-            result.cwd.display(),
-            result
-                .session
-                .as_deref()
-                .expect("native result has a session"),
-        );
-    }
-    Ok(())
+    })
 }
 
 /// Why `args` cannot start on the native host, or `None` when they can.
@@ -1205,13 +1239,8 @@ fn update_spawn(
 }
 
 fn register_worker_purpose(request: &StartRequest, pane: &str, launch_id: &str) -> Result<()> {
-    use tend::backend::PaneBackend;
-    let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
-        rmux.resolve_pane(&format!("rmux:{pane}"))
-    } else {
-        tend::TmuxBackend::new().resolve_pane(pane)
-    }
-    .context("worker pane is not observable")?;
+    let observed =
+        crate::mux_control::resolve_pane(pane).context("worker pane is not observable")?;
     if let Some(ticket) = &request.worker_spawn {
         return update_spawn(
             &request.socket,
@@ -1273,14 +1302,9 @@ fn launched_agent(
     pane: &str,
     within: std::time::Duration,
 ) -> Option<tend::discovery::Discovered> {
-    use tend::backend::PaneBackend;
     let wanted = tend::discovery::classify_command(request.agent.label());
     look_for(within, std::time::Duration::from_millis(100), || {
-        let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
-            rmux.resolve_pane(&format!("rmux:{pane}"))
-        } else {
-            tend::TmuxBackend::new().resolve_pane(pane)
-        }?;
+        let observed = crate::mux_control::resolve_pane(pane)?;
         tend::discovery::discover_from_panes(&[observed])
             .into_iter()
             .next()

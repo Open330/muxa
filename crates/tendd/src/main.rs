@@ -50,6 +50,7 @@ mod swap_runner;
 #[path = "swap_runner_off.rs"]
 mod swap_runner;
 use swap_runner::{open_swap_service, run_swap_operation, DaemonSwap};
+mod agent_start_in_process;
 mod fleet_manager;
 mod herdr_bridge;
 mod pipeline_reconciler;
@@ -254,6 +255,7 @@ async fn run() -> Result<()> {
         .or(cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
     work_up_in_process::install(socket.clone());
+    agent_start_in_process::install(socket.clone());
     tracing::info!(
         socket = %socket.display(),
         generation = restart_generation(),

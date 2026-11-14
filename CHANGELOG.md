@@ -18,12 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt is in the decision audit with its host. Only the audited web route
   can send this operation.
 
+### Changed
+
+- tendd starts agents itself for the Mac app's New Agent and the
+  `agent_start` IPC request, instead of running `tend agent start` as a
+  child. It reads the same config, pins the target's tmux server the way
+  the child's `TEND_TMUX_SOCKET` did, gives a native session the same
+  environment, and bounds every tmux command it runs by the child's 30 s.
+  A request for an rmux server still runs the child.
+  `TEND_AGENT_START_CHILD=1` brings the child back for every request.
+
 ### Removed
 
 - The swap's answer to Codex's "Working directory · resume" menu. A swap
   relaunch has set `tui.resume_cwd="session"` since v0.10.17 and never
   meets it, and a worker launch never answered it. If it does appear, the
   swap stops at it and types nothing, as for any other unknown question.
+
+### Fixed
+
+- An agent launched on a named tmux server (MCP `tend_start_agent`, and
+  now tendd) looks up its new pane on that server only. A pane with the
+  same `%N` on another server could be registered in its place.
 
 ## [0.10.17] - 2026-11-13
 

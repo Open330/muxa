@@ -1315,6 +1315,21 @@ pub fn resolve_pane(pane_id: &str) -> Option<PaneInfo> {
         .find(|p| p.pane_id == pane_id)
 }
 
+/// [`resolve_pane`] on the one server whose socket is at `socket`. Pane ids
+/// repeat across servers, so a caller that knows the server asks it alone,
+/// as a process scoped by `TEND_TMUX_SOCKET` does.
+pub fn resolve_pane_at(socket: &std::path::Path, pane_id: &str) -> Option<PaneInfo> {
+    let socket = socket.to_str()?;
+    let out = tmux_output(&["-S", socket, "list-panes", "-a", "-F", PANE_FMT]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    parse_pane_lines_for_socket(&stdout, Some(&socket_short_name(socket)))
+        .into_iter()
+        .find(|p| p.pane_id == pane_id)
+}
+
 /// Map of tmux pane shell PIDs → tmux pane id (e.g. `12345 -> "%42"`).
 ///
 /// Used by the hook adapter's ancestry-walk fallback in
