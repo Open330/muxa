@@ -100,6 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Claude's folder-trust prompt is no longer answered when its path wraps
+  across rows, on any platform: a space dropped at the break could make
+  another folder read as a trusted one. Such a prompt is left for a person.
+
 - `docs/ACCOUNT_SWAP.md` now says where `[swap] relaunch = "respawn"`
   applies: the daemon's automation and `tend swap --local`. A `tend swap`
   daemon job still types into a pane that has its shell. It also says that
