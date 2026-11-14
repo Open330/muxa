@@ -47,7 +47,10 @@ Notes from the 1.0.110 check:
   path (`session-state/<id>/events.jsonl`), and tend reads the last
   assistant message from it. Copilot writes the answer to the log up to
   ~200 ms after starting the hook, so the hook waits (at most 1 s) until the
-  log holds the stop before reading.
+  log holds Copilot's own record of this stop (it carries the hook's
+  `timestamp`) and reads the answer written before it. If that record does
+  not appear in time, the turn ends without an answer rather than with an
+  earlier turn's.
 - The npm build runs as `node` with the native `copilot` binary under it; a
   pane is still recognized as Copilot, from its process tree.
 

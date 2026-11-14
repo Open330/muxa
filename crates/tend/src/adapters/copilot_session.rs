@@ -63,34 +63,48 @@ pub fn last_answer(path: &Path) -> Option<String> {
 /// the hook runs.
 const STOP_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// [`last_answer`] for the `agentStop` hook: waits until the log holds
-/// Copilot's own `hook.start` record for this stop (written after the
-/// answer), so a slow flush does not cost the answer. After
-/// [`STOP_FLUSH_WAIT`] it reads whatever is there.
+/// [`last_answer`] for the `agentStop` hook whose payload `timestamp` is
+/// `stop_ms` (Unix milliseconds). Copilot writes its own `hook.start
+/// agentStop` record with that exact timestamp after the answer, and on
+/// 1.0.110 flushes it up to ~200 ms into the hook. This waits (at most
+/// [`STOP_FLUSH_WAIT`]) for that record and reads the answer from what
+/// precedes it, so a log that still ends at an earlier turn can never
+/// supply that turn's answer. `None` when the stop is not on disk in time.
 #[must_use]
-pub fn answer_at_stop(path: &Path) -> Option<String> {
+pub fn answer_at_stop(path: &Path, stop_ms: i64) -> Option<String> {
     let deadline = std::time::Instant::now() + STOP_FLUSH_WAIT;
     loop {
         let records = tail(path)?;
-        if stop_recorded(&records) || std::time::Instant::now() >= deadline {
-            return answer_in(&records);
+        // The first stop at or after this hook's time is this hook's.
+        if let Some(stop) = records
+            .iter()
+            .position(|record| is_stop_at(record, stop_ms))
+        {
+            return answer_in(&records[..stop]);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
-/// Does the log already hold the `agentStop` hook of the current turn
-/// (after the last prompt)?
-fn stop_recorded(records: &[Value]) -> bool {
-    for record in records.iter().rev() {
-        if is_user_prompt(record) {
-            return false;
-        }
-        if record["type"] == "hook.start" && record["data"]["hookType"] == "agentStop" {
-            return true;
-        }
-    }
-    false
+/// Is `record` Copilot's `hook.start` for the `agentStop` hook fired at
+/// `stop_ms` (or later)?
+fn is_stop_at(record: &Value, stop_ms: i64) -> bool {
+    record["type"] == "hook.start"
+        && record["data"]["hookType"] == "agentStop"
+        && record_ms(record).is_some_and(|at| at >= stop_ms)
+}
+
+/// A record's `timestamp` (RFC 3339) in Unix milliseconds.
+fn record_ms(record: &Value) -> Option<i64> {
+    let at = time::OffsetDateTime::parse(
+        record["timestamp"].as_str()?,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
 fn answer_in(records: &[Value]) -> Option<String> {
@@ -164,55 +178,77 @@ mod tests {
         assert!(tail(&path).unwrap().len() < 200);
     }
 
-    #[test]
-    fn at_a_stop_the_answer_flushed_while_the_hook_runs_is_read() {
-        let prompt = r#"{"type":"user.message","data":{"content":"q"}}"#;
-        let (_dir, path) = write(&format!("{prompt}\n"));
-        let late = path.clone();
-        // Copilot 1.0.110 writes the answer and its own hook record ~200 ms
-        // after starting the hook.
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let mut file = std::fs::OpenOptions::new().append(true).open(late).unwrap();
-            std::io::Write::write_all(
-                &mut file,
-                concat!(
-                    r#"{"type":"assistant.message","data":{"content":"late"}}"#,
-                    "\n",
-                    r#"{"type":"hook.start","data":{"hookType":"agentStop"}}"#,
-                    "\n"
-                )
-                .as_bytes(),
-            )
+    fn line(kind: &str, at_ms: i64, data: &str) -> String {
+        let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        });
-        assert_eq!(answer_at_stop(&path).as_deref(), Some("late"));
-        writer.join().unwrap();
+        format!("{{\"type\":\"{kind}\",\"timestamp\":\"{at}\",\"data\":{data}}}\n")
+    }
+
+    /// A whole turn: its prompt, answer and Copilot's record of the stop.
+    fn turn(prompt_ms: i64, answer: &str, stop_ms: i64) -> String {
+        line("user.message", prompt_ms, r#"{"content":"q"}"#)
+            + &line(
+                "assistant.message",
+                prompt_ms + 10,
+                &format!(r#"{{"content":"{answer}"}}"#),
+            )
+            + &line("hook.start", stop_ms, r#"{"hookType":"agentStop"}"#)
+    }
+
+    fn append_later(path: &Path, text: String) -> std::thread::JoinHandle<()> {
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        })
     }
 
     #[test]
-    fn at_a_stop_a_log_that_never_flushes_costs_the_answer_after_a_bound() {
-        let (_dir, path) = write("{\"type\":\"user.message\",\"data\":{\"content\":\"q\"}}\n");
+    fn at_a_stop_the_turn_flushed_while_the_hook_runs_is_read() {
+        // Only the prompt is on disk when the hook starts.
+        let (_dir, path) = write(&line("user.message", 1_000, r#"{"content":"q"}"#));
+        let writer = append_later(
+            &path,
+            line("assistant.message", 1_100, r#"{"content":"late"}"#)
+                + &line("hook.start", 2_000, r#"{"hookType":"agentStop"}"#),
+        );
+        assert_eq!(answer_at_stop(&path, 2_000).as_deref(), Some("late"));
+        writer.join().unwrap();
+    }
+
+    /// From the #536 review: the log still ends at a complete earlier turn
+    /// and the whole current turn arrives later.
+    #[test]
+    fn at_a_stop_an_earlier_turns_answer_is_never_read() {
+        let (_dir, path) = write(&turn(1_000, "OLD ANSWER", 2_000));
+        let writer = append_later(&path, turn(5_000, "NEW ANSWER", 6_000));
+        assert_eq!(answer_at_stop(&path, 6_000).as_deref(), Some("NEW ANSWER"));
+        writer.join().unwrap();
+        // The current stop never reaches the disk: no answer, after the bound.
+        let (_dir, path) = write(&turn(1_000, "OLD ANSWER", 2_000));
         let started = std::time::Instant::now();
-        assert_eq!(answer_at_stop(&path), None);
+        assert_eq!(answer_at_stop(&path, 6_000), None);
         let waited = started.elapsed();
         assert!(
             waited >= STOP_FLUSH_WAIT && waited < STOP_FLUSH_WAIT * 3,
             "{waited:?}"
         );
-        // A stop already on disk is read at once.
-        let text = concat!(
-            r#"{"type":"user.message","data":{"content":"q"}}"#,
-            "\n",
-            r#"{"type":"assistant.message","data":{"content":"a"}}"#,
-            "\n",
-            r#"{"type":"hook.start","data":{"hookType":"agentStop"}}"#,
-            "\n"
-        );
-        let (_dir, path) = write(text);
+    }
+
+    #[test]
+    fn at_a_stop_already_on_disk_the_answer_is_read_at_once() {
+        // A later turn written after it does not change which answer is read.
+        let (_dir, path) = write(&(turn(1_000, "first", 2_000) + &turn(5_000, "second", 6_000)));
         let started = std::time::Instant::now();
-        assert_eq!(answer_at_stop(&path).as_deref(), Some("a"));
+        assert_eq!(answer_at_stop(&path, 2_000).as_deref(), Some("first"));
+        assert_eq!(answer_at_stop(&path, 6_000).as_deref(), Some("second"));
         assert!(started.elapsed() < STOP_FLUSH_WAIT);
+        // A turn whose answer is only tool calls has none.
+        let (_dir, path) = write(&turn(1_000, "", 2_000));
+        assert_eq!(answer_at_stop(&path, 2_000), None);
     }
 
     #[test]

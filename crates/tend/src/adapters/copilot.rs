@@ -134,6 +134,10 @@ pub struct Input {
     /// `agentStop`: the session's `events.jsonl`.
     #[serde(default)]
     pub transcript_path: Option<String>,
+    /// When Copilot fired the hook (Unix milliseconds). Copilot's own log
+    /// record of an `agentStop` carries the same value.
+    #[serde(default)]
+    pub timestamp: Option<i64>,
     /// `agentStop`: `end_turn` on a clean turn.
     #[serde(default)]
     pub stop_reason: Option<String>,
@@ -258,7 +262,8 @@ fn normalize(event: Event, input: Input, pane: Option<String>) -> Option<AgentEv
                 .transcript_path
                 .as_deref()
                 .filter(|path| !path.is_empty())
-                .and_then(|path| super::copilot_session::answer_at_stop(Path::new(path)))
+                .zip(input.timestamp)
+                .and_then(|(path, at)| super::copilot_session::answer_at_stop(Path::new(path), at))
                 .map(truncate_response),
             recap: None,
             ai_title: None,
@@ -400,31 +405,42 @@ mod tests {
 
     #[test]
     fn agent_stop_reads_the_answer_from_the_session_log() {
-        // The real log, cut where turn 1's `agentStop` ran.
+        // The whole real log (three turns). Each stop's own payload
+        // timestamp picks its turn: turn 1 answered "hello", turn 3 only ran
+        // a tool.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("events.jsonl");
-        let first_turn = include_str!("testdata/copilot-1.0.110-events.jsonl")
+        std::fs::write(&log, include_str!("testdata/copilot-1.0.110-events.jsonl")).unwrap();
+        let stops: Vec<i64> = REPLAY
             .lines()
-            .take_while(|line| !line.contains("touch b.txt"))
-            .fold(String::new(), |text, line| text + line + "\n");
-        std::fs::write(&log, first_turn).unwrap();
-        let json = serde_json::json!({
-            "sessionId": "s", "cwd": "/w", "stopReason": "end_turn",
-            "transcriptPath": log.to_str().unwrap(),
-        });
-        match one("agent_stop", &json.to_string()) {
-            AgentEvent::TurnStopped {
-                response,
-                idle_confirmed,
-                ..
-            } => {
-                assert_eq!(response.as_deref(), Some("hello"));
-                assert!(!idle_confirmed);
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record["event"] == "agent_stop")
+            .map(|record| record["input"]["timestamp"].as_i64().unwrap())
+            .collect();
+        let answer = |timestamp: Option<i64>| {
+            let json = serde_json::json!({
+                "sessionId": "s", "cwd": "/w", "stopReason": "end_turn",
+                "transcriptPath": log.to_str().unwrap(), "timestamp": timestamp,
+            });
+            match one("agent_stop", &json.to_string()) {
+                AgentEvent::TurnStopped {
+                    response,
+                    idle_confirmed,
+                    ..
+                } => {
+                    assert!(!idle_confirmed);
+                    response
+                }
+                other => panic!("{other:?}"),
             }
-            other => panic!("{other:?}"),
-        }
+        };
+        assert_eq!(answer(Some(stops[0])).as_deref(), Some("hello"));
+        assert_eq!(answer(Some(stops[1])), None);
+        // Without the hook's time the turn cannot be told apart: no answer.
+        assert_eq!(answer(None), None);
         // A missing log costs the answer, never the stop.
-        let gone = r#"{"sessionId":"s","transcriptPath":"/nonexistent/events.jsonl"}"#;
+        let gone =
+            r#"{"sessionId":"s","transcriptPath":"/nonexistent/events.jsonl","timestamp":1}"#;
         assert!(matches!(
             one("agent_stop", gone),
             AgentEvent::TurnStopped { response: None, .. }
