@@ -186,9 +186,13 @@ pub fn load(path: &Path) -> Ledger {
         .unwrap_or_default()
 }
 
-/// [`load`] from [`default_path`].
+/// [`load`] from [`default_path`]. Empty in this crate's unit tests, so
+/// the usage of the machine running them cannot change their outcome.
 #[must_use]
 pub fn load_default() -> Ledger {
+    if cfg!(test) {
+        return Ledger::default();
+    }
     default_path().map(|path| load(&path)).unwrap_or_default()
 }
 
@@ -286,7 +290,11 @@ impl Recorder {
                     (seen.last.window(window) != Some((pct, reset))).then_some((window, pct, reset))
                 })
                 .collect();
-            let capped = (!seen.last.capped && reading.capped)
+            // A cap is credited when the row turns capped, and again when
+            // its reset changes while it stays capped (an unknown reset
+            // that becomes known included).
+            let capped = (reading.capped
+                && (!seen.last.capped || seen.last.capped_until != reading.capped_until))
                 .then(|| reading.capped_until.unwrap_or(now + UNKNOWN_RESET_COOLDOWN));
             if !windows.is_empty() || capped.is_some() {
                 if !seen.asked {
@@ -345,6 +353,30 @@ pub fn reading_of(agent: &tend::state::Agent, process: (u32, String)) -> Option<
     })
 }
 
+/// The one listed pane that is `pane_id` on the row's server. Unlike a
+/// swap's lookup, nothing is a wildcard: a row that names its server only
+/// matches a pane listed on that server, and a row (or pane) without one
+/// only when no other server lists the same pane id. An ambiguous join
+/// credits nothing.
+fn unique_pane<'a>(
+    listed: &'a [tend::tmux::PaneInfo],
+    pane_id: &str,
+    socket: Option<&str>,
+) -> Option<&'a tend::tmux::PaneInfo> {
+    let mut same_id = listed.iter().filter(|pane| pane.pane_id == pane_id);
+    let mut matching: Vec<&tend::tmux::PaneInfo> = match socket {
+        Some(socket) => same_id
+            .filter(|pane| pane.socket.as_deref() == Some(socket))
+            .collect(),
+        None => same_id.by_ref().collect(),
+    };
+    if matching.len() == 1 {
+        matching.pop()
+    } else {
+        None
+    }
+}
+
 /// One recorder pass over the daemon's agents: each agent of a provider
 /// that lists `[[accounts]]` is found in its pane (the same lookup a swap
 /// plans with), and credited through `recorder`. Does nothing at all when
@@ -392,13 +424,7 @@ pub fn record_pass(
                 .flat_map(|backend| backend.list_panes())
                 .collect()
         });
-        let Some(pane) = listed.iter().find(|pane| {
-            pane.pane_id == pane_id
-                && agent
-                    .tmux_socket
-                    .as_deref()
-                    .is_none_or(|socket| pane.socket.as_deref().is_none_or(|s| s == socket))
-        }) else {
+        let Some(pane) = unique_pane(listed, pane_id, agent.tmux_socket.as_deref()) else {
             continue;
         };
         if pane.pane_pid == 0 {
@@ -429,7 +455,7 @@ pub fn record_pass(
             }
             resolved
                 .get(reading.provider.as_str())?
-                .identify(&environ)
+                .identify_unique(&environ)
                 .map(str::to_owned)
         },
         ledger,
@@ -661,5 +687,70 @@ mod tests {
         assert_eq!(load(&path), Ledger::default());
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(load(&path), Ledger::default());
+    }
+
+    #[test]
+    fn a_changed_reset_on_a_row_that_stays_capped_is_credited() {
+        let mut recorder = Recorder::default();
+        let mut ledger = Ledger::default();
+        let by_pid = [(10, "a")];
+        recorder.observe(
+            vec![reading(10, None, None)],
+            accounts(&by_pid),
+            &mut ledger,
+            at(0),
+        );
+        let mut capped = reading(10, None, None);
+        capped.capped = true;
+        recorder.observe(vec![capped.clone()], accounts(&by_pid), &mut ledger, at(1));
+        assert_eq!(
+            ledger.standing("claude", "a", at(2)).capped_until,
+            Some(at(1) + UNKNOWN_RESET_COOLDOWN),
+            "unknown reset: the cooldown"
+        );
+        capped.capped_until = Some(at(300));
+        assert!(recorder.observe(vec![capped.clone()], accounts(&by_pid), &mut ledger, at(3)));
+        assert_eq!(
+            ledger.standing("claude", "a", at(100)).capped_until,
+            Some(at(300))
+        );
+        capped.capped_until = Some(at(400));
+        assert!(recorder.observe(vec![capped.clone()], accounts(&by_pid), &mut ledger, at(4)));
+        assert_eq!(
+            ledger.standing("claude", "a", at(350)).capped_until,
+            Some(at(400))
+        );
+        assert!(!recorder.observe(vec![capped], accounts(&by_pid), &mut ledger, at(5)));
+    }
+
+    fn pane(id: &str, socket: Option<&str>) -> tend::tmux::PaneInfo {
+        let mut pane = crate::account_swap::tests::test_pane(id);
+        pane.socket = socket.map(str::to_owned);
+        pane
+    }
+
+    #[test]
+    fn a_pane_joins_only_when_it_is_the_only_one_it_can_be() {
+        let listed = [
+            pane("%1", Some("default")),
+            pane("%1", Some("amux")),
+            pane("%2", Some("default")),
+            pane("%3", None),
+        ];
+        let socket = |p: Option<&tend::tmux::PaneInfo>| p.and_then(|p| p.socket.clone());
+        assert_eq!(
+            socket(unique_pane(&listed, "%1", Some("amux"))),
+            Some("amux".into())
+        );
+        // No server named: two servers list %1, so neither is it.
+        assert!(unique_pane(&listed, "%1", None).is_none());
+        assert_eq!(
+            socket(unique_pane(&listed, "%2", None)),
+            Some("default".into())
+        );
+        // A named server never matches a pane listed without one.
+        assert!(unique_pane(&listed, "%3", Some("default")).is_none());
+        assert!(unique_pane(&listed, "%3", None).is_some());
+        assert!(unique_pane(&listed, "%9", None).is_none());
     }
 }

@@ -3857,7 +3857,7 @@ fn stop(runner: &Runner, launch: &PaneLaunch) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tend::agent_tui::{DOWN, ENTER};
     use tend::pane_process::{is_shell, outside_codex_servers};
@@ -5014,7 +5014,7 @@ mod tests {
         assert_eq!(moves, vec![Ok("c".to_owned()), Ok("a".to_owned())]);
     }
 
-    fn test_pane(pane_id: &str) -> tend::tmux::PaneInfo {
+    pub(crate) fn test_pane(pane_id: &str) -> tend::tmux::PaneInfo {
         tend::tmux::PaneInfo {
             session_group: None,
             agent_program: None,

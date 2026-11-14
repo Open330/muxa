@@ -202,6 +202,19 @@ impl ResolvedAccounts {
             .find(|(_, wanted)| env_matches(wanted, environ))
             .map(|(name, _)| name.as_str())
     }
+
+    /// The one account `environ` belongs to: `None` when it matches none,
+    /// or more than one (profiles that share or nest their variables), so
+    /// config order never decides whose usage a process reported.
+    #[must_use]
+    pub fn identify_unique(&self, environ: &[(String, String)]) -> Option<&str> {
+        let mut matching = self
+            .entries
+            .iter()
+            .filter(|(_, wanted)| env_matches(wanted, environ));
+        let (name, _) = matching.next()?;
+        matching.next().is_none().then_some(name.as_str())
+    }
 }
 
 /// The account `environ` belongs to, by name.
@@ -757,5 +770,21 @@ mod tests {
             parse_environ(b"A=1\0B=x=y\0\0"),
             vec![("A".into(), "1".into()), ("B".into(), "x=y".into())]
         );
+    }
+
+    #[test]
+    fn a_unique_identification_refuses_overlapping_profiles() {
+        let shared = [("CLAUDE_CONFIG_DIR", "/p/x")];
+        let resolved = ResolvedAccounts::new(&[
+            profile("a", &shared),
+            profile("b", &shared),
+            profile("c", &[("CLAUDE_CONFIG_DIR", "/p/c")]),
+        ]);
+        let env = environ(&[("CLAUDE_CONFIG_DIR", "/p/x")]);
+        assert_eq!(resolved.identify(&env), Some("a"));
+        assert_eq!(resolved.identify_unique(&env), None);
+        let own = environ(&[("CLAUDE_CONFIG_DIR", "/p/c")]);
+        assert_eq!(resolved.identify_unique(&own), Some("c"));
+        assert_eq!(resolved.identify_unique(&environ(&[])), None);
     }
 }

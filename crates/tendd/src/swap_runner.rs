@@ -132,51 +132,67 @@ fn spawn_usage_recorder(
     let backends = backends.to_vec();
     let accounts = accounts.clone();
     tokio::spawn(async move {
-        let recorder = Arc::new(std::sync::Mutex::new(
-            tend_aas::account_usage::Recorder::default(),
-        ));
+        // The ledger is held here, loaded once: tendd is its only writer. A
+        // pass that credited something leaves it dirty until a save works,
+        // so an I/O error delays a credit instead of losing it (the
+        // recorder has already moved past that reading).
+        let state = Arc::new(std::sync::Mutex::new(UsageState {
+            recorder: tend_aas::account_usage::Recorder::default(),
+            ledger: None,
+            dirty: false,
+        }));
         let mut tick = tokio::time::interval(USAGE_RECORD_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             let agents = store.snapshot().await;
-            let (recorder, backends, accounts, file) = (
-                Arc::clone(&recorder),
+            let (state, backends, accounts, file) = (
+                Arc::clone(&state),
                 backends.clone(),
                 accounts.clone(),
                 path.clone(),
             );
             let pass = tokio::task::spawn_blocking(move || {
                 let now = time::OffsetDateTime::now_utc();
-                let mut ledger = tend_aas::account_usage::load(&file);
-                let mut recorder = recorder
+                let mut state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let changed = tend_aas::account_usage::record_pass(
-                    &mut recorder,
-                    &mut ledger,
-                    &agents,
-                    &backends,
-                    &accounts,
-                    now,
+                let UsageState {
+                    recorder,
+                    ledger,
+                    dirty,
+                } = &mut *state;
+                let ledger = ledger.get_or_insert_with(|| tend_aas::account_usage::load(&file));
+                *dirty |= tend_aas::account_usage::record_pass(
+                    recorder, ledger, &agents, &backends, &accounts, now,
                 );
-                if changed {
-                    ledger.prune(now);
-                    tend_aas::account_usage::save(&file, &ledger)
-                } else {
-                    Ok(())
+                if !*dirty {
+                    return Ok(());
                 }
+                ledger.prune(now);
+                tend_aas::account_usage::save(&file, ledger)?;
+                *dirty = false;
+                Ok::<(), std::io::Error>(())
             })
             .await;
             match pass {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, path = %path.display(), "could not save account usage");
+                    tracing::warn!(%error, path = %path.display(), "could not save account usage; retrying next pass");
                 }
                 Err(error) => tracing::warn!(%error, "account usage pass failed"),
             }
         }
     });
+}
+
+/// The usage recorder's state between passes.
+struct UsageState {
+    recorder: tend_aas::account_usage::Recorder,
+    /// Loaded on the first pass.
+    ledger: Option<tend_aas::account_usage::Ledger>,
+    /// Holds credits not yet saved.
+    dirty: bool,
 }
 
 /// One admitted swap operation, from its pane's guard to its job's end.
