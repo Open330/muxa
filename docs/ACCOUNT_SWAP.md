@@ -288,7 +288,7 @@ example a Codex with a nested Claude child).
 
 | Flag | Account |
 | ---- | ------- |
-| `--to auto` (default) | The next account other than the agent's current one (configured accounts: in the listed order, skipping the one it is capped on; `aas`: the best-ranked one `aas candidates` marks eligible). |
+| `--to auto` (default) | The next account other than the agent's current one (configured accounts: the best-ranked by observed usage, skipping the one it is capped on and any held capped; `aas`: the best-ranked one `aas candidates` marks eligible). |
 | `--to personal` | This account (`personal@claude` is accepted too). |
 | `--spread` | Round-robin over every eligible account, so a batch does not drain one account at once. |
 
