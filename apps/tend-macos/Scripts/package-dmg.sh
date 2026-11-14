@@ -45,13 +45,21 @@ fail() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 # whole release as a draft for hours (v0.10.16 sat four hours in this step
 # with nothing in its log); one that fails says where and can be rerun.
 # Returns 124 on a timeout, like timeout(1), which macOS does not ship.
+#
+# The command runs in a process group of its own (job control on for the
+# spawn only), so a timeout stops everything it started, not just its
+# first process: TERM to the group, then KILL to whatever is left of it
+# 10 seconds later, even once the first process has exited. The command
+# gets no stdin; none of the tools run this way reads it.
 bounded() {
     local secs=$1 label=$2 marker rc=0 pid dog
     shift 2
     marker=$(mktemp -t tend-bounded)
     rm -f "$marker"
+    set -m
     "$@" &
     pid=$!
+    set +m
     # The watchdog waits on a background sleep, so stopping it (the command
     # finished first) ends it at once, without reporting a timeout.
     (
@@ -63,11 +71,11 @@ bounded() {
         kill -0 "$pid" 2>/dev/null || exit 0
         : >"$marker"
         printf '\033[31merror:\033[0m %s took longer than %ss; stopping it\n' "$label" "$secs" >&2
-        kill -TERM "$pid" 2>/dev/null || exit 0
+        kill -TERM -- "-$pid" 2>/dev/null || exit 0
         sleep 10 &
         nap=$!
         wait "$nap" || exit 0
-        kill -KILL "$pid" 2>/dev/null || true
+        kill -KILL -- "-$pid" 2>/dev/null || true
     ) &
     dog=$!
     wait "$pid" || rc=$?
@@ -75,6 +83,14 @@ bounded() {
     wait "$dog" 2>/dev/null || true
     if [ -e "$marker" ]; then
         rm -f "$marker"
+        # The first process is gone; give the rest of its group the same
+        # grace, then kill what remains.
+        local waited=0
+        while kill -0 -- "-$pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -KILL -- "-$pid" 2>/dev/null || true
         return 124
     fi
     return "$rc"
@@ -102,7 +118,14 @@ BUILD_LOG="${TEND_BUILD_LOG:-$(mktemp -t tend-build)}"
 # minute what it is doing, so a build that stops moving shows where.
 (
     started=$SECONDS
-    while sleep 60; do
+    nap=
+    # Stopped with TERM: take the sleep down too, or it keeps this step's
+    # output open for up to a minute after the build ends.
+    trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; exit 0' TERM
+    while :; do
+        sleep 60 &
+        nap=$!
+        wait "$nap" || exit 0
         printf '    ... %dm: %s\n' $(((SECONDS - started) / 60)) \
             "$(tail -n 1 "$BUILD_LOG" 2>/dev/null | cut -c1-160)"
     done
