@@ -69,6 +69,20 @@ function renderCard(card) {
   li.dataset.id = card.id;
   if (card.host) li.dataset.host = card.host;
   li.append(el("div", `kind ${card.kind}`, card.label));
+  // What tend checked itself comes first; the agent's account follows.
+  if (card.checks) {
+    const box = el("section", `checks ${card.checks.passed ? "pass" : "fail"}`);
+    box.append(el("div", "headline", card.checks.headline));
+    const list = el("ul");
+    for (const line of card.checks.lines) {
+      const item = el("li", line.cls, line.text);
+      if (line.command) item.append(el("code", null, line.command));
+      if (line.tail) item.append(el("pre", null, line.tail));
+      list.append(item);
+    }
+    box.append(list);
+    li.append(box);
+  }
   li.append(el("h2", null, card.title));
   li.append(el("div", "meta", card.meta));
   if (card.needed) li.append(el("p", "needed", card.needed));

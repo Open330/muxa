@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ago, decidedCard, draftKey, evidenceLine, hostSections, pendingCard, safeHref, linkedItemOf, needsReturnPath } from "../src/dashboard/web/needs-model.mjs";
+import { ago, checksOf, decidedCard, draftKey, evidenceLine, hostSections, pendingCard, safeHref, linkedItemOf, needsReturnPath } from "../src/dashboard/web/needs-model.mjs";
 
 const now = Date.parse("2026-11-12T12:00:00Z");
 
@@ -152,4 +152,79 @@ test("a remote result is decided here only where that host takes decisions over 
   assert.deepEqual(observe.notes, ["observe-only: answer on that host"]);
   // The same id on two hosts keeps two drafts.
   assert.notEqual(draftKey(current.cards[0]), draftKey(older.cards[0]));
+});
+
+test("tend's own checks come first and are not repeated as evidence", () => {
+  const verification = {
+    passed: true,
+    ran_at: "2026-11-12T11:58:00Z",
+    checks: [
+      { command: "cargo test -p tend", name: "unit", passed: true, exit_code: 0, tail: "ok" },
+      { command: "node --test", passed: true, exit_code: 0, tail: "" },
+    ],
+  };
+  const review = pendingCard(
+    {
+      kind: "review",
+      id: "rv_1",
+      target: { kind: "work", workspace: "tend", work: "ENG-2" },
+      summary: "Done",
+      requested_at: "2026-11-12T11:59:00Z",
+      verification,
+      decision: {
+        evidence: [
+          { kind: "test", command: "cargo test -p tend", passed: true, verified: true },
+          { kind: "test", command: "make lint", passed: true },
+        ],
+      },
+    },
+    now,
+  );
+  assert.equal(review.checks.headline, "tend ran 2/2 checks passed · 2m ago");
+  assert.equal(review.checks.passed, true);
+  assert.deepEqual(review.checks.lines[0], { text: "passed: unit", cls: "pass", command: "cargo test -p tend", tail: null });
+  assert.equal(review.checks.lines[1].text, "passed: node --test");
+  // The agent's own test stays; tend's copy of its check does not.
+  assert.deepEqual(review.evidence.map((line) => line.text), ["test passed: make lint"]);
+});
+
+test("a failed or timed-out check shows how it ended, with its output", () => {
+  const checks = checksOf({
+    passed: false,
+    ran_at: "nonsense",
+    checks: [
+      { command: "a", passed: false, exit_code: 2, tail: "boom" },
+      { command: "b", passed: false, timed_out: true, tail: "" },
+    ],
+  });
+  assert.equal(checks.passed, false);
+  assert.equal(checks.headline, "tend ran 0/2 checks passed");
+  assert.deepEqual(checks.lines[0], { text: "FAILED: a (exit 2)", cls: "fail", command: null, tail: "boom" });
+  assert.equal(checks.lines[1].text, "FAILED: b (timed out)");
+  assert.equal(checksOf(null), null);
+  assert.equal(checksOf({ checks: [] }), null);
+});
+
+test("without a verification record, tend's checks in the evidence say who ran them", () => {
+  const review = pendingCard({
+    kind: "review",
+    id: "rv_2",
+    target: { kind: "work", workspace: "tend", work: "ENG-3" },
+    summary: "Done",
+    decision: { evidence: [{ kind: "test", command: "cargo test", passed: true, verified: true }] },
+  });
+  assert.equal(review.checks, null);
+  assert.equal(review.evidence[0].text, "check run by tend passed: cargo test");
+});
+
+test("a decided result keeps its checks in the history", () => {
+  const card = decidedCard({
+    kind: "review",
+    id: "rv_3",
+    target: { kind: "work", workspace: "tend", work: "ENG-4" },
+    summary: "Done",
+    verification: { passed: true, ran_at: "2026-11-12T11:00:00Z", checks: [{ command: "x", passed: true, tail: "" }] },
+    disposition: { kind: "accepted", at: "2026-11-12T11:30:00Z", by: { kind: "person" } },
+  }, now);
+  assert.equal(card.checks.headline, "tend ran 1/1 check passed · 1h ago");
 });

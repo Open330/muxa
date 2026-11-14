@@ -353,7 +353,10 @@ Their sessions still appear as workspaces in the rail (see
 (`tend_request_attention`), agents waiting in their pane, then results filed
 for review. Each card shows the summary, the decision asked for, the options,
 the agent's recommendation and its evidence (commit, PR link, diff, test
-result with its output tail, path). The **Decided** tab lists past decisions
+result with its output tail, path). A result on a Work with declared checks
+shows what tend ran itself first (`verification`: each check, passed or how
+it failed, with its output tail), above the agent's own account; tend's copy
+of those checks in the evidence is not repeated. The **Decided** tab lists past decisions
 with their notes and answers. The page reads `GET /api/decisions` and
 `GET /api/decisions/history` (both take `?limit=`, at most 500), the same
 daemon reads as the Mac app (`decision_queue`, `decision_history`).

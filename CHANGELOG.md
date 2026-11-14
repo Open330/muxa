@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt is in the decision audit with its host. Only the audited web route
   can send this operation.
 
+- The web "Needs you" page and the Mac app's decision cards show the checks
+  tend ran itself on a result (the Work's declared checks, `verification`)
+  first: each check passed, or how it failed with its output tail. The
+  agent's own account follows, without tend's copy of those checks in its
+  evidence.
+
 ### Changed
 
 - A `work up` or `agent start` that another Fleet host sends this one runs

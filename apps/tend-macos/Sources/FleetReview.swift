@@ -257,6 +257,9 @@ struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
     /// Set once someone decided the item (`decision_history`).
     var disposition: Disposition? = nil
     var idempotencyKey: String? = nil
+    /// What tendd ran itself (the Work's declared checks) before the item
+    /// reached the person; nil when it ran nothing.
+    var verification: TendVerification? = nil
 
     struct Disposition: Decodable, Hashable, Sendable {
         let kind: String
@@ -266,10 +269,27 @@ struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, target, generation, summary, anchor, decision, disposition
+        case id, target, generation, summary, anchor, decision, disposition, verification
         case requestedAt = "requested_at"
         case requestedBy = "requested_by"
         case idempotencyKey = "idempotency_key"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        target = try values.decode(Target.self, forKey: .target)
+        generation = try values.decode(UInt64.self, forKey: .generation)
+        summary = try values.decode(String.self, forKey: .summary)
+        anchor = try values.decodeIfPresent(String.self, forKey: .anchor)
+        requestedAt = try values.decodeIfPresent(String.self, forKey: .requestedAt)
+        requestedBy = try values.decode(Actor.self, forKey: .requestedBy)
+        decision = try values.decodeIfPresent(TendDecision.self, forKey: .decision)
+        disposition = try values.decodeIfPresent(Disposition.self, forKey: .disposition)
+        idempotencyKey = try values.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        // A verification record this app cannot read leaves the item
+        // visible, without its checks.
+        verification = (try? values.decodeIfPresent(TendLenient<TendVerification>.self, forKey: .verification))?.value
     }
 
     /// Who asked, as they declared it (not verified).

@@ -46,8 +46,9 @@ export function evidenceLine(evidence) {
       return { text: `diff ${evidence.range}${evidence.repo ? ` in ${evidence.repo}` : ""}` };
     case "test": {
       const outcome = evidence.passed === true ? "passed" : evidence.passed === false ? "failed" : "ran";
+      // `verified`: tend ran it (a Work's declared check), not the agent.
       return {
-        text: `test ${outcome}: ${evidence.command}`,
+        text: `${evidence.verified === true ? "check run by tend" : "test"} ${outcome}: ${evidence.command}`,
         cls: evidence.passed === true ? "pass" : evidence.passed === false ? "fail" : "",
         tail: evidence.tail || null,
       };
@@ -59,12 +60,50 @@ export function evidenceLine(evidence) {
   }
 }
 
-function decisionParts(decision) {
+/// What tend ran itself before the result reached the person (the Work's
+/// declared checks, `verification`), shown ahead of the agent's account.
+/// Null when tend ran nothing.
+export function checksOf(verification, now = Date.now()) {
+  const checks = Array.isArray(verification?.checks) ? verification.checks : [];
+  if (!checks.length) return null;
+  const passed = checks.filter((check) => check?.passed === true).length;
+  const when = ago(verification.ran_at, now);
   return {
+    passed: verification.passed === true && passed === checks.length,
+    headline: `tend ran ${passed}/${checks.length} ${checks.length === 1 ? "check" : "checks"} passed${when ? ` · ${when} ago` : ""}`,
+    lines: checks.map((check) => {
+      const how = check?.timed_out
+        ? "timed out"
+        : Number.isInteger(check?.exit_code)
+          ? `exit ${check.exit_code}`
+          : check?.passed === true
+            ? ""
+            : "killed";
+      const label = check?.name || check?.command || "check";
+      return {
+        text: `${check?.passed === true ? "passed" : "FAILED"}: ${label}${how && check?.passed !== true ? ` (${how})` : ""}`,
+        cls: check?.passed === true ? "pass" : "fail",
+        // The command under its name, so the person sees what ran.
+        command: check?.name && check?.command ? check.command : null,
+        tail: check?.passed === true ? null : check?.tail || null,
+      };
+    }),
+  };
+}
+
+/// The asker's decision. With tend's own checks shown above, the copies
+/// tendd also put in the evidence (marked `verified`) are not repeated.
+function decisionParts(decision, verification = null, now = Date.now()) {
+  const checks = checksOf(verification, now);
+  const evidence = Array.isArray(decision?.evidence) ? decision.evidence : [];
+  return {
+    checks,
     needed: decision?.needed || null,
     options: Array.isArray(decision?.options) ? decision.options : [],
     recommendation: decision?.recommendation || null,
-    evidence: Array.isArray(decision?.evidence) ? decision.evidence.map(evidenceLine) : [],
+    evidence: evidence
+      .filter((item) => !(checks && item?.kind === "test" && item.verified === true))
+      .map(evidenceLine),
   };
 }
 
@@ -105,7 +144,7 @@ export function pendingCard(item, now = Date.now()) {
         ...decisionParts(null),
       };
     case "review": {
-      const parts = decisionParts(item.decision);
+      const parts = decisionParts(item.decision, item.verification, now);
       return {
         id: item.id,
         kind: "review",
@@ -131,7 +170,7 @@ export function decidedCard(item, now = Date.now()) {
       title: item.summary,
       meta: `${target(item)} · ${ago(d.at, now)}${d.by?.label ? ` · ${d.by.label}` : ""}`,
       outcome: d.note ? `${d.kind}: ${firstLine(d.note)}` : d.kind || "",
-      ...decisionParts(item.decision),
+      ...decisionParts(item.decision, item.verification, now),
     };
   }
   if (item?.kind === "human_answer") {
