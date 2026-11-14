@@ -2078,34 +2078,76 @@ fn relaunch_command_without_home(pane: &PaneShape) -> Option<String> {
     {
         return None;
     }
-    let resuming = pane.agent.as_ref().and_then(|agent| {
-        (!agent.session_id.is_empty() && !agent.session_id.starts_with("synthetic"))
-            .then_some(agent.kind.as_str())
-    });
-    let command = match pane.argv.as_deref() {
+    let session = pane
+        .agent
+        .as_ref()
+        .filter(|agent| !agent.session_id.is_empty() && !agent.session_id.starts_with("synthetic"));
+    let dialect = tend::shell::Dialect::native();
+    match pane.argv.as_deref() {
         Some(argv) if !argv.is_empty() => {
-            let argv = match resuming {
-                Some(kind) => without_session_id(&without_initial_prompt(argv, kind), kind),
+            let mut words = match session {
+                Some(agent) => without_session_id(
+                    &without_initial_prompt(argv, agent.kind.as_str()),
+                    agent.kind.as_str(),
+                ),
                 None => argv.to_vec(),
             };
-            tend::shell::Dialect::native().command_line(&argv)
+            match session.map(|agent| agent.kind.as_str()) {
+                Some("claude_code") if !words.iter().any(|w| w == "--resume") => {
+                    words.extend(["--resume".to_owned(), session?.session_id.clone()]);
+                }
+                Some("codex") if !words.iter().any(|w| w == "resume") => {
+                    words.extend(["resume".to_owned(), session?.session_id.clone()]);
+                }
+                _ => {}
+            }
+            // A restored Codex never comes up on its update menu or its
+            // directory question (`tend::codex_launch`).
+            let words = tend::codex_launch::with_startup_overrides_in_line(&words);
+            Some(dialect.command_line(&words))
         }
-        _ => pane.command.clone()?,
-    };
-    let Some(agent) = pane.agent.as_ref() else {
-        return Some(command);
-    };
-    if agent.session_id.is_empty() || agent.session_id.starts_with("synthetic") {
-        return Some(command);
+        _ => {
+            let command = pane.command.clone()?;
+            let Some(agent) = session else {
+                return Some(command);
+            };
+            Some(match agent.kind.as_str() {
+                "claude_code" if !command.contains("--resume") => {
+                    format!("{command} --resume {}", agent.session_id)
+                }
+                "codex" => {
+                    let command = if command.contains(" resume ") {
+                        command
+                    } else {
+                        format!("{command} resume {}", agent.session_id)
+                    };
+                    codex_overrides_in_text(&command)
+                }
+                _ => command,
+            })
+        }
     }
-    match agent.kind.as_str() {
-        "claude_code" if !command.contains("--resume") => {
-            Some(format!("{command} --resume {}", agent.session_id))
-        }
-        "codex" if !command.contains(" resume ") => {
-            Some(format!("{command} resume {}", agent.session_id))
-        }
-        _ => Some(command),
+}
+
+/// [`tend::codex_launch`]'s overrides for a Codex line known only as text
+/// (no captured argv): spliced in before its ` resume `, skipping any key
+/// the line already names.
+fn codex_overrides_in_text(command: &str) -> String {
+    let pairs: Vec<String> = tend::codex_launch::STARTUP_OVERRIDES
+        .iter()
+        .filter(|assignment| {
+            let key = assignment.split('=').next().unwrap_or_default();
+            !command.contains(key)
+        })
+        .flat_map(|assignment| ["-c".to_owned(), (*assignment).to_owned()])
+        .collect();
+    if pairs.is_empty() {
+        return command.to_owned();
+    }
+    let fragment = tend::shell::Dialect::native().command_line(&pairs);
+    match command.find(" resume ") {
+        Some(at) => format!("{} {fragment}{}", &command[..at], &command[at..]),
+        None => format!("{command} {fragment}"),
     }
 }
 
@@ -3324,7 +3366,7 @@ mod tests {
         codex.agent.as_mut().unwrap().session_id = "01a13353-ba8c-70f3-a502-2a33f3521878".into();
         assert_eq!(
             relaunch_command(&codex).as_deref(),
-            Some("codex --yolo resume 01a13353-ba8c-70f3-a502-2a33f3521878")
+            Some("codex --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 01a13353-ba8c-70f3-a502-2a33f3521878")
         );
     }
 
@@ -3392,7 +3434,7 @@ mod tests {
         );
         assert_eq!(
             relaunch_command(&codex).as_deref(),
-            Some("aas exec e-ed@codex -- --yolo resume 01a12f38")
+            Some("aas exec e-ed@codex -- --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 01a12f38")
         );
         // Bare program, prompt last.
         let bare = shape(

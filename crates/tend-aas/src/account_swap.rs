@@ -631,23 +631,12 @@ fn resume_suffix(kind: AgentKind, session_id: &str) -> Vec<String> {
         // Codex's update check is off for this start, and it resumes in the
         // session's own directory (what the swap always answered), so those
         // dialogs are never shown rather than answered.
-        AgentKind::Codex => vec![
-            "-c".into(),
-            CODEX_NO_UPDATE_CHECK.into(),
-            "-c".into(),
-            CODEX_RESUME_IN_SESSION_DIR.into(),
-            "resume".into(),
-            session_id.into(),
-        ],
+        AgentKind::Codex => {
+            tend::codex_launch::with_startup_overrides(&["resume".into(), session_id.into()], None)
+        }
         _ => vec!["--resume".into(), session_id.into()],
     }
 }
-
-/// The Codex config override a swap relaunch starts with. Codex ignores a
-/// `-c` key it does not know, so an older release starts as before.
-const CODEX_NO_UPDATE_CHECK: &str = "check_for_update_on_startup=false";
-/// Resume in the session's directory without asking (`tui.resume_cwd`).
-const CODEX_RESUME_IN_SESSION_DIR: &str = "tui.resume_cwd=\"session\"";
 
 /// The line to type back into the pane: the same launch, on `account`,
 /// resuming `session_id`.
@@ -4224,9 +4213,9 @@ pub(crate) mod tests {
             "codex",
             "--yolo",
             "-c",
-            CODEX_NO_UPDATE_CHECK,
+            tend::codex_launch::STARTUP_OVERRIDES[0],
             "-c",
-            CODEX_RESUME_IN_SESSION_DIR,
+            tend::codex_launch::STARTUP_OVERRIDES[1],
             "resume",
             "019a",
         ]
@@ -4237,7 +4226,10 @@ pub(crate) mod tests {
             argv_resumes(&argv, AgentKind::Codex, "019a"),
             ArgvResume::Exact
         );
-        assert_eq!(CODEX_RESUME_IN_SESSION_DIR, "tui.resume_cwd=\"session\"");
+        assert_eq!(
+            tend::codex_launch::STARTUP_OVERRIDES[1],
+            "tui.resume_cwd=\"session\""
+        );
         // Claude's line is unchanged.
         assert_eq!(resume_suffix(AgentKind::ClaudeCode, "S"), ["--resume", "S"]);
     }
