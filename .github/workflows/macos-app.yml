@@ -18,6 +18,11 @@ on:
   # Run on main by hand to seed the shared libghostty and Rust caches.
   workflow_dispatch:
 
+# The Rust cache key hashes CARGO_* variables; the release workflow sets
+# this one, so set it here too or the release cannot find this cache.
+env:
+  CARGO_TERM_COLOR: always
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -57,6 +62,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          # The same key as the release's macOS app job, which restores this
+          # cache: by default the key carries the job id, and the two jobs'
+          # ids differ, so the release always built Rust cold.
+          shared-key: tend-macos-app
           # Only main's cache is visible to other refs; a PR or tag copy is
           # half a gigabyte that crowds out the shared ones.
           save-if: ${{ github.ref == 'refs/heads/main' }}

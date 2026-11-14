@@ -213,6 +213,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          # Main's `macOS app` workflow saves under this key (see there).
+          shared-key: tend-macos-app
           # A cache saved from a tag can only be read by that tag; restore
           # main's and leave it at that.
           save-if: false
