@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always exits 0, so it can never deny a tool. `tend doctor` checks the file
   when Copilot is installed. Checked against Copilot CLI 1.0.110; see
   `docs/COPILOT.md`.
+- Esc on a Copilot permission prompt no longer leaves the row waiting.
+  Copilot fires no hook for it, so tendd reads the session log
+  (`$COPILOT_HOME/session-state/<id>/events.jsonl`) of each working or
+  waiting Copilot row every two seconds and settles a turn that ended in
+  `abort`, dated at the abort; a newer hook always wins.
+  `[reconciler] copilot_session_log_enabled = false` turns it off.
 
 - Configured accounts (`[[accounts.<provider>]]`) are ranked by observed
   usage. tendd credits a quota reading or a cap to an account only when the

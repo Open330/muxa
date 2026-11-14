@@ -15,7 +15,8 @@
 
 use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
 
 /// How much of the log's end is read. A turn's answer and the prompt
 /// before it are near the end; a tool result larger than this between them
@@ -24,12 +25,16 @@ const TAIL_BYTES: u64 = 512 * 1024;
 
 /// The log's last complete lines, oldest first.
 pub(crate) fn tail(path: &Path) -> Option<Vec<Value>> {
+    tail_bytes(path, TAIL_BYTES)
+}
+
+fn tail_bytes(path: &Path, max: u64) -> Option<Vec<Value>> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
+    let start = len.saturating_sub(max);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
-    file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    file.take(max).read_to_end(&mut bytes).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines();
     if start > 0 {
@@ -123,6 +128,125 @@ fn answer_in(records: &[Value]) -> Option<String> {
         }
     }
     None
+}
+
+/// How much of the log's end [`poll`] reads. An `abort` is the last thing
+/// Copilot writes for a cancelled turn, so it sits in the last few lines.
+const SETTLE_TAIL_BYTES: u64 = 64 * 1024;
+
+/// `$COPILOT_HOME` (or `~/.copilot`), when it exists: where the session
+/// logs live.
+#[must_use]
+pub fn default_home() -> Option<PathBuf> {
+    std::env::var_os("COPILOT_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".copilot")))
+        .filter(|path| path.is_dir())
+}
+
+/// When the log's current turn was cancelled: the `abort` record's time,
+/// when it is the latest of the turn's start (`user.message`,
+/// `assistant.turn_start`) and its cancel. Esc on a permission prompt
+/// fires no hook, and this record is the only trace of it.
+///
+/// `assistant.turn_end` alone settles nothing: Copilot writes one after
+/// every model call, mid-turn too.
+fn cancelled_at(records: &[Value]) -> Option<OffsetDateTime> {
+    let record = records.iter().rev().find(|record| {
+        is_user_prompt(record)
+            || record["type"] == "assistant.turn_start"
+            || record["type"] == "abort"
+    })?;
+    if record["type"] != "abort" {
+        return None;
+    }
+    OffsetDateTime::parse(
+        record["timestamp"].as_str()?,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()
+}
+
+/// Settle Copilot rows a missing hook left working or waiting: for each,
+/// read its session log and, when the turn there was cancelled, record the
+/// stop at the cancel's own time. The Store's precedence drops it when a
+/// newer hook (the next prompt) has already moved the row.
+/// The states a missing hook can leave a Copilot row in, and so the only
+/// ones [`poll`] reads and settles.
+const SETTLED_STATES: &[crate::event::AgentState] = &[
+    crate::event::AgentState::Working,
+    crate::event::AgentState::WaitingInput,
+    crate::event::AgentState::WaitingChoice,
+];
+
+pub async fn poll(store: &crate::state::SharedStore, home: &Path) {
+    use crate::event::{AgentEvent, AgentId, AgentKind};
+    let targets: Vec<AgentId> = store
+        .snapshot()
+        .await
+        .into_iter()
+        .filter(|agent| {
+            agent.kind == AgentKind::Copilot
+                && SETTLED_STATES.contains(&agent.state)
+                // A session id names a directory; refuse anything that
+                // could leave `session-state/`.
+                && !agent.session_id.is_empty()
+                && !agent.session_id.contains(['/', '\\'])
+                && !agent.session_id.starts_with('.')
+        })
+        .map(|agent| AgentId {
+            kind: AgentKind::Copilot,
+            session_id: agent.session_id,
+            surface: agent.surface,
+            pane: agent.pane,
+            tmux_socket: agent.tmux_socket,
+            cwd: agent.cwd,
+        })
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let root = home.join("session-state");
+    let settled = tokio::task::spawn_blocking(move || {
+        targets
+            .into_iter()
+            .filter_map(|id| {
+                let log = root.join(&id.session_id).join("events.jsonl");
+                let at = cancelled_at(&tail_bytes(&log, SETTLE_TAIL_BYTES)?)?;
+                Some((id, at))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let now = OffsetDateTime::now_utc();
+    for (id, at) in settled {
+        if at > now {
+            continue;
+        }
+        let event = AgentEvent::TurnStopped {
+            id,
+            response: None,
+            recap: None,
+            ai_title: None,
+            // Positive evidence the wait is over: Copilot recorded the
+            // permission prompt cancelled (`permission.completed`,
+            // `abort`). Without it the Store keeps a response-less stop on
+            // a waiting row waiting, as it must for Codex's early `Stop`.
+            idle_confirmed: true,
+            at,
+        };
+        // Only a row that still exists and still needs settling: the user
+        // may have forgotten it while the log was read.
+        store
+            .apply_observed_if_in(
+                &event,
+                crate::provenance::StateSource::ProviderRecord,
+                SETTLED_STATES,
+            )
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +373,293 @@ mod tests {
         // A turn whose answer is only tool calls has none.
         let (_dir, path) = write(&turn(1_000, "", 2_000));
         assert_eq!(answer_at_stop(&path, 2_000), None);
+    }
+
+    /// The real log cut after its first `n` lines.
+    fn real_until(pattern: &str) -> Vec<Value> {
+        let mut records = Vec::new();
+        for line in REAL.lines() {
+            records.push(serde_json::from_str(line).unwrap());
+            if line.contains(pattern) {
+                break;
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn only_an_abort_after_the_turn_started_is_a_cancel() {
+        // Turn 2 of the real session, cut at Esc's `abort`.
+        let at = cancelled_at(&real_until("\"abort\"")).unwrap();
+        assert_eq!(at.to_string(), "2026-11-14 14:54:30.051 +00:00:00");
+        // The whole log: turn 3 started after the abort and finished.
+        let all: Vec<Value> = REAL
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(cancelled_at(&all), None);
+        // Turn 1 ends with `assistant.turn_end`, which is no cancel.
+        assert_eq!(cancelled_at(&real_until("agentStop")), None);
+    }
+
+    mod poll {
+        use super::super::*;
+        use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel};
+        use crate::state::Store;
+        use time::Duration;
+
+        fn id(session: &str, pane: &str) -> AgentId {
+            AgentId {
+                kind: AgentKind::Copilot,
+                session_id: session.into(),
+                surface: None,
+                pane: Some(pane.into()),
+                tmux_socket: None,
+                cwd: Some("/w".into()),
+            }
+        }
+
+        /// `seconds` from now. The Store dates a hook's watermark when it
+        /// is ingested, so test times sit around now, as real hooks do.
+        fn at(seconds: i64) -> OffsetDateTime {
+            OffsetDateTime::now_utc() + Duration::seconds(seconds)
+        }
+
+        fn rfc3339(at: OffsetDateTime) -> String {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        }
+
+        async fn hook(store: &crate::state::SharedStore, events: Vec<AgentEvent>) {
+            for ev in events {
+                store.apply_with_ask(&ev, None).await;
+            }
+        }
+
+        fn write_log(home: &Path, session: &str, lines: &[String]) {
+            let dir = home.join("session-state").join(session);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("events.jsonl"), lines.join("\n") + "\n").unwrap();
+        }
+
+        fn prompt_line(at: OffsetDateTime) -> String {
+            format!(
+                r#"{{"type":"user.message","timestamp":"{}","data":{{"content":"touch b.txt"}}}}"#,
+                rfc3339(at)
+            )
+        }
+
+        fn abort_line(at: OffsetDateTime) -> String {
+            format!(
+                r#"{{"type":"abort","timestamp":"{}","data":{{"reason":"user_initiated"}}}}"#,
+                rfc3339(at)
+            )
+        }
+
+        /// A Copilot row waiting on a permission prompt, as its hooks
+        /// leave it.
+        async fn waiting_row(store: &crate::state::SharedStore, session: &str, pane: &str) {
+            let id = id(session, pane);
+            hook(
+                store,
+                vec![
+                    AgentEvent::Started {
+                        id: id.clone(),
+                        at: at(-3),
+                    },
+                    AgentEvent::PromptSubmitted {
+                        id: id.clone(),
+                        prompt: "touch b.txt".into(),
+                        at: at(-2),
+                    },
+                    AgentEvent::NotificationFired {
+                        id,
+                        level: NotificationLevel::NeedsInput,
+                        message: "copilot permission: Run command: touch b.txt".into(),
+                        at: at(-1),
+                    },
+                ],
+            )
+            .await;
+            assert_eq!(
+                store.by_session(session).await.unwrap().state,
+                AgentState::WaitingInput
+            );
+        }
+
+        #[tokio::test]
+        async fn esc_on_a_permission_prompt_settles_the_row_at_the_cancel() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Store::shared();
+            waiting_row(&store, "s1", "%1").await;
+            // Esc: Copilot writes `abort` and fires no hook.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let cancel = OffsetDateTime::now_utc();
+            write_log(
+                home.path(),
+                "s1",
+                &[prompt_line(at(-2)), abort_line(cancel)],
+            );
+            poll(&store, home.path()).await;
+            let row = store.by_session("s1").await.unwrap();
+            assert_eq!(row.state, AgentState::Idle);
+            assert_eq!(row.last_response, None);
+            assert!((row.state_entered_at - cancel).abs() < Duration::milliseconds(1));
+            // Settled rows are not read again.
+            poll(&store, home.path()).await;
+            assert_eq!(
+                store.by_session("s1").await.unwrap().state,
+                AgentState::Idle
+            );
+        }
+
+        #[tokio::test]
+        async fn a_newer_hook_wins_over_an_older_cancel() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Store::shared();
+            waiting_row(&store, "s2", "%1").await;
+            let cancel = OffsetDateTime::now_utc();
+            write_log(
+                home.path(),
+                "s2",
+                &[prompt_line(at(-2)), abort_line(cancel)],
+            );
+            // The next prompt is hooked before Copilot flushes it to its log.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            hook(
+                &store,
+                vec![AgentEvent::PromptSubmitted {
+                    id: id("s2", "%1"),
+                    prompt: "again".into(),
+                    at: at(0),
+                }],
+            )
+            .await;
+            poll(&store, home.path()).await;
+            assert_eq!(
+                store.by_session("s2").await.unwrap().state,
+                AgentState::Working
+            );
+        }
+
+        /// From the #538 review: the row is forgotten while its log is read.
+        #[test]
+        fn a_row_forgotten_during_the_read_is_not_recreated() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let home = tempfile::tempdir().unwrap();
+                let store = Store::shared();
+                waiting_row(&store, "gone", "%1").await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                write_log(
+                    home.path(),
+                    "gone",
+                    &[prompt_line(at(-2)), abort_line(OffsetDateTime::now_utc())],
+                );
+                // Hold the only blocking thread so the poll's read waits.
+                let (release, held) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || held.recv().ok());
+                let polling = {
+                    let store = store.clone();
+                    let home = home.path().to_path_buf();
+                    tokio::spawn(async move { poll(&store, &home).await })
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(store.forget_agent("gone").await);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                polling.await.unwrap();
+                assert!(store.by_session("gone").await.is_none());
+            });
+        }
+
+        #[tokio::test]
+        async fn a_row_that_moved_on_during_the_read_is_left_alone() {
+            let store = Store::shared();
+            waiting_row(&store, "s4", "%1").await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let stop = AgentEvent::TurnStopped {
+                id: id("s4", "%1"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: true,
+                at: OffsetDateTime::now_utc(),
+            };
+            store
+                .apply_observed_if_in(
+                    &stop,
+                    crate::provenance::StateSource::ProviderRecord,
+                    &[AgentState::Working],
+                )
+                .await;
+            assert_eq!(
+                store.by_session("s4").await.unwrap().state,
+                AgentState::WaitingInput
+            );
+        }
+
+        #[tokio::test]
+        async fn a_session_id_that_leaves_the_log_tree_is_never_read() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Store::shared();
+            let evil = "../s3";
+            waiting_row(&store, evil, "%1").await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // An abort log where `session-state/../s3` would point.
+            let dir = home.path().join("s3");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("events.jsonl"),
+                abort_line(OffsetDateTime::now_utc()) + "\n",
+            )
+            .unwrap();
+            poll(&store, home.path()).await;
+            assert_eq!(
+                store.by_session(evil).await.unwrap().state,
+                AgentState::WaitingInput
+            );
+        }
+
+        #[tokio::test]
+        async fn other_kinds_and_a_missing_log_are_left_alone() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Store::shared();
+            let mut codex = id("c1", "%1");
+            codex.kind = AgentKind::Codex;
+            hook(
+                &store,
+                vec![
+                    AgentEvent::Started {
+                        id: codex.clone(),
+                        at: at(-2),
+                    },
+                    AgentEvent::PromptSubmitted {
+                        id: codex,
+                        prompt: "x".into(),
+                        at: at(-1),
+                    },
+                ],
+            )
+            .await;
+            waiting_row(&store, "nolog", "%2").await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            write_log(home.path(), "c1", &[abort_line(OffsetDateTime::now_utc())]);
+            poll(&store, home.path()).await;
+            assert_eq!(
+                store.by_session("c1").await.unwrap().state,
+                AgentState::Working
+            );
+            assert_eq!(
+                store.by_session("nolog").await.unwrap().state,
+                AgentState::WaitingInput
+            );
+        }
     }
 
     #[test]

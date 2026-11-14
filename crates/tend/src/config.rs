@@ -1295,6 +1295,14 @@ pub struct ReconcilerConfig {
     /// that want to skip the per-tick directory scan entirely).
     #[serde(default = "default_true")]
     pub codex_rollout_enabled: bool,
+    /// Read Copilot CLI session logs (`$COPILOT_HOME/session-state`) on the
+    /// same two-second cadence, for live Copilot rows that are working or
+    /// waiting, to settle a turn Copilot cancelled without a hook (Esc on a
+    /// permission prompt). Costs nothing while no Copilot row is live.
+    ///
+    /// Default `true`.
+    #[serde(default = "default_true")]
+    pub copilot_session_log_enabled: bool,
     /// Age (seconds) after which a fully orphaned agent row — no pane, no
     /// surface, no pid — is flipped to `Stopped` so the regular GC can reap
     /// it. Closes the liveness hole where a codex session driven through a
@@ -1326,6 +1334,7 @@ impl Default for ReconcilerConfig {
             stuck_working_timeout_secs: 0,
             stuck_waiting_timeout_secs: 0,
             codex_rollout_enabled: true,
+            copilot_session_log_enabled: true,
             paneless_stale_timeout_secs: default_paneless_stale_secs(),
             paneless_max_live_rows: default_paneless_max_live_rows(),
         }

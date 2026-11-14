@@ -162,6 +162,10 @@ pub struct Reconciler<L: LivenessSource> {
     /// Last parsed tail per live codex session, reused while the rollout file
     /// is unchanged. Pruned to the polled set every pass.
     codex_rollouts: Arc<std::sync::Mutex<codex_rollout::RolloutCache>>,
+    /// `$COPILOT_HOME`. When `Some`, Copilot rows a missing hook left
+    /// working or waiting are settled from their session logs (see
+    /// [`crate::adapters::copilot_session::poll`]), on the Codex cadence.
+    copilot_home: Option<PathBuf>,
     native_sessions: Option<crate::session::SharedSessionBackend>,
     /// When each observed host last answered well enough to protect its rows
     /// from the cross-host age-out. Seeded with construction time, so a host
@@ -203,6 +207,7 @@ impl<L: LivenessSource> Reconciler<L> {
             paneless_max_live: 0,
             codex_sessions_root: None,
             codex_rollouts: Arc::default(),
+            copilot_home: None,
             native_sessions: None,
             last_protected: std::sync::Mutex::new(
                 kinds
@@ -279,6 +284,12 @@ impl<L: LivenessSource> Reconciler<L> {
     #[must_use]
     pub fn with_codex_sessions_root(mut self, root: Option<PathBuf>) -> Self {
         self.codex_sessions_root = root;
+        self
+    }
+
+    #[must_use]
+    pub fn with_copilot_home(mut self, home: Option<PathBuf>) -> Self {
+        self.copilot_home = home;
         self
     }
 
@@ -797,6 +808,9 @@ impl<L: LivenessSource> Reconciler<L> {
         if let Some(root) = &self.codex_sessions_root {
             self.poll_codex_rollouts(root).await;
         }
+        if let Some(home) = &self.copilot_home {
+            crate::adapters::copilot_session::poll(&self.store, home).await;
+        }
         // Flip pid-tracked task rows whose process has exited to Stopped.
         let dead_tasks = self.store.reap_dead_pids().await;
         if dead_tasks > 0 {
@@ -877,9 +891,12 @@ impl<L: LivenessSource> Reconciler<L> {
         tick.tick().await;
         loop {
             tokio::select! {
-                _ = codex_tick.tick(), if self.codex_sessions_root.is_some() => {
+                _ = codex_tick.tick(), if self.codex_sessions_root.is_some() || self.copilot_home.is_some() => {
                     if let Some(root) = &self.codex_sessions_root {
                         self.poll_codex_rollouts(root).await;
+                    }
+                    if let Some(home) = &self.copilot_home {
+                        crate::adapters::copilot_session::poll(&self.store, home).await;
                     }
                 }
                 _ = tick.tick() => {

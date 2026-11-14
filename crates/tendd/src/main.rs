@@ -1683,6 +1683,13 @@ fn spawn_reconciler_task(
     } else {
         None
     };
+    // Copilot CLI cancels a turn on Esc without a hook; its session log is
+    // the only record of it.
+    let copilot_home = if cfg.reconciler.copilot_session_log_enabled {
+        tend::adapters::copilot_session::default_home()
+    } else {
+        None
+    };
     let runner = Reconciler::with_sources(
         store.clone(),
         backends,
@@ -1701,6 +1708,7 @@ fn spawn_reconciler_task(
     ))
     .with_paneless_max_live(cfg.reconciler.paneless_max_live_rows)
     .with_codex_sessions_root(codex_sessions_root.clone())
+    .with_copilot_home(copilot_home.clone())
     .with_agent_directory(agent_directory);
     let shutdown_rx = shutdown_tx.subscribe();
     let handle = tokio::spawn(runner.run(shutdown_rx));
@@ -1711,6 +1719,7 @@ fn spawn_reconciler_task(
         paneless_stale_timeout_secs = cfg.reconciler.paneless_stale_timeout_secs,
         paneless_max_live_rows = cfg.reconciler.paneless_max_live_rows,
         codex_rollout_polling = codex_sessions_root.is_some(),
+        copilot_session_logs = copilot_home.is_some(),
         "reconciler enabled",
     );
     Some(handle)

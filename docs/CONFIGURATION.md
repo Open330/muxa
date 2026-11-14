@@ -673,6 +673,7 @@ interval_secs = 30
 stuck_working_timeout_secs = 0
 stuck_waiting_timeout_secs = 0
 codex_rollout_enabled = true
+copilot_session_log_enabled = true
 paneless_stale_timeout_secs = 86400
 paneless_max_live_rows = 256
 ```
@@ -686,7 +687,11 @@ Codex rollout polling runs every two seconds independently of the full
 `interval_secs` reconciliation. It uses original event timestamps for activity
 and recovers running/completed turns and actual errors. Used percentages and
 credit balances alone do not change state. Set `codex_rollout_enabled = false`
-to disable it. `paneless_stale_timeout_secs` stops fully orphaned registry rows
+to disable it. On the same cadence, `copilot_session_log_enabled` reads the
+session log (`$COPILOT_HOME/session-state/<id>/events.jsonl`) of each Copilot CLI
+row that is working or waiting, and settles a turn Copilot cancelled without a
+hook (Esc on a permission prompt) at the cancel's own time; set it to `false` to
+disable. `paneless_stale_timeout_secs` stops fully orphaned registry rows
 after 24 hours by default; `0` disables that cleanup. `paneless_max_live_rows`
 keeps at most that many live orphan rows at once (the least recently active
 beyond it are stopped), so a script running agent CLIs headlessly cannot pile

@@ -1493,6 +1493,10 @@ enum Admission {
     Rule,
     /// A deterministic repair of a row still exactly as it was read.
     RepairIfUnchanged { last_activity_at: OffsetDateTime },
+    /// A daemon observation made from an earlier read of a row: held to
+    /// `provenance::admit`, and only while that row still exists in one of
+    /// these states, so stale work cannot recreate a forgotten row.
+    ExistingIn(&'static [AgentState]),
 }
 
 /// Reconcile pane occupants for an incoming `Started` event.
@@ -1862,6 +1866,19 @@ impl Store {
             .await;
     }
 
+    /// [`Self::apply_observed`] for an observation made from an earlier read
+    /// of the row: a no-op unless the row still exists in one of `states`
+    /// when the event is applied (checked under the registry's write lock).
+    pub async fn apply_observed_if_in(
+        &self,
+        ev: &AgentEvent,
+        source: StateSource,
+        states: &'static [AgentState],
+    ) {
+        self.apply_event(ev, None, false, source, Admission::ExistingIn(states))
+            .await;
+    }
+
     /// Apply a deterministic repair stamped at the row's own last activity,
     /// only if the row still has that last activity and is in `Error`. The
     /// check runs under the registry's write lock together with the apply,
@@ -1953,12 +1970,15 @@ impl Store {
         let row = agents.get(&id.session_id);
         let verdict = match (admission, row) {
             // A repair whose row has since been forgotten must not recreate it.
-            (Admission::RepairIfUnchanged { .. }, None) => {
+            (Admission::RepairIfUnchanged { .. } | Admission::ExistingIn(_), None) => {
+                Err(crate::provenance::Refusal::Superseded)
+            }
+            (Admission::ExistingIn(states), Some(row)) if !states.contains(&row.state) => {
                 Err(crate::provenance::Refusal::Superseded)
             }
             (_, None) | (Admission::Ingested, _) => Ok(()),
             (_, Some(_)) if matches!(ev, AgentEvent::Heartbeat { .. }) => Ok(()),
-            (Admission::Rule, Some(row)) => crate::provenance::admit(
+            (Admission::Rule | Admission::ExistingIn(_), Some(row)) => crate::provenance::admit(
                 deterministic_watermark(row),
                 source,
                 at,
