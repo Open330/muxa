@@ -114,6 +114,7 @@ pub mod work_control;
 // WS-F: snapshot
 pub mod listener_inventory;
 pub mod mux_snapshot_control;
+pub mod work_complete;
 pub mod work_pipeline_spec;
 pub mod work_presets;
 pub mod work_verify;

@@ -117,6 +117,38 @@ impl Client {
         serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// [`Self::pipeline_done`] that also files `record` as one daemon
+    /// operation (`work_done_record_v1`): a crash between the two cannot
+    /// leave the record without the completion. Check the capability first;
+    /// an older daemon ignores the record.
+    pub async fn pipeline_done_with_record(
+        &self,
+        identity: &WorkIdentity,
+        alias: &str,
+        generation: u64,
+        record: &crate::review::NewReview,
+    ) -> Result<(PipelineRun, crate::review::ReviewItem), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "pipeline_done",
+            "identity": identity,
+            "alias": alias,
+            "generation": generation,
+            "record": record,
+        });
+        let response = self
+            .call_with_timeout(&req, crate::work_verify::VERIFY_CALL_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(super::response_error(&response));
+        }
+        let run =
+            serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)?;
+        let item =
+            serde_json::from_value(response["review_item"].clone()).map_err(RuntimeError::Json)?;
+        Ok((run, item))
+    }
+
     pub async fn pipeline_invalidate(
         &self,
         identity: &WorkIdentity,

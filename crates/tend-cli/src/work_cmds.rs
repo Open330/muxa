@@ -68,24 +68,45 @@ pub async fn run_work_done(
         .filter(|pane| !pane.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("no pane to read; pass --pane (outside tmux, or under a shared Codex app-server whose TMUX_PANE names another pane)"))?;
     let (identity, alias, generation) = pane_pipeline(&pane, args.alias.clone(), args.generation)?;
+    let record = if args.undo {
+        None
+    } else {
+        args.record.into_review(&identity, &alias, generation)?
+    };
     let mut filed = None;
-    if !args.undo {
-        if let Some(record) = args.record.into_review(&identity, &alias, generation)? {
-            // Filed before completion: a refused record leaves the alias
-            // open, so a retry files and completes together, and the key
-            // makes that retry return the same item.
-            filed = Some(
-                crate::review_cmd::file(client, &record)
-                    .await
-                    .context("filing the result record; the alias is not reported done yet")?,
-            );
-        }
-    }
     let run = if args.undo {
         client
             .pipeline_invalidate(&identity, &alias, generation)
             .await
             .with_context(|| format!("invalidate pipeline alias {alias:?}"))?
+    } else if let Some(record) = record {
+        crate::review_cmd::require_filing(client, &record).await?;
+        if crate::decision_record::daemon_supports(client, tend::work_complete::CAPABILITY)
+            .await
+            .map_err(anyhow::Error::msg)?
+        {
+            // One daemon operation: the record and the completion land
+            // together, or a crash between them is finished at restart.
+            let (run, item) = client
+                .pipeline_done_with_record(&identity, &alias, generation, &record)
+                .await
+                .with_context(|| format!("file the result record and complete {alias:?}"))?;
+            filed = Some(item);
+            run
+        } else {
+            // An older daemon: filed before completion, so a refused record
+            // leaves the alias open and a retry (same key, same item)
+            // files and completes together.
+            filed = Some(
+                crate::review_cmd::file(client, &record)
+                    .await
+                    .context("filing the result record; the alias is not reported done yet")?,
+            );
+            client
+                .pipeline_done(&identity, &alias, generation)
+                .await
+                .with_context(|| format!("atomically complete pipeline alias {alias:?}"))?
+        }
     } else {
         client
             .pipeline_done(&identity, &alias, generation)
@@ -466,6 +487,7 @@ mod work_list_view_tests {
                             error: None,
                             reconcile_pending: false,
                             claim_started_at: None,
+                            completing: None,
                             updated_at: time::OffsetDateTime::UNIX_EPOCH,
                         },
                     )
@@ -516,6 +538,7 @@ mod work_list_view_tests {
             error: None,
             reconcile_pending: false,
             claim_started_at: None,
+            completing: None,
             updated_at: now,
         };
         PipelineRun {

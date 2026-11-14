@@ -156,3 +156,75 @@ fn the_daemon_runtime_does_not_wait_out_a_stuck_blocking_task() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn only_the_default_daemon_finishes_interrupted_completions() {
+    use tend::pipeline_run::{PendingCompletion, PipelineAliasStatus, PipelineRunRegistration};
+    let identity = tend::work::WorkIdentity::new("ws", "WORK-1");
+    let runs = PipelineRunStore::in_memory();
+    let run = runs
+        .register(PipelineRunRegistration {
+            identity: identity.clone(),
+            pipeline: "solo".to_string(),
+            desired: vec![tend::pipeline::DesiredAgent {
+                alias: "impl".to_string(),
+                program: "codex".to_string(),
+                role: None,
+                task: None,
+                prompt: Some("do it".to_string()),
+                options: Vec::new(),
+                direction: None,
+                after: Vec::new(),
+                purpose: tend::collaboration::LaunchPurpose::Primary,
+            }],
+            cwd: PathBuf::from("/tmp/work"),
+            window_id: None,
+            observed: Vec::new(),
+            invalidate: Vec::new(),
+        })
+        .await
+        .unwrap();
+    runs.claim_ready(&identity, run.generation).await.unwrap();
+    let record = tend::review::NewReview {
+        target: tend::review::ReviewTarget::Work {
+            workspace: "ws".to_string(),
+            work: "WORK-1".to_string(),
+            alias: Some("impl".to_string()),
+            pipeline_generation: Some(run.generation),
+        },
+        summary: "done".to_string(),
+        anchor: None,
+        idempotency_key: Some("work-done:startup-test".to_string()),
+        requested_by: tend::review::ReviewActor {
+            kind: tend::review::ActorKind::Agent,
+            label: None,
+        },
+        decision: None,
+    };
+    runs.begin_completion(
+        &identity,
+        "impl",
+        PendingCompletion {
+            generation: run.generation,
+            record,
+            verification: None,
+        },
+    )
+    .await
+    .unwrap();
+    let reviews = tend::review::ReviewStore::in_memory();
+    let alias = |runs: Vec<tend::pipeline_run::PipelineRun>| {
+        let state = runs[0].aliases["impl"].clone();
+        (state.status, state.completing.is_some())
+    };
+
+    // An override daemon leaves it alone: the stores may be the default one's.
+    assert!(!recover_completions(&runs, &reviews, false).await);
+    assert_eq!(
+        alias(runs.list().await),
+        (PipelineAliasStatus::Running, true)
+    );
+
+    assert!(recover_completions(&runs, &reviews, true).await);
+    assert_eq!(alias(runs.list().await), (PipelineAliasStatus::Done, false));
+}

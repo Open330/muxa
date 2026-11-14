@@ -299,6 +299,10 @@ pub(super) enum RequestBody {
         identity: WorkIdentity,
         alias: String,
         generation: u64,
+        /// A result record to file with the completion, as one operation
+        /// (`work_done_record_v1`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<Box<crate::review::NewReview>>,
     },
     /// Start a new generation for an alias and its downstream closure.
     PipelineInvalidate {
@@ -1067,6 +1071,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::decision_queue::DECISION_QUEUE_CAPABILITY,
     crate::work::WORK_BACKLOG_CAPABILITY,
     crate::work::WORK_VERIFY_CAPABILITY,
+    crate::work_complete::CAPABILITY,
     crate::work::WORK_RECENT_RESULTS_CAPABILITY,
     crate::work::WORK_EXTERNAL_CAPABILITY,
     "pipeline_subscribe",

@@ -71,7 +71,32 @@ pub struct PipelineAliasState {
     /// a short lease so daemon/CLI crashes cannot strand the Run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_started_at: Option<OffsetDateTime>,
+    /// A completion that files a result record, written before either is
+    /// applied so a crash between the two is finished at the next start
+    /// (`work_done_record_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completing: Option<Box<PendingCompletion>>,
     pub updated_at: OffsetDateTime,
+}
+
+/// What [`PipelineRunStore::begin_completion`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Began {
+    /// Wrote this completion down.
+    Created,
+    /// The same completion was already written down; left as it was.
+    Existing,
+}
+
+/// A result record and the completion it belongs to. The record carries its
+/// idempotency key, so filing it again returns the item already filed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCompletion {
+    pub generation: u64,
+    pub record: crate::review::NewReview,
+    /// What tendd's own checks found, recorded with the item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::work_verify::Verification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +506,7 @@ impl PipelineRunStore {
                     state.error = None;
                     state.reconcile_pending = true;
                     state.claim_started_at = None;
+                    state.completing = None;
                     state.updated_at = now;
                     // Keep the pane as a re-prompt target. The downstream
                     // agent is not considered running in the new generation
@@ -541,33 +567,7 @@ impl PipelineRunStore {
             .cloned()
             .ok_or_else(|| PipelineRunError::NotFound(identity.key()))?;
         let mut run = previous.clone();
-        let state = run
-            .aliases
-            .get_mut(alias)
-            .ok_or_else(|| PipelineRunError::UnknownAlias {
-                run: identity.key(),
-                alias: alias.to_string(),
-            })?;
-        // Run generation is a monotonic revision, but independent branches
-        // may still be working in an older generation. Validate the alias's
-        // expected generation so restarting one branch does not invalidate an
-        // unrelated branch's legitimate completion event.
-        if state.generation != generation {
-            return Err(PipelineRunError::StaleGeneration {
-                alias: alias.to_string(),
-                current: state.generation,
-                event: generation,
-            });
-        }
-        // A generation number alone is not proof that this alias was
-        // materialized. Accept completion only after an observed run or an
-        // active atomic claim; otherwise a caller could skip the scheduler
-        // and open downstream work directly.
-        if state.reconcile_pending && state.claim_started_at.is_none() {
-            return Err(PipelineRunError::Invalid(format!(
-                "alias {alias:?} has not started in generation {generation}"
-            )));
-        }
+        let state = completable(&mut run, identity, alias, generation)?;
         let now = OffsetDateTime::now_utc();
         state.status = PipelineAliasStatus::Done;
         state.generation = generation;
@@ -575,11 +575,103 @@ impl PipelineRunStore {
         state.error = None;
         state.reconcile_pending = false;
         state.claim_started_at = None;
+        state.completing = None;
         state.updated_at = now;
         run.updated_at = now;
         persist_run(&mut inner, run.clone(), Some(previous)).await?;
         self.bump_revision();
         Ok(run)
+    }
+
+    /// Record that `alias` is about to file `pending.record` and complete,
+    /// after the same checks [`Self::done`] makes. Persisted first, so a
+    /// filed record is never left without its completion: whatever a crash
+    /// interrupts, [`Self::pending_completions`] hands back at the next start.
+    ///
+    /// A completion already written down for this generation is never
+    /// replaced: its record may be filed already. The same record (same
+    /// key) reuses it ([`Began::Existing`]); another record is refused.
+    pub async fn begin_completion(
+        &self,
+        identity: &WorkIdentity,
+        alias: &str,
+        pending: PendingCompletion,
+    ) -> Result<Began, PipelineRunError> {
+        let mut inner = self.inner.lock().await;
+        let previous = inner
+            .runs
+            .get(identity)
+            .cloned()
+            .ok_or_else(|| PipelineRunError::NotFound(identity.key()))?;
+        let mut run = previous.clone();
+        let state = completable(&mut run, identity, alias, pending.generation)?;
+        if let Some(existing) = state
+            .completing
+            .as_ref()
+            .filter(|existing| existing.generation == pending.generation)
+        {
+            if existing.record.idempotency_key == pending.record.idempotency_key {
+                return Ok(Began::Existing);
+            }
+            return Err(PipelineRunError::Invalid(format!(
+                "another result for {alias:?} in generation {} is still being completed",
+                pending.generation
+            )));
+        }
+        state.completing = Some(Box::new(pending));
+        persist_run(&mut inner, run, Some(previous)).await?;
+        Ok(Began::Created)
+    }
+
+    /// Drop the pending completion of `alias` in `generation` whose record
+    /// has idempotency key `key`, if it is still the one recorded.
+    pub async fn abandon_completion(
+        &self,
+        identity: &WorkIdentity,
+        alias: &str,
+        generation: u64,
+        key: Option<&str>,
+    ) -> Result<(), PipelineRunError> {
+        let mut inner = self.inner.lock().await;
+        let Some(previous) = inner.runs.get(identity).cloned() else {
+            return Ok(());
+        };
+        let mut run = previous.clone();
+        let Some(state) = run.aliases.get_mut(alias) else {
+            return Ok(());
+        };
+        if state.completing.as_ref().is_none_or(|pending| {
+            pending.generation != generation || pending.record.idempotency_key.as_deref() != key
+        }) {
+            return Ok(());
+        }
+        state.completing = None;
+        persist_run(&mut inner, run, Some(previous)).await?;
+        Ok(())
+    }
+
+    /// Every recorded completion not yet applied, with whether it still
+    /// matches its alias's generation (an invalidation since makes it stale).
+    pub async fn pending_completions(
+        &self,
+    ) -> Vec<(WorkIdentity, String, PendingCompletion, bool)> {
+        let inner = self.inner.lock().await;
+        inner
+            .runs
+            .values()
+            .flat_map(|run| {
+                run.aliases.values().filter_map(|state| {
+                    state.completing.as_ref().map(|pending| {
+                        (
+                            run.identity.clone(),
+                            state.alias.clone(),
+                            (**pending).clone(),
+                            pending.generation == state.generation,
+                        )
+                    })
+                })
+            })
+            .collect()
     }
 
     /// Undo completion by starting a new generation and invalidating the
@@ -621,6 +713,7 @@ impl PipelineRunStore {
                 state.error = None;
                 state.reconcile_pending = true;
                 state.claim_started_at = None;
+                state.completing = None;
                 state.updated_at = now;
             }
         }
@@ -945,6 +1038,43 @@ fn validate_registration(registration: &PipelineRunRegistration) -> Result<(), P
     Ok(())
 }
 
+/// The alias `done(alias, generation)` may complete, or why not.
+fn completable<'a>(
+    run: &'a mut PipelineRun,
+    identity: &WorkIdentity,
+    alias: &str,
+    generation: u64,
+) -> Result<&'a mut PipelineAliasState, PipelineRunError> {
+    let state = run
+        .aliases
+        .get_mut(alias)
+        .ok_or_else(|| PipelineRunError::UnknownAlias {
+            run: identity.key(),
+            alias: alias.to_string(),
+        })?;
+    // Run generation is a monotonic revision, but independent branches
+    // may still be working in an older generation. Validate the alias's
+    // expected generation so restarting one branch does not invalidate an
+    // unrelated branch's legitimate completion event.
+    if state.generation != generation {
+        return Err(PipelineRunError::StaleGeneration {
+            alias: alias.to_string(),
+            current: state.generation,
+            event: generation,
+        });
+    }
+    // A generation number alone is not proof that this alias was
+    // materialized. Accept completion only after an observed run or an
+    // active atomic claim; otherwise a caller could skip the scheduler
+    // and open downstream work directly.
+    if state.reconcile_pending && state.claim_started_at.is_none() {
+        return Err(PipelineRunError::Invalid(format!(
+            "alias {alias:?} has not started in generation {generation}"
+        )));
+    }
+    Ok(state)
+}
+
 fn pending_state(alias: &str, generation: u64, now: OffsetDateTime) -> PipelineAliasState {
     PipelineAliasState {
         alias: alias.to_string(),
@@ -955,6 +1085,7 @@ fn pending_state(alias: &str, generation: u64, now: OffsetDateTime) -> PipelineA
         error: None,
         reconcile_pending: true,
         claim_started_at: None,
+        completing: None,
         updated_at: now,
     }
 }

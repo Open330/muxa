@@ -136,7 +136,8 @@ desired agents, monotonic generation, window binding, and each alias's
 - `pipeline_runs` returns every durable Run.
 - `pipeline_register` upserts desired state and live-pane observations.
 - `pipeline_done` atomically accepts `identity`, `alias`, and that alias's
-  expected `generation`; stale events are rejected.
+  expected `generation`; stale events are rejected. With `record`
+  (`work_done_record_v1`, below) it also files a result record.
 - `pipeline_invalidate` generation-checks the target alias, advances the Run
   generation, and clears completion for it and its transitive downstream
   closure.
@@ -882,6 +883,26 @@ set only by tendd and meant to be shown before the agent's `summary` and
 `decision`; the same results also lead `decision.evidence` as
 `{"kind":"test", …, "verified": true}`. A client's `verified` claim is
 cleared. Both calls can take up to the verification budget (1,200 s).
+
+## Result and completion together (`work_done_record_v1`)
+
+`pipeline_done` may carry `record`, a `review_create` record for the same
+alias: `target` must be `{"kind":"work"}` with this `workspace`, `work`,
+`alias` and `pipeline_generation`, and it must have an `idempotency_key`;
+anything else is refused before a check runs. tendd runs the Work's checks
+once, then writes the completion down (the record and its verification, on
+the alias in the Run store), files the record, and marks the alias done. The
+response has both `pipeline_run` and `review_item`. A record that cannot be
+filed leaves the alias open and nothing newly written down; a completion
+already written down for the same record (same key) is reused and kept, and
+one for a different record is refused, never replaced. tendd runs one such
+completion at a time (after the checks), so overlapping retries cannot drop
+each other's. A crash after the
+completion is written down is finished at the next start of the default
+daemon: filing again under the key returns the item already filed (or files
+it), then the alias completes; an alias restarted since drops it. So a filed
+result is never left with its alias open. A daemon without the capability
+ignores `record`, so check `hello` first.
 
 ## `HistoryEntry` schema (in `recent_prompts` responses)
 

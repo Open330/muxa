@@ -55,8 +55,12 @@ tend work done --summary "Migration and retry path done" --commit 1a2b3c \
   --option "behind the flag" --option "on by default" --recommend "behind the flag"
 ```
 
-which files the item, keyed by Work, alias and pipeline generation, before it
-reports the alias done. A refused record leaves the alias open.
+which files the item, keyed by Work, alias and pipeline generation, and
+reports the alias done in the same tendd operation (`tend_file_result` does
+the same with `complete: true`). A refused record leaves the alias open; a
+crash between filing and completing is finished at the next start. An older
+tendd without `work_done_record_v1` gets the record first and the completion
+second, as before.
 
 ## Decision fields
 
