@@ -24,7 +24,9 @@
 //! declines, and the caller runs the child instead. There is no outer
 //! timeout: the operation stays running, and counted, until the work really
 //! ends, which the subprocess deadline bounds.
-//! `TEND_WORK_UP_CHILD=1` forces the child.
+//! Dropping the call (tendd stopping) cancels the subprocess scope, as the
+//! child was killed on drop. The same code runs a `work up` another Fleet
+//! host sends (`relay_in_process`). `TEND_WORK_UP_CHILD=1` forces the child.
 
 use std::path::PathBuf;
 use std::sync::Arc;
