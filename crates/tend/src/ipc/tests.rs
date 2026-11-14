@@ -367,7 +367,7 @@ async fn add_collaboration_agent(
                 surface: None,
                 pane: Some(pane.into()),
                 tmux_socket: Some("default".into()),
-                cwd: Some("/repo".into()),
+                cwd: Some(crate::test_paths::abs("/repo")),
             },
             at: OffsetDateTime::now_utc(),
         })

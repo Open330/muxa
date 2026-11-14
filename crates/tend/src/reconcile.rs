@@ -1697,7 +1697,11 @@ mod tests {
             r#"{{"timestamp":"2026-06-12T06:26:08.491Z","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{primary_pct},"window_minutes":300,"resets_at":1781262859}},"secondary":{{"used_percent":46.0,"window_minutes":10080,"resets_at":1781745469}},"rate_limit_reached_type":{reached}}}}}}}"#
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
-        std::fs::File::open(&path)
+        // Writable: Windows sets file times only through a handle with
+        // write access.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(2))
             .unwrap();
@@ -1965,7 +1969,11 @@ mod tests {
         .with_codex_sessions_root(Some(root.path().to_path_buf()));
         let parses = || reconciler.codex_rollouts.lock().unwrap().parses();
 
-        std::fs::File::open(&path)
+        // Writable: Windows sets file times only through a handle with
+        // write access.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(2))
             .unwrap();

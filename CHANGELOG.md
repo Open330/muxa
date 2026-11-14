@@ -100,6 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows: orchestration policies with a `~/` root (and roots such as
+  `/srv/runs` meant for a Unix node) are no longer refused, and a remote
+  `work up` / `agent start` may carry the other host's Unix or Windows
+  directory; the host that runs it still checks it by its own rule. Execute
+  path reservations compare plain paths, not Windows' `\\?\` verbatim form.
+  A Codex rollout replaced by rename with the same size and time is read
+  again (Windows has no inode; the creation time tells it apart).
+
 - Claude's folder-trust prompt is no longer answered when its path wraps
   across rows, on any platform: a space dropped at the break could make
   another folder read as a trusted one. Such a prompt is left for a person.

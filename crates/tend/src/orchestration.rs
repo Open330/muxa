@@ -3,6 +3,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// The home a plan's templates are checked against without expanding any
+/// real one (a remote node's home is not known here). Absolute on this
+/// platform, or Windows would refuse every `~/` root.
+const PLACEHOLDER_HOME: &str = if cfg!(windows) {
+    r"C:\placeholder-home"
+} else {
+    "/placeholder-home"
+};
+
 use crate::fleet::{
     FleetHostSnapshot, FleetHostState, FleetSnapshot, HostAccessMode, LabelSelector, NodeId,
 };
@@ -195,7 +204,7 @@ impl OrchestrationConfig {
                     paths,
                     reason: String::new(),
                 }
-                .resolve_paths(Path::new("/placeholder-home"))?;
+                .resolve_paths(Path::new(PLACEHOLDER_HOME))?;
             }
         }
         Ok(())
@@ -265,7 +274,7 @@ impl OrchestrationConfig {
         }
         let plan = DispatchPlan { request, node_id, host: host.alias.clone(), repo: policy.repo.clone(), url: policy.url.clone(), pipeline: policy.pipeline.clone(), paths, reason: "online, control-authorized, workspace and request selectors matched; fewest active agents, then stable NodeId".into() };
         // Validate templates without expanding the controller's home on a remote node.
-        plan.resolve_paths(Path::new("/placeholder-home"))?;
+        plan.resolve_paths(Path::new(PLACEHOLDER_HOME))?;
         Ok(plan)
     }
 }
@@ -301,12 +310,15 @@ impl DispatchPlan {
             Ok(path)
         };
         let root = expand(&self.paths.root)?;
-        if !root.is_absolute() {
+        // Rooted, not `is_absolute`: these paths are often a remote node's,
+        // and on a Windows controller `/srv/runs` (a Unix node's root) has
+        // no drive yet is no less absolute there. On Unix the two agree.
+        if !root.has_root() {
             return Err("execution root must be absolute or start with ~/".into());
         }
         let resolve = |s: &str| -> Result<PathBuf, String> {
             let p = expand(s)?;
-            Ok(if p.is_absolute() { p } else { root.join(p) })
+            Ok(if p.has_root() { p } else { root.join(p) })
         };
         // Runs/artifacts must be attempt-specific so retries cannot overwrite another attempt.
         for template in [&self.paths.run, &self.paths.artifacts] {

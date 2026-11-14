@@ -459,7 +459,7 @@ mod tests {
                 crate::work::WorkEdit {
                     title: Some("Fix login".into()),
                     prompt: Some("fix the redirect".into()),
-                    cwd: Some("/src/web".into()),
+                    cwd: Some(crate::test_paths::abs("/src/web")),
                     priority: Some(2),
                     ..Default::default()
                 },

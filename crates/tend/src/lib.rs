@@ -84,6 +84,8 @@ pub mod process_snapshot;
 pub mod process_tree;
 mod prompt_headline;
 pub mod provenance;
+#[cfg(test)]
+pub(crate) mod test_paths;
 #[cfg(unix)]
 #[doc(hidden)]
 pub mod test_support;

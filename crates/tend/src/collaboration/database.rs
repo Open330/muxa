@@ -92,7 +92,9 @@ fn same_file(original: &std::fs::Metadata, current: &std::fs::Metadata) -> bool 
     matches!((original.created(), current.created()), (Ok(a), Ok(b)) if a == b)
 }
 
-#[cfg(test)]
+// Windows will not rename a database file another handle has open, so it
+// cannot disappear under the connection there.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

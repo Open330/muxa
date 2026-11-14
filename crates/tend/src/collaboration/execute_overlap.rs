@@ -172,7 +172,7 @@ fn resolve(path: &Path) -> PathBuf {
                 out.pop();
                 // `missing/..` can lead back into a real directory.
                 if !exists {
-                    if let Ok(real) = std::fs::canonicalize(&out) {
+                    if let Ok(real) = crate::paths::canonicalize(&out) {
                         out = real;
                         exists = true;
                     }
@@ -181,7 +181,7 @@ fn resolve(path: &Path) -> PathBuf {
             other => {
                 out.push(other.as_os_str());
                 if exists {
-                    match std::fs::canonicalize(&out) {
+                    match crate::paths::canonicalize(&out) {
                         Ok(real) => out = real,
                         Err(_) => exists = false,
                     }
@@ -254,16 +254,18 @@ mod tests {
 
     #[test]
     fn paths_resolve_against_the_directory_and_globs_count_from_their_prefix() {
-        let cwd = Path::new("/nonexistent-tend-test/tend");
+        use crate::test_paths::abs_path;
+        let cwd = abs_path("/nonexistent-tend-test/tend");
+        let cwd = cwd.as_path();
         assert_eq!(
             checkout_scope(
                 cwd,
                 &["./crates/tend/../tend-cli/src/", "docs/**/*.md", "*.toml"]
             ),
             [
-                PathBuf::from("/nonexistent-tend-test/tend/crates/tend-cli/src"),
-                PathBuf::from("/nonexistent-tend-test/tend/docs"),
-                PathBuf::from("/nonexistent-tend-test/tend"),
+                abs_path("/nonexistent-tend-test/tend/crates/tend-cli/src"),
+                abs_path("/nonexistent-tend-test/tend/docs"),
+                abs_path("/nonexistent-tend-test/tend"),
             ]
         );
         assert!(overlaps("/a/b", "/a/b/c"));
@@ -273,7 +275,7 @@ mod tests {
     #[test]
     fn real_directories_without_git_still_overlap() {
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = crate::paths::canonicalize(dir.path()).unwrap();
         // No `.git` anywhere: nesting alone decides.
         std::fs::create_dir_all(root.join("nongit/src/a")).unwrap();
         let outer = root.join("nongit/src").to_string_lossy().into_owned();
@@ -287,7 +289,7 @@ mod tests {
     #[test]
     fn symlinked_names_resolve_to_the_files_they_reach() {
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = crate::paths::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("repo/.git")).unwrap();
         std::fs::create_dir_all(root.join("repo/real/a")).unwrap();
         std::fs::create_dir_all(root.join("other/sub")).unwrap();
@@ -317,7 +319,7 @@ mod tests {
     #[test]
     fn no_paths_claims_the_checkout_root_found_by_its_git_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = crate::paths::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("crates/a")).unwrap();
         assert_eq!(

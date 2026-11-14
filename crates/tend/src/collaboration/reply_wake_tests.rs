@@ -20,7 +20,7 @@ fn participant(pane: &str, session: &str) -> Participant {
         tmux_session_name: Some("main".into()),
         window_name: Some("feature".into()),
         state: AgentState::Idle,
-        cwd: Some("/repo".into()),
+        cwd: Some(crate::test_paths::abs("/repo")),
         alias: None,
         roles: Vec::new(),
         console: false,
@@ -601,7 +601,7 @@ async fn agent_on(pane: &str, session: &str) -> Agent {
                 surface: None,
                 pane: Some(pane.into()),
                 tmux_socket: Some("default".into()),
-                cwd: Some("/repo".into()),
+                cwd: Some(crate::test_paths::abs("/repo")),
             },
             at: OffsetDateTime::now_utc(),
         })

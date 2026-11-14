@@ -136,7 +136,12 @@ impl WorkUpRequest {
                 "external cannot be combined with no_ticket".into(),
             ));
         }
-        if self.cwd.as_deref().is_some_and(|path| !path.is_absolute()) {
+        let remote = crate::paths::is_remote_host(self.host.as_deref());
+        if self
+            .cwd
+            .as_deref()
+            .is_some_and(|path| !crate::paths::absolute_where_used(path, remote))
+        {
             return Err(WorkUpError::Invalid("cwd must be an absolute path".into()));
         }
         if self
@@ -855,6 +860,7 @@ mod tests {
         authorize_work_command("dev", HostAccessMode::Control, &ok).unwrap();
     }
 
+    #[cfg(unix)] // runs /bin/sh
     #[tokio::test]
     async fn fleet_launch_is_attachable_tmux_independent_of_callers_terminal() {
         let output = execute_tmux_work(
@@ -877,7 +883,7 @@ mod tests {
             external: None,
             pipeline: Some("implement-review".into()),
             workspace: Some("tend".into()),
-            cwd: Some(PathBuf::from("/tmp/tend")),
+            cwd: Some(crate::test_paths::abs_path("/tmp/tend")),
             skill: None,
             body: Some("Build it".into()),
             context: None,
@@ -891,6 +897,7 @@ mod tests {
     fn native_work_request_builds_non_interactive_canonical_cli_arguments() {
         let input = work_request(None);
         input.validate().unwrap();
+        let cwd = crate::test_paths::abs("/tmp/tend");
         assert_eq!(
             input.arguments(),
             vec![
@@ -904,7 +911,7 @@ mod tests {
                 "--workspace",
                 "tend",
                 "--cwd",
-                "/tmp/tend",
+                cwd.as_str(),
                 "--body",
                 "Build it",
                 "--no-ticket",

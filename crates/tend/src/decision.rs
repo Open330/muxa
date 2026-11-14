@@ -333,12 +333,13 @@ mod tests {
 
     #[test]
     fn shorthand_parses_each_kind() {
-        let repo = Some("/src/tend");
+        let repo_path = crate::test_paths::abs("/src/tend");
+        let repo = Some(repo_path.as_str());
         assert_eq!(
             Evidence::parse("commit:1a2b3c", repo).unwrap(),
             Evidence::Commit {
                 sha: "1a2b3c".into(),
-                repo: Some("/src/tend".into())
+                repo: Some(repo_path.clone())
             }
         );
         assert_eq!(

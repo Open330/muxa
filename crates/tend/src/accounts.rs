@@ -571,6 +571,9 @@ mod tests {
         );
     }
 
+    // An env file is sourced by `sh`, at identify and at launch; Windows
+    // refuses configured accounts (docs/WINDOWS.md).
+    #[cfg(unix)]
     #[test]
     fn a_token_from_an_env_file_identifies_and_launches_without_being_typed() {
         let dir = std::env::temp_dir().join(format!("tend-accounts-{}", std::process::id()));

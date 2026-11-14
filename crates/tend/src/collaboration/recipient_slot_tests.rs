@@ -43,7 +43,7 @@ fn agent(pane: &PaneInfo, session: &str, purpose: LaunchPurpose) -> Participant 
         tmux_session_name: Some("webapp".into()),
         window_name: Some(pane.window_name.clone()),
         state: AgentState::Idle,
-        cwd: Some("/repo".into()),
+        cwd: Some(crate::test_paths::abs("/repo")),
         alias: None,
         roles: pane.agent_role.iter().cloned().collect(),
         console: false,
