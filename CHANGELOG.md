@@ -109,6 +109,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `tend` command pointed at a daemon that is not the user's (`--socket
+  <scratch>`, or run with its own HOME/XDG setup) no longer reads the user's
+  tmux or rmux server through its own `$TMUX`/`$RMUX`. Inside a real pane,
+  `tend --socket <scratch> status` / `panes` used to merge every one of the
+  owner's panes into the scratch daemon's topology. It now gets the same
+  restriction as such a daemon (#546). `tend hook` is unchanged, since it
+  names its own pane from those variables.
+
 - Windows: orchestration policies with a `~/` root (and roots such as
   `/srv/runs` meant for a Unix node) are no longer refused, and a remote
   `work up` / `agent start` may carry the other host's Unix or Windows

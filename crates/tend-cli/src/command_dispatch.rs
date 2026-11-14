@@ -27,6 +27,17 @@ pub(super) async fn main() -> Result<()> {
         return Ok(());
     }
     let cmd = args.cmd.unwrap_or(Cmd::Start);
+    let early_socket = args.socket.clone().unwrap_or_else(paths::default_socket);
+    if matches!(
+        &cmd,
+        Cmd::Agent {
+            action: AgentCmd::Move(_)
+        } | Cmd::Window {
+            action: WindowCmd::Move(_)
+        }
+    ) {
+        keep_off_the_users_mux(&cmd, &early_socket, None);
+    }
     if let Cmd::Agent {
         action: AgentCmd::Move(move_args),
     } = &cmd
@@ -84,6 +95,7 @@ pub(super) async fn main() -> Result<()> {
         .socket
         .or_else(|| cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
+    keep_off_the_users_mux(&cmd, &socket, cfg.socket.as_deref());
     let client =
         Client::new(socket.clone()).with_collaboration_client_kind(collaboration_client_kind(&cmd));
 
@@ -347,4 +359,46 @@ pub(super) async fn main() -> Result<()> {
         let _ = invalidation_client.invalidate_agent_directory().await;
     }
     result
+}
+
+/// A CLI talking to a daemon that is not the user's (`--socket` / its own
+/// HOME or XDG setup) reads panes only from that daemon's side: never the
+/// user's tmux/rmux server through its own `$TMUX`/`$RMUX`, which inside a
+/// real pane would merge the owner's panes into a scratch daemon's
+/// topology. `tend hook` is left alone: it names its own pane from them.
+fn keep_off_the_users_mux(
+    cmd: &Cmd,
+    socket: &std::path::Path,
+    cfg_socket: Option<&std::path::Path>,
+) -> bool {
+    let restrict = mux_restriction_needed(cmd, || paths::talks_to_users_daemon(socket, cfg_socket));
+    if restrict {
+        tend::tmux::scanner::restrict_to_own_tmux_dir();
+    }
+    restrict
+}
+
+fn mux_restriction_needed(cmd: &Cmd, users_daemon: impl FnOnce() -> bool) -> bool {
+    !matches!(cmd, Cmd::Hook { .. }) && !users_daemon()
+}
+
+#[cfg(test)]
+mod mux_restriction_tests {
+    use super::*;
+
+    #[test]
+    fn a_cli_for_another_daemon_stays_off_the_users_mux_but_hooks_do_not() {
+        // `tend --socket <scratch> status` and the like.
+        assert!(mux_restriction_needed(&Cmd::Panes, || false));
+        // The user's own daemon: unchanged.
+        assert!(!mux_restriction_needed(&Cmd::Panes, || true));
+        // A hook names its own pane from `$TMUX`; it is never restricted,
+        // and the check is not even made.
+        let hook = Cmd::Hook {
+            which: crate::HookCmd::Claude {
+                event: "stop".into(),
+            },
+        };
+        assert!(!mux_restriction_needed(&hook, || panic!("not asked for a hook")));
+    }
 }

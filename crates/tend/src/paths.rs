@@ -251,6 +251,30 @@ fn dirs_overridden(
     overridden
 }
 
+/// Whether a client using `socket` talks to the user's own daemon: the
+/// default socket (or the one `config.toml` names) in the account's own
+/// HOME/XDG setup. A CLI pointed at a scratch or test daemon is not, and
+/// must not read the user's tmux/rmux server through its own `$TMUX`/`$RMUX`
+/// (`tmux::scanner::restrict_to_own_tmux_dir`).
+#[must_use]
+pub fn talks_to_users_daemon(socket: &Path, cfg_socket: Option<&Path>) -> bool {
+    users_daemon(
+        socket,
+        &default_socket(),
+        cfg_socket,
+        &default_dirs_overridden(),
+    )
+}
+
+fn users_daemon(
+    socket: &Path,
+    default: &Path,
+    cfg_socket: Option<&Path>,
+    overrides: &[&str],
+) -> bool {
+    (socket == default || cfg_socket == Some(socket)) && overrides.is_empty()
+}
+
 /// The XDG variables tend reads, with their spec default under the home
 /// (`None`: the runtime dir, whose default is `/run/user/<uid>`).
 const XDG_DIRS: &[(&str, Option<&str>)] = &[
@@ -360,6 +384,19 @@ mod tests {
             Path::new("/nonexistent/x/"),
             Path::new("/nonexistent/x")
         ));
+    }
+
+    #[test]
+    fn only_the_default_socket_in_the_accounts_own_setup_is_the_users_daemon() {
+        let default = Path::new("/tmp/tend-501.sock");
+        let named = Path::new("/srv/tend/main.sock");
+        let scratch = Path::new("/private/tmp/claude-501/x/run/tend.sock");
+        assert!(users_daemon(default, default, None, &[]));
+        assert!(users_daemon(named, default, Some(named), &[]));
+        assert!(!users_daemon(scratch, default, None, &[]));
+        assert!(!users_daemon(scratch, default, Some(named), &[]));
+        // Its own XDG setup makes the scratch socket "default": still not.
+        assert!(!users_daemon(scratch, scratch, None, &["XDG_RUNTIME_DIR"]));
     }
 
     #[test]
