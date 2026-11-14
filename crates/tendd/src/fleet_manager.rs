@@ -17,10 +17,11 @@ use tend::fleet::{
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES,
-    FLEET_DECISION_QUEUE_CAPABILITY, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
-    FLEET_PROTOCOL_VERSION, FLEET_REVIEW_DISPOSE_CAPABILITY, FLEET_SEND_KEYS_CAPABILITY,
-    FLEET_SERVER_INVENTORY_CAPABILITY, FLEET_WORKTREE_CHANGE_CAPABILITY,
-    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_DECISION_HISTORY_CAPABILITY, FLEET_DECISION_QUEUE_CAPABILITY, FLEET_MAX_DIAGNOSTIC_BYTES,
+    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_REVIEW_DISPOSE_CAPABILITY,
+    FLEET_SEND_KEYS_CAPABILITY, FLEET_SERVER_INVENTORY_CAPABILITY,
+    FLEET_WORKTREE_CHANGE_CAPABILITY, FLEET_WORKTREE_INVENTORY_CAPABILITY,
+    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use tend::tmux::SessionInfo;
 use tend::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -485,6 +486,14 @@ impl LocalTask {
                     .map(FleetCommandResult::decision_queue)
                     .map_err(|error| error.to_string())
             }
+            FleetOperation::DecisionHistory { limit } => {
+                audit_operation(LOCAL_HOST_ALIAS, "decision_history", 0);
+                self.client
+                    .decision_history(&tend::decision_queue::operator_origin(), limit)
+                    .await
+                    .map(FleetCommandResult::decision_history)
+                    .map_err(|error| error.to_string())
+            }
             FleetOperation::ReviewDispose { dispose } => {
                 audit_operation(LOCAL_HOST_ALIAS, "review_dispose", 0);
                 self.client
@@ -715,24 +724,23 @@ fn spawn_server_inventory(command: HostCommand, agents: &SharedStore) -> Option<
     None
 }
 
-/// The decision queue goes only to a relay that says it answers it.
+/// The decision queue and history go only to a relay that says it answers
+/// them.
 fn decision_queue_refusal(
     alias: &str,
     hello: &RelayHello,
     operation: &FleetOperation,
 ) -> Option<String> {
-    if !matches!(operation, FleetOperation::DecisionQueue { .. }) {
-        return None;
-    }
-    if hello
-        .capabilities
-        .iter()
-        .any(|capability| capability == FLEET_DECISION_QUEUE_CAPABILITY)
-    {
+    let (capability, what) = match operation {
+        FleetOperation::DecisionQueue { .. } => (FLEET_DECISION_QUEUE_CAPABILITY, "queue"),
+        FleetOperation::DecisionHistory { .. } => (FLEET_DECISION_HISTORY_CAPABILITY, "history"),
+        _ => return None,
+    };
+    if hello.capabilities.iter().any(|c| c == capability) {
         return None;
     }
     Some(format!(
-        "host '{alias}' cannot send its decision queue; upgrade tend on that host"
+        "host '{alias}' cannot send its decision {what}; upgrade tend on that host"
     ))
 }
 
@@ -1782,6 +1790,14 @@ impl HostTask {
                             );
                             RelayRequest::DecisionQueue { request_id: id, limit }
                         }
+                        FleetOperation::DecisionHistory { limit } => {
+                            audit_operation(&self.alias, "decision_history", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::DecisionHistory { request_id: id, limit }
+                        }
                         FleetOperation::ReviewDispose { dispose } => {
                             audit_operation(&self.alias, "review_dispose", 0);
                             pending.insert(
@@ -2322,6 +2338,34 @@ mod tests {
         assert!(FLEET_CAPABILITIES.contains(&FLEET_BOUNDED_CLAIM_CAPABILITY));
         assert!(unbounded_claim_refusal("remote", &current, &claim).is_none());
         assert!(unbounded_claim_refusal("remote", &current, &list).is_none());
+    }
+
+    #[test]
+    fn the_decision_history_reaches_only_relays_that_send_it() {
+        let hello = |capabilities: &[&str]| RelayHello {
+            fleet_protocol: FLEET_PROTOCOL_VERSION,
+            min_fleet_protocol: FLEET_PROTOCOL_VERSION,
+            node_id: NodeId::generate(),
+            hostname: "remote".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tend_version: "0.0.0".into(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            daemon_generation: None,
+            boot_id: "boot".into(),
+            backends: Vec::new(),
+            server_time: OffsetDateTime::now_utc(),
+        };
+        let older = hello(&[FLEET_DECISION_QUEUE_CAPABILITY]);
+        let current = hello(FLEET_CAPABILITIES);
+        let history = FleetOperation::DecisionHistory { limit: 50 };
+        let refusal = decision_queue_refusal("remote", &older, &history).unwrap();
+        assert!(refusal.contains("decision history"), "{refusal}");
+        assert!(decision_queue_refusal("remote", &current, &history).is_none());
+        assert!(
+            !history.is_control(),
+            "a read: observe-only hosts send it too"
+        );
     }
 
     #[test]

@@ -101,6 +101,9 @@ pub const FLEET_DECISION_QUEUE_CAPABILITY: &str = "fleet_decision_queue_v1";
 /// Relay capability: the relay applies [`RelayRequest::ReviewDispose`] to
 /// one of its host's review items, exactly or not at all.
 pub const FLEET_REVIEW_DISPOSE_CAPABILITY: &str = "fleet_review_dispose_v1";
+/// Relay capability: the relay answers [`RelayRequest::DecisionHistory`]
+/// with its host's past decisions, read as the operator console.
+pub const FLEET_DECISION_HISTORY_CAPABILITY: &str = "fleet_decision_history_v1";
 /// The relay (and, in a daemon's own hello, the controller) carries
 /// `SendPrompt.force` end to end and enforces it through the destination
 /// daemon's guarded `send_prompt`. Distinct from the local
@@ -131,6 +134,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     FLEET_SERVER_INVENTORY_CAPABILITY,
     FLEET_DECISION_QUEUE_CAPABILITY,
     FLEET_REVIEW_DISPOSE_CAPABILITY,
+    FLEET_DECISION_HISTORY_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -602,6 +606,11 @@ pub enum RelayRequest {
         request_id: String,
         dispose: FleetReviewDispose,
     },
+    /// The relay host's past decisions as its operator sees them; read-only.
+    DecisionHistory {
+        request_id: String,
+        limit: usize,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -681,6 +690,7 @@ impl RelayRequest {
             | Self::ServerInventory { request_id }
             | Self::DecisionQueue { request_id, .. }
             | Self::ReviewDispose { request_id, .. }
+            | Self::DecisionHistory { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -835,6 +845,11 @@ pub enum FleetOperation {
     /// is in `review_dispose`.
     ReviewDispose {
         dispose: FleetReviewDispose,
+    },
+    /// `fleet_decision_history_v1`: the host's decided review items and
+    /// answered questions to its operator, newest first. Read-only.
+    DecisionHistory {
+        limit: usize,
     },
     CollaborationSend {
         pane: PaneKey,
@@ -996,6 +1011,9 @@ pub struct FleetCommandResult {
     /// How a `review_dispose` ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_dispose: Option<FleetReviewOutcome>,
+    /// The host's past decisions, for `decision_history`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_history: Option<Box<crate::decision_queue::DecisionHistory>>,
 }
 
 impl FleetCommandResult {
@@ -1004,6 +1022,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: Some(message.into()),
             capture: None,
@@ -1045,6 +1064,14 @@ impl FleetCommandResult {
     }
 
     #[must_use]
+    pub fn decision_history(history: crate::decision_queue::DecisionHistory) -> Self {
+        Self {
+            decision_history: Some(Box::new(history)),
+            ..Self::accepted("decision history")
+        }
+    }
+
+    #[must_use]
     pub fn review_dispose(outcome: FleetReviewOutcome) -> Self {
         Self {
             review_dispose: Some(outcome),
@@ -1074,6 +1101,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture,
@@ -1103,6 +1131,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture,
@@ -1130,6 +1159,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1157,6 +1187,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1184,6 +1215,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1231,6 +1263,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1259,6 +1292,7 @@ impl FleetCommandResult {
         Self {
             decision_queue: None,
             review_dispose: None,
+            decision_history: None,
             accepted: true,
             message: None,
             capture: None,

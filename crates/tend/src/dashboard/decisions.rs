@@ -56,7 +56,10 @@
 //! A remote question is answered over Fleet only on a control-mode host,
 //! and only after reading the request back from that host and checking it
 //! is addressed to the operator console: a Fleet reply to anything else
-//! would be sent as the agent in that pane. The history covers this host.
+//! would be sent as the agent in that pane. The history is per host too:
+//! a relay that answers `fleet_decision_history_v1` sends its host's past
+//! decisions, read there as its operator console; an older or offline host
+//! is listed with what kept it out.
 //!
 //! A remote review decision names its host; the host's relay checks the
 //! option against its own copy of the item, records the person (`by`) and
@@ -273,20 +276,84 @@ pub(super) async fn queue_handler(
     Json(json!({ "hosts": hosts })).into_response()
 }
 
-/// `GET /api/decisions/history`: past decisions, newest first.
+/// `GET /api/decisions/history`: past decisions, newest first, per host
+/// like the queue. A Fleet host whose relay answers
+/// `fleet_decision_history_v1` sends its own history, read there as its
+/// operator console; any other host is listed with what kept it out.
 pub(super) async fn history_handler(
     State(state): State<AppState>,
     Query(query): Query<DecisionsQuery>,
 ) -> Response {
-    let history = crate::decision_queue::read_history(
-        &state.reviews,
-        &state.collaboration,
-        query.limit.unwrap_or(DEFAULT_LIMIT),
-        true,
-    )
-    .await;
-    let covers = local_alias(&fleet_hosts(&state).await);
-    Json(json!({ "covers": covers, "history": history })).into_response()
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    let history =
+        crate::decision_queue::read_history(&state.reviews, &state.collaboration, limit, true)
+            .await;
+    let fleet_hosts = fleet_hosts(&state).await;
+    let covers = local_alias(&fleet_hosts);
+    let mut hosts = vec![json!({
+        "alias": covers, "local": true, "unavailable": history.unavailable.clone(),
+        "history": history,
+    })];
+    if let Some(fleet) = &state.fleet {
+        let sections = futures::future::join_all(
+            fleet_hosts
+                .into_iter()
+                .filter(|host| !host.local)
+                .map(|host| remote_history(fleet, host, limit)),
+        )
+        .await;
+        hosts.extend(sections);
+    }
+    // `history` stays this host's, for a page from before per-host history.
+    Json(json!({ "covers": covers, "history": hosts[0]["history"].clone(), "hosts": hosts }))
+        .into_response()
+}
+
+/// One Fleet host's past decisions.
+async fn remote_history(
+    fleet: &crate::fleet::FleetRuntime,
+    host: crate::fleet::FleetHostSnapshot,
+    limit: usize,
+) -> serde_json::Value {
+    use crate::fleet::{FleetHostState, FleetOperation};
+    let empty = || crate::decision_queue::assemble_history(Vec::new(), &[], limit);
+    let section = |history: crate::decision_queue::DecisionHistory, unavailable: Vec<String>| json!({ "alias": host.alias, "local": false, "unavailable": unavailable, "history": history });
+    if !matches!(
+        host.state,
+        FleetHostState::Online | FleetHostState::Degraded
+    ) {
+        return section(
+            empty(),
+            vec![format!("host is {}", state_label(host.state))],
+        );
+    }
+    if !host
+        .capabilities
+        .iter()
+        .any(|c| c == crate::fleet::FLEET_DECISION_HISTORY_CAPABILITY)
+    {
+        return section(
+            empty(),
+            vec!["decision history: this host's tend does not send it; upgrade it".into()],
+        );
+    }
+    match fleet
+        .execute(
+            host.alias.clone(),
+            FleetOperation::DecisionHistory { limit },
+            FLEET_READ_TIMEOUT,
+        )
+        .await
+    {
+        Ok(result) => {
+            let history = result
+                .decision_history
+                .map_or_else(empty, |history| *history);
+            let unavailable = history.unavailable.clone();
+            section(history, unavailable)
+        }
+        Err(error) => section(empty(), vec![format!("decision history: {error}")]),
+    }
 }
 
 /// `GET /needs`: the phone-first page that renders the two reads above.

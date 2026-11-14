@@ -211,14 +211,9 @@ function actions(card) {
   return box;
 }
 
-function renderList(list, cards, empty) {
-  list.replaceChildren(...cards.map(renderCard));
-  if (!cards.length) list.replaceChildren(el("li", "card meta", empty));
-}
-
 /// One heading per host (only when there is more than one), what it
 /// covers and what could not be read, then its cards.
-function renderSections(list, sections) {
+function renderSections(list, sections, empty = "Nothing is waiting on you.") {
   const nodes = [];
   const several = sections.length > 1;
   for (const section of sections) {
@@ -232,15 +227,8 @@ function renderSections(list, sections) {
     nodes.push(...section.cards.map(renderCard));
   }
   const total = sections.reduce((sum, section) => sum + section.cards.length, 0);
-  if (!total) nodes.push(el("li", "card meta", "Nothing is waiting on you."));
+  if (!total) nodes.push(el("li", "card meta", empty));
   list.replaceChildren(...nodes);
-}
-
-function unavailableNote(unavailable, truncated) {
-  const notes = [];
-  if (truncated) notes.push("more than shown");
-  for (const source of unavailable || []) notes.push(`unavailable: ${source}`);
-  return notes.join(" · ");
 }
 
 /// Drop everything private on the page: after a lost session nothing an
@@ -303,10 +291,10 @@ async function refresh() {
     } else {
       const data = await read("/api/decisions/history");
       if (!current()) return;
-      const cards = (data.history?.items || []).map((item) => decidedCard(item)).filter(Boolean);
-      renderList($("history"), cards, "No decisions recorded yet.");
-      status.textContent = unavailableNote(data.history?.unavailable, data.history?.truncated);
-      $("covers").textContent = `Covers ${data.covers || "this host"}.`;
+      const sections = historySections(data);
+      renderSections($("history"), sections, "No decisions recorded yet.");
+      status.textContent = "";
+      $("covers").textContent = `Covers ${sections.map((s) => s.alias).join(", ")}.`;
     }
     $("login").hidden = true;
   } catch (error) {

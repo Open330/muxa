@@ -388,8 +388,11 @@ then holds; an answer about any other item is refused. Observe-only hosts'
 items, and review items on an older host, are shown but decided on their
 own host. Only this route sends that Fleet operation: `fleet_command` over
 IPC and `POST /api/fleet/{host}/command` refuse it, so nothing else can name
-a person as having decided. The **Decided** tab
-covers this host.
+a person as having decided. The **Decided** tab is
+per host too: a Fleet host whose tend answers the Fleet `decision_history`
+read (`fleet_decision_history_v1`) sends its past decisions, read there as
+its operator console; an older or offline host is listed with what kept it
+out.
 
 Each card can be decided from the page, through the same daemon paths as
 the Mac app:

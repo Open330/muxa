@@ -3556,6 +3556,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_decision_history_covers_fleet_hosts() {
+        use crate::fleet::{FleetCommandResult, FleetHostState, FLEET_DECISION_HISTORY_CAPABILITY};
+        let store = Arc::new(crate::fleet::FleetStore::new());
+        let mut here = fleet_host("here", "dev");
+        here.local = true;
+        let mut mini = fleet_host("mini", "dev");
+        mini.capabilities = vec![FLEET_DECISION_HISTORY_CAPABILITY.to_owned()];
+        let old = fleet_host("old", "dev");
+        let mut off = fleet_host("off", "dev");
+        off.state = FleetHostState::Offline;
+        off.capabilities = vec![FLEET_DECISION_HISTORY_CAPABILITY.to_owned()];
+        for host in [here, mini, old, off] {
+            store.upsert_host(host).await;
+        }
+        let (runtime, mut commands) = FleetRuntime::new(store);
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let result = match command.operation {
+                    FleetOperation::DecisionHistory { limit } => {
+                        assert_eq!(command.host, "mini", "only a host that sends it is asked");
+                        let mut history =
+                            crate::decision_queue::assemble_history(Vec::new(), &[], limit);
+                        history.truncated = true;
+                        Ok(FleetCommandResult::decision_history(history))
+                    }
+                    other => Err(format!("unexpected {other:?}")),
+                };
+                let _ = command.reply.send(result);
+            }
+        });
+        let app = router(state_with_token("s3cret").with_fleet(Some(runtime)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/decisions/history")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let hosts = body["hosts"].as_array().unwrap();
+        let names: Vec<&str> = hosts.iter().map(|h| h["alias"].as_str().unwrap()).collect();
+        assert_eq!(names, ["here", "mini", "off", "old"]);
+        assert_eq!(hosts[0]["local"], true);
+        assert_eq!(
+            body["history"], hosts[0]["history"],
+            "the older field stays this host's"
+        );
+        assert_eq!(hosts[1]["history"]["truncated"], true);
+        assert_eq!(hosts[2]["unavailable"], json!(["host is offline"]));
+        assert!(hosts[3]["unavailable"][0]
+            .as_str()
+            .unwrap()
+            .contains("upgrade"));
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // one fake Fleet covers every outcome and the audit
     async fn remote_review_items_are_decided_on_their_host_through_the_audited_path() {
         use crate::fleet::{

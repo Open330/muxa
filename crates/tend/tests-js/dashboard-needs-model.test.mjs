@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ago, checksOf, decidedCard, draftKey, evidenceLine, hostSections, pendingCard, safeHref, linkedItemOf, needsReturnPath } from "../src/dashboard/web/needs-model.mjs";
+import { ago, checksOf, decidedCard, draftKey, historySections, evidenceLine, hostSections, pendingCard, safeHref, linkedItemOf, needsReturnPath } from "../src/dashboard/web/needs-model.mjs";
 
 const now = Date.parse("2026-11-12T12:00:00Z");
 
@@ -227,4 +227,26 @@ test("a decided result keeps its checks in the history", () => {
     disposition: { kind: "accepted", at: "2026-11-12T11:30:00Z", by: { kind: "person" } },
   }, now);
   assert.equal(card.checks.headline, "tend ran 1/1 check passed · 1h ago");
+});
+
+test("the history is per host, and says what kept a host out", () => {
+  const answered = { kind: "human_answer", request_id: "rq_1", body: "Merge?", status: "completed", answer: "yes", answered_at: "2026-11-12T11:00:00Z" };
+  const sections = historySections({
+    hosts: [
+      { alias: "mba", local: true, history: { items: [answered] } },
+      { alias: "mini", local: false, history: { items: [answered], truncated: true } },
+      { alias: "old", local: false, unavailable: ["decision history: this host's tend does not send it; upgrade it"], history: { items: [] } },
+    ],
+  }, now);
+  assert.deepEqual(sections.map((s) => s.alias), ["mba", "mini", "old"]);
+  assert.equal(sections[0].cards[0].remote, false);
+  assert.equal(sections[1].cards[0].host, "mini");
+  assert.equal(sections[1].cards[0].remote, true);
+  assert.equal(sections[1].cards[0].actionable, false, "nothing in the history is acted on");
+  assert.deepEqual(sections[1].notes, ["more than shown"]);
+  assert.match(sections[2].notes[0], /upgrade/);
+  // An older single-history response is one local section.
+  const old = historySections({ covers: "here", history: { items: [answered] } }, now);
+  assert.equal(old.length, 1);
+  assert.equal(old[0].alias, "here");
 });
