@@ -3562,16 +3562,21 @@ mod tests {
             FleetCommandResult, FleetReviewDispose, FleetReviewOutcome, HostAccessMode,
             FLEET_DECISION_QUEUE_CAPABILITY, FLEET_REVIEW_DISPOSE_CAPABILITY,
         };
-        let item = |id: &str| -> Box<crate::review::ReviewItem> {
-            Box::new(
-                serde_json::from_value(json!({
-                    "id": id, "target": {"kind": "session", "provider": "claude", "session_id": "s"},
-                    "generation": 1, "summary": "done", "requested_at": "2026-11-14T00:00:00Z",
-                    "requested_by": {"kind": "agent", "label": "impl"},
-                }))
-                .unwrap(),
-            )
+        // An item holding `kind` with `note` decided by `label`; open
+        // without a kind.
+        let decided = |id: &str, kind: Option<&str>, note: Option<&str>, label: &str| {
+            let mut value = json!({
+                "id": id, "target": {"kind": "session", "provider": "claude", "session_id": "s"},
+                "generation": 1, "summary": "done", "requested_at": "2026-11-14T00:00:00Z",
+                "requested_by": {"kind": "agent", "label": "impl"},
+            });
+            if let Some(kind) = kind {
+                value["disposition"] = json!({"kind": kind, "at": "2026-11-14T00:01:00Z",
+                    "note": note, "by": {"kind": "user", "label": label}});
+            }
+            Box::new(serde_json::from_value::<crate::review::ReviewItem>(value).unwrap())
         };
+        let item = move |id: &str| decided(id, Some("accepted"), None, "web:token");
         let store = Arc::new(crate::fleet::FleetStore::new());
         let mut here = fleet_host("here", "dev");
         here.local = true;
@@ -3612,12 +3617,46 @@ mod tests {
                         Ok(FleetCommandResult::review_dispose(
                             match dispose.id.as_str() {
                                 "rv_ok" => FleetReviewOutcome::Recorded {
-                                    item: item("rv_ok"),
+                                    item: decided(
+                                        "rv_ok",
+                                        Some("accepted"),
+                                        Some("chose: ship\nlooks fine"),
+                                        "web:token",
+                                    ),
                                     replay: false,
                                 },
+                                // Decided the same way earlier by someone else.
                                 "rv_again" => FleetReviewOutcome::Recorded {
-                                    item: item("rv_again"),
+                                    item: decided("rv_again", Some("accepted"), None, "web:alice"),
                                     replay: true,
+                                },
+                                // The right id, without this decision.
+                                "rv_open" => FleetReviewOutcome::Recorded {
+                                    item: decided("rv_open", None, None, ""),
+                                    replay: false,
+                                },
+                                "rv_kind" => FleetReviewOutcome::Recorded {
+                                    item: decided("rv_kind", Some("returned"), None, "web:token"),
+                                    replay: false,
+                                },
+                                "rv_note" => FleetReviewOutcome::Recorded {
+                                    item: decided(
+                                        "rv_note",
+                                        Some("accepted"),
+                                        Some("other"),
+                                        "web:token",
+                                    ),
+                                    replay: false,
+                                },
+                                // A new recording in someone else's name.
+                                "rv_actor" => FleetReviewOutcome::Recorded {
+                                    item: decided(
+                                        "rv_actor",
+                                        Some("accepted"),
+                                        None,
+                                        "web:mallory",
+                                    ),
+                                    replay: false,
                                 },
                                 // A host answering about another item.
                                 "rv_swap" => FleetReviewOutcome::Recorded {
@@ -3742,11 +3781,15 @@ mod tests {
             decide("ctl", "rv_again", json!({})).await.status(),
             StatusCode::OK
         );
-        // An answer about another item is not taken as this decision.
-        assert_eq!(
-            decide("ctl", "rv_swap", json!({})).await.status(),
-            StatusCode::BAD_GATEWAY
-        );
+        // An answer about another item, or one that does not hold this
+        // decision as this person's, is not taken as this decision.
+        for id in ["rv_swap", "rv_open", "rv_kind", "rv_note", "rv_actor"] {
+            assert_eq!(
+                decide("ctl", id, json!({})).await.status(),
+                StatusCode::BAD_GATEWAY,
+                "{id}"
+            );
+        }
         assert_eq!(
             decide("ctl", "rv_done", json!({})).await.status(),
             StatusCode::CONFLICT
@@ -3778,7 +3821,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(outcomes.len(), 9, "{outcomes:?}");
+        assert_eq!(outcomes.len(), 13, "{outcomes:?}");
         assert_eq!(outcomes[3], ("ctl".into(), "recorded".into(), 200));
         assert_eq!(outcomes[4], ("ctl".into(), "already recorded".into(), 200));
         assert_eq!(outcomes[5].2, 502);
@@ -3795,7 +3838,7 @@ mod tests {
         )
         .await;
         assert_eq!(raw.status(), StatusCode::FORBIDDEN);
-        assert_eq!(sent.lock().unwrap().len(), 6);
+        assert_eq!(sent.lock().unwrap().len(), 10);
     }
 
     #[tokio::test]

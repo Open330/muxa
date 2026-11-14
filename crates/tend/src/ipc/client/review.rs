@@ -221,9 +221,15 @@ impl Client {
             )));
         }
         Ok(if after.decided_as(request.disposition, note.as_deref()) {
+            // The same decision by someone else won the race: a replay of
+            // theirs, not a new one in this person's name.
+            let replay = after
+                .disposition
+                .as_ref()
+                .is_some_and(|existing| existing.by != by);
             Outcome::Recorded {
                 item: Box::new(after),
-                replay: false,
+                replay,
             }
         } else {
             Outcome::Conflict {

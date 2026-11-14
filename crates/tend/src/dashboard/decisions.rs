@@ -540,16 +540,33 @@ async fn review_remote(
             format!("{alias} answered for review {} instead of {id}", item.id),
             None,
         ),
-        Some(FleetReviewOutcome::Recorded { item, replay }) => (
-            StatusCode::OK,
-            if replay {
-                "already recorded"
+        // Nor an item that does not hold this decision, or a new
+        // recording made in someone else's name.
+        Some(FleetReviewOutcome::Recorded { item, replay }) => {
+            let note =
+                crate::review::decision_note(decision.option.as_deref(), decision.note.as_deref());
+            let ours = item.disposition.as_ref().is_some_and(|d| {
+                d.by.kind == crate::review::ActorKind::User && d.by.label.as_deref() == Some(by)
+            });
+            if !item.decided_as(decision.disposition, note.as_deref()) || (!replay && !ours) {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("{alias} reported review {id} without this decision"),
+                    None,
+                )
             } else {
-                "recorded"
+                (
+                    StatusCode::OK,
+                    if replay {
+                        "already recorded"
+                    } else {
+                        "recorded"
+                    }
+                    .into(),
+                    Some(item),
+                )
             }
-            .into(),
-            Some(item),
-        ),
+        }
         Some(FleetReviewOutcome::NotFound { message }) => (StatusCode::NOT_FOUND, message, None),
         Some(FleetReviewOutcome::Conflict { message }) => (StatusCode::CONFLICT, message, None),
         Some(FleetReviewOutcome::Invalid { message }) => (StatusCode::BAD_REQUEST, message, None),
