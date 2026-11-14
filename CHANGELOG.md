@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows: worktree set-aside and delete no longer refuse every worktree
+  with "could not list processes"; process directories come from the OS
+  process table instead of `lsof`. Listening servers are listed on Windows
+  too, from `Get-NetTCPConnection`.
+
 - An agent launched on a named tmux server (MCP `tend_start_agent`, and
   now tendd) looks up its new pane on that server only. A pane with the
   same `%N` on another server could be registered in its place.
