@@ -15,7 +15,8 @@
 //!
 //! The answer has the child's shape: exit code 0 or 1, the `--json` document
 //! as stdout (also when a restore stops early, which printed its report
-//! anyway), and `Error: {error:?}` on stderr, as the CLI's `main` printed it.
+//! anyway), and `Error: ` plus the error chain on stderr, as the CLI's `main`
+//! printed it (`work_up_in_process::printed`, which leaves out a backtrace).
 //! An argv that does not parse, or one without `--json`, declines and runs
 //! the child. `TEND_SNAPSHOT_CHILD=1` forces the child.
 
@@ -109,7 +110,7 @@ fn answer(result: anyhow::Result<()>, document: Option<serde_json::Value>) -> Wo
         Err(error) => WorkCommandOutput {
             exit_code: 1,
             stdout,
-            stderr: format!("Error: {error:?}\n"),
+            stderr: format!("Error: {}\n", crate::work_up_in_process::printed(&error)),
         },
     }
 }

@@ -82,8 +82,8 @@ async fn run(
                 let result = tend_work::work_up::run_noninteractive(args, &config, &client).await;
                 // As the CLI did after every `work up`, success or not.
                 let _ = client.invalidate_agent_directory().await;
-                let result = result
-                    .map_err(|error| WorkUpError::Failed(last_line(&format!("{error:?}"))))?;
+                let result =
+                    result.map_err(|error| WorkUpError::Failed(last_line(&printed(&error))))?;
                 serde_json::to_value(result).map_err(WorkUpError::InvalidJson)
             })
         })
@@ -103,6 +103,31 @@ pub(crate) fn cli_config_path(
     env.filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or(default)
+}
+
+/// An error as the CLI's `main` printed it (`Error: {error:?}` without the
+/// prefix): the message, then `Caused by:` and the chain. Unlike `{:?}`, it
+/// never carries a backtrace. A backtrace appears when `RUST_BACKTRACE` is set
+/// in tendd's environment, and its last line would then be a stack frame
+/// instead of the error.
+pub(crate) fn printed(error: &anyhow::Error) -> String {
+    use std::fmt::Write as _;
+    let mut text = error.to_string();
+    let causes: Vec<String> = error.chain().skip(1).map(ToString::to_string).collect();
+    if !causes.is_empty() {
+        text.push_str("\n\nCaused by:");
+        let numbered = causes.len() > 1;
+        for (index, cause) in causes.iter().enumerate() {
+            text.push('\n');
+            if numbered {
+                let _ = write!(text, "{index: >5}: ");
+            } else {
+                text.push_str("    ");
+            }
+            text.push_str(&cause.replace('\n', "\n      "));
+        }
+    }
+    text
 }
 
 /// The child's error was the last line of its stderr, where `tend` printed
@@ -129,6 +154,20 @@ mod tests {
         );
         assert_eq!(cli_config_path(Some("".into()), default.clone()), default);
         assert_eq!(cli_config_path(None, default.clone()), default);
+    }
+
+    #[test]
+    fn an_error_prints_as_anyhow_debug_without_a_backtrace() {
+        let one = anyhow::anyhow!("bad cwd").context("no route");
+        assert_eq!(printed(&one), "no route\n\nCaused by:\n    bad cwd");
+        let two = anyhow::anyhow!("gone")
+            .context("bad cwd")
+            .context("no route");
+        assert_eq!(
+            printed(&two),
+            "no route\n\nCaused by:\n    0: bad cwd\n    1: gone"
+        );
+        assert_eq!(printed(&anyhow::anyhow!("plain")), "plain");
     }
 
     #[test]
