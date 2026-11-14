@@ -23,6 +23,8 @@
 #   TEND_SKIP_NOTARIZE=1 Sign but do not notarize (a local smoke test).
 #   TEND_VERSION         Version to package. Defaults to the workspace
 #                        version in Cargo.toml.
+#   TEND_BUILD_LOG       Where the app build's output goes (default: a temp
+#                        file). CI sets it so the log survives a failure.
 #
 # Output: dist/Tend-<version>.dmg
 
@@ -36,6 +38,63 @@ BUILT_APP="$APP_DIR/.build/DerivedData/Build/Products/Release/Tend.app"
 
 log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Run a command that talks to something outside this machine (Apple's
+# notary, timestamp and ticket services) or that is known to wedge on CI
+# runners (hdiutil), and give up after SECS. A release that hangs holds the
+# whole release as a draft for hours (v0.10.16 sat four hours in this step
+# with nothing in its log); one that fails says where and can be rerun.
+# Returns 124 on a timeout, like timeout(1), which macOS does not ship.
+#
+# The command runs in a process group of its own (job control on for the
+# spawn only), so a timeout stops everything it started, not just its
+# first process: TERM to the group, then KILL to whatever is left of it
+# 10 seconds later, even once the first process has exited. The command
+# gets no stdin; none of the tools run this way reads it.
+bounded() {
+    local secs=$1 label=$2 marker rc=0 pid dog
+    shift 2
+    marker=$(mktemp -t tend-bounded)
+    rm -f "$marker"
+    set -m
+    "$@" &
+    pid=$!
+    set +m
+    # The watchdog waits on a background sleep, so stopping it (the command
+    # finished first) ends it at once, without reporting a timeout.
+    (
+        nap=
+        trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; exit 0' TERM
+        sleep "$secs" &
+        nap=$!
+        wait "$nap" || exit 0
+        kill -0 "$pid" 2>/dev/null || exit 0
+        : >"$marker"
+        printf '\033[31merror:\033[0m %s took longer than %ss; stopping it\n' "$label" "$secs" >&2
+        kill -TERM -- "-$pid" 2>/dev/null || exit 0
+        sleep 10 &
+        nap=$!
+        wait "$nap" || exit 0
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    ) &
+    dog=$!
+    wait "$pid" || rc=$?
+    kill "$dog" 2>/dev/null || true
+    wait "$dog" 2>/dev/null || true
+    if [ -e "$marker" ]; then
+        rm -f "$marker"
+        # The first process is gone; give the rest of its group the same
+        # grace, then kill what remains.
+        local waited=0
+        while kill -0 -- "-$pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -KILL -- "-$pid" 2>/dev/null || true
+        return 124
+    fi
+    return "$rc"
+}
 
 # ---------------------------------------------------------------- build
 
@@ -53,9 +112,33 @@ VERSION="${VERSION#v}"
 log "Version $VERSION"
 
 log "Building Tend.app (Release)"
-BUILD_LOG="$(mktemp -t tend-build)"
-if ! CONFIGURATION=Release TEND_MARKETING_VERSION="$VERSION" \
-    "$SCRIPT_DIR/build-app.sh" >"$BUILD_LOG" 2>&1; then
+BUILD_LOG="${TEND_BUILD_LOG:-$(mktemp -t tend-build)}"
+: >"$BUILD_LOG"
+# The build is quiet and takes most of an hour on a cold runner. Say once a
+# minute what it is doing, so a build that stops moving shows where.
+(
+    started=$SECONDS
+    nap=
+    # Stopped with TERM: take the sleep down too, or it keeps this step's
+    # output open for up to a minute after the build ends.
+    trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; exit 0' TERM
+    while :; do
+        sleep 60 &
+        nap=$!
+        wait "$nap" || exit 0
+        printf '    ... %dm: %s\n' $(((SECONDS - started) / 60)) \
+            "$(tail -n 1 "$BUILD_LOG" 2>/dev/null | cut -c1-160)"
+    done
+) &
+HEARTBEAT=$!
+trap 'kill "$HEARTBEAT" 2>/dev/null || true' EXIT
+build_status=0
+CONFIGURATION=Release TEND_MARKETING_VERSION="$VERSION" \
+    "$SCRIPT_DIR/build-app.sh" >"$BUILD_LOG" 2>&1 || build_status=$?
+kill "$HEARTBEAT" 2>/dev/null || true
+wait "$HEARTBEAT" 2>/dev/null || true
+trap - EXIT
+if [ "$build_status" -ne 0 ]; then
     # Quiet on success, but a failed build must show why.
     grep -E 'error:|warning: .*(unavailable|deprecated)|BUILD FAILED' "$BUILD_LOG" | sort -u | head -80 >&2 || true
     tail -40 "$BUILD_LOG" >&2
@@ -81,8 +164,10 @@ if [ -n "${TEND_SIGN_IDENTITY:-}" ]; then
     # Inside out: every nested executable first, the bundle last. The
     # helpers are what tend actually runs — an unsigned tendd fails
     # notarization and, worse, would be refused at launch on a clean Mac.
+    # --timestamp asks Apple's timestamp server, so each call is bounded.
     while IFS= read -r nested; do
-        codesign --force --options runtime --timestamp \
+        bounded 300 "signing $(basename "$nested")" \
+            codesign --force --options runtime --timestamp \
             --sign "$TEND_SIGN_IDENTITY" "$nested"
     done < <(
         find "$APP/Contents" \
@@ -91,11 +176,13 @@ if [ -n "${TEND_SIGN_IDENTITY:-}" ]; then
     )
     # Frameworks and bundles, if the app ever grows any.
     while IFS= read -r bundle; do
-        codesign --force --options runtime --timestamp \
+        bounded 300 "signing $(basename "$bundle")" \
+            codesign --force --options runtime --timestamp \
             --sign "$TEND_SIGN_IDENTITY" "$bundle"
     done < <(find "$APP/Contents" -name "*.framework" -o -name "*.bundle" 2>/dev/null || true)
 
-    codesign --force --options runtime --timestamp \
+    bounded 300 "signing Tend.app" \
+        codesign --force --options runtime --timestamp \
         --sign "$TEND_SIGN_IDENTITY" "$APP"
 
     log "Verifying the signature"
@@ -113,17 +200,28 @@ rm -f "$DMG"
 
 ln -sf /Applications "$STAGE/Applications"
 
+# hdiutil on hosted macOS runners now and then fails with "Resource busy"
+# or never returns; it takes seconds when it works, so bound it and retry.
 build_dmg() {
+    local attempt
     log "Building $(basename "$DMG")"
-    rm -f "$DMG"
-    hdiutil create \
-        -volname "Tend $VERSION" \
-        -srcfolder "$STAGE" \
-        -ov -format UDZO \
-        -quiet \
-        "$DMG"
+    for attempt in 1 2 3; do
+        rm -f "$DMG"
+        if bounded 600 "hdiutil create" hdiutil create \
+            -volname "Tend $VERSION" \
+            -srcfolder "$STAGE" \
+            -ov -format UDZO \
+            -quiet \
+            "$DMG"; then
+            break
+        fi
+        [ "$attempt" -lt 3 ] || fail "hdiutil could not build $(basename "$DMG")"
+        log "hdiutil failed (attempt $attempt); retrying"
+        sleep $((attempt * 10))
+    done
     if [ -n "${TEND_SIGN_IDENTITY:-}" ]; then
-        codesign --force --timestamp --sign "$TEND_SIGN_IDENTITY" "$DMG"
+        bounded 300 "signing $(basename "$DMG")" \
+            codesign --force --timestamp --sign "$TEND_SIGN_IDENTITY" "$DMG"
     fi
 }
 
@@ -144,7 +242,9 @@ notarize() {
     fi
     [ -n "${TEND_TEAM_ID:-}" ] && args+=(--team-id "$TEND_TEAM_ID")
     log "Submitting for notarization; this waits for Apple"
-    xcrun "${args[@]}"
+    # notarytool's --timeout covers waiting for the verdict, not the upload
+    # or a stalled connection; this covers the whole call.
+    bounded 2400 "notarization" xcrun "${args[@]}"
 }
 
 # Stapling fetches the ticket from Apple's CloudKit endpoint, which drops
@@ -154,8 +254,8 @@ notarize() {
 staple() {
     local attempt
     for attempt in 1 2 3 4 5; do
-        if xcrun stapler staple "$1"; then
-            xcrun stapler validate "$1"
+        if bounded 300 "stapling" xcrun stapler staple "$1"; then
+            bounded 300 "validating the ticket" xcrun stapler validate "$1"
             return 0
         fi
         [ "$attempt" -lt 5 ] || break
@@ -191,8 +291,10 @@ if [ -n "${TEND_SIGN_IDENTITY:-}" ] && [ "${TEND_SKIP_NOTARIZE:-}" != "1" ]; the
         staple "$DMG"
         log "Gatekeeper assessment"
         # The real test: what a stranger's Mac decides about these files.
-        spctl -a -vvv -t install "$DMG" || fail "Gatekeeper refused the DMG"
-        spctl -a -vvv -t exec "$APP" || fail "Gatekeeper refused Tend.app"
+        bounded 300 "Gatekeeper on the DMG" spctl -a -vvv -t install "$DMG" \
+            || fail "Gatekeeper refused the DMG"
+        bounded 300 "Gatekeeper on Tend.app" spctl -a -vvv -t exec "$APP" \
+            || fail "Gatekeeper refused Tend.app"
     fi
 fi
 

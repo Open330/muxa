@@ -166,6 +166,10 @@ jobs:
     needs: [create-release]
     if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.create-release.result == 'success') }}
     runs-on: macos-26
+    # Releases took 25-70 minutes. v0.10.16 sat four hours in the build step
+    # with nothing in its log and held the release as a draft until someone
+    # cancelled it; a hang must fail the job instead.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
 
@@ -244,7 +248,12 @@ jobs:
           keychain="$RUNNER_TEMP/tend-signing.keychain-db"
           password="$(openssl rand -base64 24)"
           security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 3600 "$keychain"
+          # No auto-lock. It used to lock after an hour, and the app build
+          # alone takes 40-50 minutes on a cold runner; a slower one reached
+          # codesign with the keychain locked, and codesign then waits for a
+          # password prompt no one can answer. The keychain is deleted at the
+          # end of the job.
+          security set-keychain-settings "$keychain"
           security unlock-keychain -p "$password" "$keychain"
           printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
@@ -283,8 +292,12 @@ jobs:
           echo "enabled=true" >> "$GITHUB_OUTPUT"
           echo "path=$key" >> "$GITHUB_OUTPUT"
 
+      # package-dmg.sh bounds each call to Apple (signing timestamps,
+      # notarization, stapling) and hdiutil itself; this is the backstop.
       - name: Build, sign, notarize and package
+        timeout-minutes: 130
         env:
+          TEND_BUILD_LOG: ${{ runner.temp }}/tend-app-build.log
           TEND_VERSION: ${{ steps.ref.outputs.version }}
           TEND_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
           TEND_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
@@ -293,6 +306,15 @@ jobs:
           NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: apps/tend-macos/Scripts/package-dmg.sh
+
+      - name: Upload the build log
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tend-app-build-log
+          path: ${{ runner.temp }}/tend-app-build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Checksum
         id: dmg
