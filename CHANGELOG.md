@@ -77,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `docs/ACCOUNT_SWAP.md` now says where `[swap] relaunch = "respawn"`
+  applies: the daemon's automation and `tend swap --local`. A `tend swap`
+  daemon job still types into a pane that has its shell. It also says that
+  a respawn drops variables exported in the pane's shell, and why `type`
+  stays the default, with the measurements behind it.
+
 - Windows: worktree set-aside and delete no longer refuse every worktree
   with "could not list processes"; process directories come from the OS
   process table instead of `lsof`. Listening servers are listed on Windows
