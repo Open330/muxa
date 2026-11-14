@@ -48,6 +48,32 @@ final class FleetDecisionFeed: ObservableObject {
 
     static let refreshEvery: Duration = .seconds(5)
 
+    /// Other Fleet hosts' queues, for their review items; read at most every
+    /// `remoteEvery` seconds, kept between reads.
+    @Published private(set) var remoteQueues: [(host: TendFleetHostIdentity, queue: TendPendingQueue)] = []
+    var lastRemoteLoad = Date.distantPast
+    static let remoteEvery: TimeInterval = 15
+
+    /// Reads the review items of every Fleet host this app can decide them
+    /// on (`FleetDecisions.decidesReviews`), when tendd takes such a
+    /// decision from the app at all.
+    func loadRemote(_ client: TendIPCClient, hosts: [TendFleetHost], force: Bool = false) async {
+        guard await client.supports(tendRemoteReviewCapability) else {
+            if !remoteQueues.isEmpty { remoteQueues = [] }
+            return
+        }
+        guard force || Date().timeIntervalSince(lastRemoteLoad) >= Self.remoteEvery else { return }
+        lastRemoteLoad = Date()
+        var queues: [(host: TendFleetHostIdentity, queue: TendPendingQueue)] = []
+        for host in hosts where FleetDecisions.decidesReviews(host) {
+            // A host that cannot be read now keeps nothing on screen to act on.
+            if let queue = try? await client.remoteDecisionQueue(host: host.identity) {
+                queues.append((host.identity, queue))
+            }
+        }
+        remoteQueues = queues
+    }
+
     func load(_ client: TendIPCClient, works: [FleetWork] = []) async {
         guard !loading else { return }
         loading = true
@@ -203,6 +229,7 @@ final class FleetDecisionFeed: ObservableObject {
     func decisions(_ model: AppModel) -> [FleetDecision] {
         guard let local = model.fleetHosts.first(where: \.local)?.identity else { return [] }
         let merged = FleetDecisions.merge(queue: queue, reviews: reviews, messages: model.operatorMessages, localHost: local)
+            + FleetDecisions.remoteReviews(remoteQueues)
         return FleetDecisions.attachAskers(merged, agents: model.hostedAgents)
     }
 
@@ -245,9 +272,19 @@ final class FleetDecisionFeed: ObservableObject {
         }
     }
 
-    /// Accepts, returns or withdraws a review item on this Mac's daemon.
+    /// Accepts, returns or withdraws a review item: on this Mac's daemon, or
+    /// through it on the Fleet host that holds the item.
     func decide(_ decision: FleetDecision, _ disposition: TendReviewDisposition, note: String?, model: AppModel) async -> Bool {
         guard case .review(let item) = decision.source else { return false }
+        if !decision.host.local {
+            let decided = await record(decision, model: model) {
+                try await model.client.decideRemoteReview(
+                    host: decision.host.alias, id: item.id, disposition: disposition, note: note
+                )
+            }
+            await loadRemote(model.client, hosts: model.fleetHosts, force: true)
+            return decided
+        }
         return await record(decision, model: model) {
             try await model.client.decideReview(id: item.id, disposition: disposition, note: note)
         }

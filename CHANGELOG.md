@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Mac app's Home lists open review items on other Fleet hosts and can
+  accept, send back or withdraw them, through the same checks as the web
+  "Needs you" page (`review_dispose_remote_v1`). tendd takes this request
+  only from the signed Tend app. It checks the code that connected, by the
+  socket's audit token, against the app's code-signing requirement, so an
+  agent cannot use the request to accept its own result. Every attempt is
+  in the decision audit as `app:mac`.
+
 - Results on other Fleet hosts can be accepted, sent back or withdrawn from
   the controller's "Needs you" page. The decision goes to the host that holds
   the item (a new Fleet operation, `fleet_review_dispose_v1`, control-mode

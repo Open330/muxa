@@ -113,6 +113,7 @@ struct FleetHomeView: View {
             // leave the queue while Home stays open.
             while !Task.isCancelled {
                 await decisionFeed.load(model.client, works: allWorks)
+                await decisionFeed.loadRemote(model.client, hosts: model.fleetHosts)
                 try? await Task.sleep(for: FleetDecisionFeed.refreshEvery)
             }
         }

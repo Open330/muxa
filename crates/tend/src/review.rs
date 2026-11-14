@@ -20,6 +20,9 @@ use time::OffsetDateTime;
 pub const REVIEW_CAPABILITY: &str = "review_items_v1";
 /// The daemon records a claim and its disposition together
 /// ([`ReviewStore::record`]).
+/// `review_dispose_remote`: the Mac app decides a review item on another
+/// Fleet host through tendd (see [`crate::app_identity`]).
+pub const REVIEW_DISPOSE_REMOTE_CAPABILITY: &str = "review_dispose_remote_v1";
 pub const REVIEW_RECORD_CAPABILITY: &str = "review_record_v1";
 
 const SCHEMA_VERSION: i64 = 1;

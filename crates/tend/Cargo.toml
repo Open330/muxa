@@ -66,7 +66,15 @@ sysinfo = { version = "0.37.2", default-features = false, features = ["system"] 
 # `kill(pid, 0)` answering ESRCH is the authoritative "this pid is gone" on
 # macOS, which has no `/proc`. Without it a worker whose pane closed can never
 # be proven exited, so its launch holds room capacity forever.
-nix = { version = "0.29", features = ["signal"] }
+nix = { version = "0.30", features = ["signal", "socket"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Which program is on the other end of the daemon socket: the peer's audit
+# token (`LOCAL_PEERTOKEN`, through nix above) checked against the Tend app's
+# code-signing requirement. Decisions that only the person may take from the
+# Mac app (`app_identity`) rest on it; both crates keep `unsafe` out of tend.
+security-framework = { version = "3", default-features = false }
+core-foundation = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

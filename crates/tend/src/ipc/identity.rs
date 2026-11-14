@@ -110,6 +110,9 @@ pub(super) struct CollaborationConnectionActor {
     pub(super) caller_uid: Option<u32>,
     pub(super) caller_gid: Option<u32>,
     pub(super) executable: Option<String>,
+    /// The peer's audit token at connect time (macOS), for
+    /// [`crate::app_identity`].
+    pub(super) audit_token: Option<[u32; 8]>,
     pub(super) observed_pane: Option<String>,
     pub(super) pane_evidence: Option<CollaborationPaneEvidence>,
     pub(super) pane_observed: bool,
@@ -182,6 +185,7 @@ pub(super) fn observe_collaboration_actor(stream: &Stream) -> CollaborationConne
         caller_uid,
         caller_gid,
         executable,
+        audit_token: peer.audit_token,
         observed_pane: None,
         pane_evidence: None,
         pane_observed: false,

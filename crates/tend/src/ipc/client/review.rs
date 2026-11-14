@@ -247,3 +247,34 @@ impl Client {
         })
     }
 }
+
+impl Client {
+    /// Decide a review item on the Fleet host `host`
+    /// (`review_dispose_remote_v1`). tendd takes it only from the signed
+    /// Tend Mac app; from any other caller this is refused.
+    pub async fn review_dispose_remote(
+        &self,
+        host: &str,
+        id: &str,
+        disposition: DispositionKind,
+        option: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<ReviewItem, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "review_dispose_remote",
+            "host": host,
+            "id": id,
+            "disposition": disposition,
+            "option": option,
+            "note": note,
+        });
+        let response = self
+            .call_with_timeout(&req, Duration::from_secs(30))
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(super::response_error(&response));
+        }
+        field(&response, "review_item")
+    }
+}

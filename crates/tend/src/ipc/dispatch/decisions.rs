@@ -60,6 +60,10 @@ pub(super) async fn handle(
                 }
             }
         }
+        body @ RequestBody::ReviewDisposeRemote { .. } => {
+            *kind = "review_dispose_remote";
+            Box::pin(review_dispose_remote(ctx, conn, body)).await
+        }
         body @ (RequestBody::ReviewGet { .. }
         | RequestBody::ReviewList { .. }
         | RequestBody::ReviewSummary
@@ -148,6 +152,112 @@ async fn verify_result(
             Ok(Some(crate::work_verify::Verification::new(outcomes)))
         }
         crate::work_verify::Gate::Failed(outcomes) => Err(crate::work_verify::refusal(&outcomes)),
+    }
+}
+
+/// A review decision on another Fleet host, as the Mac app asked for it.
+struct RemoteDecision {
+    host: String,
+    id: String,
+    disposition: crate::review::DispositionKind,
+    option: Option<String>,
+    note: Option<String>,
+}
+
+/// The actor label a decision taken in the Mac app is recorded under.
+const APP_ACTOR: &str = "app:mac";
+
+/// Decide a review item on another Fleet host for the person at the Mac app.
+/// The caller must be the signed Tend app, as macOS reports the process
+/// that connected ([`crate::app_identity`]); a caller tendd observes in an
+/// agent's pane is refused before that. Then the same checks as the
+/// dashboard ([`crate::fleet_review::decide`]), and one audit line either way.
+async fn review_dispose_remote(ctx: &ServerCtx, conn: &mut Conn, body: RequestBody) -> Response {
+    let RequestBody::ReviewDisposeRemote {
+        host,
+        id,
+        disposition,
+        option,
+        note,
+    } = body
+    else {
+        return Response::err("not a remote review decision");
+    };
+    let decision = RemoteDecision {
+        host,
+        id,
+        disposition,
+        option,
+        note,
+    };
+    let token = conn.collaboration_actor.audit_token;
+    let in_agent_pane = caller_is_agent(ctx, conn).await;
+    let is_app = !in_agent_pane
+        && tokio::task::spawn_blocking(move || crate::app_identity::is_tend_app(token))
+            .await
+            .unwrap_or(false);
+    let (outcome, response) = if is_app {
+        remote_outcome(ctx, &decision).await
+    } else {
+        let message = "only the Tend app can decide a result on another host: use the dashboard's Needs you page, or decide it on that host";
+        (
+            "refused: not the Tend app".to_owned(),
+            Response::err(message),
+        )
+    };
+    crate::fleet_review::audit(
+        ctx.decision_audit.as_ref(),
+        serde_json::json!({
+            "at": crate::fleet_review::now(), "by": APP_ACTOR, "via": "app",
+            "caller_pid": conn.collaboration_actor.caller_pid,
+            "action": "review", "host": decision.host, "id": decision.id,
+            "disposition": decision.disposition, "option": decision.option,
+            "outcome": outcome,
+        }),
+    )
+    .await;
+    response
+}
+
+async fn remote_outcome(ctx: &ServerCtx, decision: &RemoteDecision) -> (String, Response) {
+    const MAX_NOTE_BYTES: usize = 1024;
+    let Some(fleet) = &ctx.fleet else {
+        return (
+            "refused: no Fleet".into(),
+            Response::err("fleet is not enabled in tendd"),
+        );
+    };
+    let note = crate::review::decision_note(decision.option.as_deref(), decision.note.as_deref());
+    if note
+        .as_ref()
+        .is_some_and(|note| note.len() > MAX_NOTE_BYTES)
+    {
+        let message = format!("note exceeds {MAX_NOTE_BYTES} bytes");
+        return (format!("invalid: {message}"), Response::err(message));
+    }
+    let hosts = fleet.store.snapshot_selected(None).await.hosts;
+    match crate::fleet_review::decide(
+        fleet,
+        &hosts,
+        &decision.host,
+        &decision.id,
+        decision.disposition,
+        decision.option.as_deref(),
+        decision.note.as_deref(),
+        APP_ACTOR,
+    )
+    .await
+    {
+        Ok((item, replay)) => (
+            if replay {
+                "already recorded"
+            } else {
+                "recorded"
+            }
+            .into(),
+            Response::with_review_item(*item),
+        ),
+        Err((refusal, message)) => (format!("{refusal:?}: {message}"), Response::err(message)),
     }
 }
 

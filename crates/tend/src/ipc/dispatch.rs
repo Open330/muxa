@@ -39,6 +39,7 @@ pub(super) struct ServerCtx {
     pub(super) work_up: Arc<WorkUpManager>,
     pub(super) mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     pub(super) config_path: Option<PathBuf>,
+    pub(super) decision_audit: Option<PathBuf>,
     pub(super) swap: Option<Arc<dyn crate::swap_api::SwapJobs>>,
 }
 
@@ -286,6 +287,7 @@ async fn route(
         | RequestBody::ReviewList { .. }
         | RequestBody::ReviewSummary
         | RequestBody::ReviewDispose { .. }
+        | RequestBody::ReviewDisposeRemote { .. }
         | RequestBody::ReviewRecord { .. }
         | RequestBody::DecisionQueue { .. }
         | RequestBody::DecisionHistory { .. }) => {

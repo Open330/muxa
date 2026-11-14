@@ -388,7 +388,20 @@ then holds; an answer about any other item is refused. Observe-only hosts'
 items, and review items on an older host, are shown but decided on their
 own host. Only this route sends that Fleet operation: `fleet_command` over
 IPC and `POST /api/fleet/{host}/command` refuse it, so nothing else can name
-a person as having decided. The **Decided** tab
+a person as having decided.
+
+The Mac app's Home lists those hosts' open review items too and decides
+them through tendd with `review_dispose_remote` (`review_dispose_remote_v1`),
+the same checks as the web route, recorded as `app:mac` in the same audit
+file. tendd takes that request only from the signed Tend app: it reads the
+caller's audit token from the socket (`LOCAL_PEERTOKEN`, recorded at
+connect time) and checks the running code against the app's designated
+requirement (Developer ID, team `728FW73BS8`, `dev.tend.mac`). An agent
+cannot meet it by naming a program `Tend`, copying or re-signing the bundle,
+or connecting and then `exec`ing the app; a caller observed in an agent's
+pane is refused before the check. A development build of the app is
+refused too. What it does not stop is the real app driven through its own
+interface, which macOS allows only with the person's Accessibility grant. The **Decided** tab
 covers this host.
 
 Each card can be decided from the page, through the same daemon paths as

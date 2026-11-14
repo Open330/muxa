@@ -432,6 +432,7 @@ async fn client_disconnect_before_response_is_clean_handler_exit() {
             "/tmp/tend-disconnect-test.sock",
         )),
         config_path: None,
+        decision_audit: None,
         swap: None,
     };
     let handle = tokio::spawn(handle(server_stream, ctx, stopping_rx));
@@ -2929,6 +2930,91 @@ async fn a_fleet_review_decision_is_applied_exactly_or_reported_as_it_stands() {
         client.review_dispose_exactly(&missing).await.unwrap(),
         Outcome::NotFound { .. }
     ));
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn only_the_tend_app_may_decide_a_result_on_another_host() {
+    use crate::fleet::{FleetHostSnapshot, HostAccessMode, FLEET_REVIEW_DISPOSE_CAPABILITY};
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("tend-remote-review.sock");
+    let audit = dir.path().join("decisions.jsonl");
+    let fleet_store = Arc::new(crate::fleet::FleetStore::new());
+    fleet_store
+        .upsert_host(FleetHostSnapshot {
+            alias: "mini".into(),
+            local: false,
+            ssh_target: "mini".into(),
+            labels: std::collections::BTreeMap::new(),
+            annotations: std::collections::BTreeMap::new(),
+            mode: HostAccessMode::Control,
+            state: crate::fleet::FleetHostState::Online,
+            node_id: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            tend_version: None,
+            protocol: None,
+            capabilities: vec![FLEET_REVIEW_DISPOSE_CAPABILITY.into()],
+            daemon_generation: None,
+            boot_id: None,
+            latency_ms: None,
+            last_seen_at: None,
+            received_at: None,
+            error: None,
+            remote: None,
+        })
+        .await;
+    let (fleet, mut commands) = FleetRuntime::new(fleet_store);
+    let server = Server::new(sock.clone(), Store::shared())
+        .with_fleet(fleet)
+        .with_decision_audit(Some(audit.clone()));
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+    assert!(client
+        .hello(Duration::from_secs(3))
+        .await
+        .unwrap()
+        .capabilities
+        .iter()
+        .any(|c| c == crate::review::REVIEW_DISPOSE_REMOTE_CAPABILITY));
+
+    // This test binary is not the signed app: refused, and nothing reaches
+    // the host.
+    let refused = client
+        .review_dispose_remote(
+            "mini",
+            "rv_1",
+            crate::review::DispositionKind::Accepted,
+            None,
+            None,
+        )
+        .await
+        .expect_err("only the Tend app may");
+    assert!(
+        refused.to_string().contains("only the Tend app"),
+        "{refused}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), commands.recv())
+            .await
+            .is_err(),
+        "nothing was sent over Fleet"
+    );
+    let line: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&audit)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(line["outcome"], "refused: not the Tend app");
+    assert_eq!(line["host"], "mini");
+    assert_eq!(line["by"], "app:mac");
     tx.send(()).unwrap();
     handle.await.unwrap();
 }

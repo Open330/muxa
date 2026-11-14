@@ -48,6 +48,11 @@ pub struct PeerIdentity {
     pub pid: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    /// macOS: the peer's audit token as the kernel recorded it at connect
+    /// time (`LOCAL_PEERTOKEN`). Unlike the pid it also names the process
+    /// image, so a caller that connects and then `exec`s another program
+    /// does not inherit that program's identity. `None` elsewhere.
+    pub audit_token: Option<[u32; 8]>,
 }
 
 /// Restrict an already-bound endpoint to its owner.
@@ -224,8 +229,22 @@ mod imp {
                 pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
                 uid: Some(cred.uid()),
                 gid: Some(cred.gid()),
+                audit_token: peer_audit_token(&self.0),
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn peer_audit_token(stream: &tokio::net::UnixStream) -> Option<[u32; 8]> {
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
+            .ok()
+            .map(|token| token.val)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::unnecessary_wraps)] // the macOS reader can fail
+    fn peer_audit_token(_stream: &tokio::net::UnixStream) -> Option<[u32; 8]> {
+        None
     }
 
     pub(super) fn harden(endpoint: &Path) -> io::Result<()> {

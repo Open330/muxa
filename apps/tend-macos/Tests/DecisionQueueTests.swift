@@ -380,4 +380,38 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
         #expect(review.verification == nil)
         #expect(FleetDecision(review: review, host: local).verification == nil)
     }
+
+    @Test func anotherHostsReviewItemsAreKeyedByThatHost() throws {
+        let json = """
+        {"items":[
+          {"kind":"review","id":"rv_1","target":{"kind":"session","provider":"claude","session_id":"s"},
+           "generation":1,"summary":"Check it","requested_by":{"kind":"agent","label":"impl"}},
+          {"kind":"human_request","request_id":"req_9","body":"?","from_session_id":"s","from_pane":"%1",
+           "created_at":"2026-11-12T01:00:00Z"}
+        ]}
+        """
+        let queue = try JSONDecoder().decode(TendPendingQueue.self, from: Data(json.utf8))
+        let decisions = FleetDecisions.remoteReviews([(remote, queue)])
+        // Only the review item: that host's questions come from its mailbox.
+        #expect(decisions.map(\.id) == ["review:mini:rv_1"])
+        #expect(decisions[0].host == remote)
+        // The same id here is another item.
+        let here = FleetDecisions.remoteReviews([(local, queue)])
+        #expect(here.map(\.id) == ["review:rv_1"])
+    }
+
+    @Test func onlyAControlHostThatTakesDecisionsIsAsked() throws {
+        func host(_ mode: String, _ capabilities: [String]?, state: String = "online", local: Bool = false) throws -> TendFleetHost {
+            var object: [String: Any] = ["alias": "h", "local": local, "mode": mode, "state": state]
+            if let capabilities { object["capabilities"] = capabilities }
+            return try JSONDecoder().decode(TendFleetHost.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        let both = ["fleet_decision_queue_v1", "fleet_review_dispose_v1"]
+        #expect(FleetDecisions.decidesReviews(try host("control", both)))
+        #expect(!FleetDecisions.decidesReviews(try host("observe", both)))
+        #expect(!FleetDecisions.decidesReviews(try host("control", ["fleet_decision_queue_v1"])))
+        #expect(!FleetDecisions.decidesReviews(try host("control", nil)))
+        #expect(!FleetDecisions.decidesReviews(try host("control", both, state: "offline")))
+        #expect(!FleetDecisions.decidesReviews(try host("control", both, local: true)))
+    }
 }

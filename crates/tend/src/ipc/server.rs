@@ -29,6 +29,9 @@ pub struct Server {
     /// The daemon's `config.toml`, for the requests that read and replace it
     /// whole. `None` when tendd was started without one.
     pub(super) config_path: Option<PathBuf>,
+    /// Where a person's decisions taken over this socket are audited, the
+    /// same file as the dashboard's (`fleet_review::audit`).
+    pub(super) decision_audit: Option<PathBuf>,
     /// Daemon-owned swap jobs; `None` when the daemon could not take its
     /// job store, in which case every swap request is refused.
     pub(super) swap: Option<Arc<dyn crate::swap_api::SwapJobs>>,
@@ -57,6 +60,7 @@ impl Server {
             work_up: self.work_up.clone(),
             mux_snapshots: self.mux_snapshots.clone(),
             config_path: self.config_path.clone(),
+            decision_audit: self.decision_audit.clone(),
             swap: self.swap.clone(),
         }
     }
@@ -89,6 +93,7 @@ impl Server {
             work_up,
             mux_snapshots,
             config_path: None,
+            decision_audit: None,
             swap: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
             endpoint_check: ENDPOINT_CHECK_INTERVAL,
@@ -125,6 +130,13 @@ impl Server {
     #[must_use]
     pub fn with_swap(mut self, swap: Option<Arc<dyn crate::swap_api::SwapJobs>>) -> Self {
         self.swap = swap;
+        self
+    }
+
+    /// Where decisions taken over this socket are audited.
+    #[must_use]
+    pub fn with_decision_audit(mut self, path: Option<PathBuf>) -> Self {
+        self.decision_audit = path;
         self
     }
 

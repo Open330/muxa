@@ -109,6 +109,20 @@ pub(super) enum RequestBody {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Decide a review item that lives on the Fleet host `host`, as the
+    /// person at the Mac app (`review_dispose_remote_v1`). Only a caller
+    /// macOS proves to be the signed Tend app may: tendd checks the
+    /// connection's audit token against [`crate::app_identity`], so an
+    /// agent cannot use it to accept its own result.
+    ReviewDisposeRemote {
+        host: String,
+        id: String,
+        disposition: crate::review::DispositionKind,
+        #[serde(default)]
+        option: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Record a claim and its disposition together (`review_record_v1`):
     /// `review.requested_by` both asks and decides. Needs an idempotency key.
     ReviewRecord {
@@ -1060,6 +1074,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     collaboration::USER_AUTHORIZED_DELIVERY_CAPABILITY,
     "pipeline_runs_v1",
     crate::review::REVIEW_CAPABILITY,
+    crate::review::REVIEW_DISPOSE_REMOTE_CAPABILITY,
     "turn_evidence_v1",
     crate::review::REVIEW_RECORD_CAPABILITY,
     crate::decision::REVIEW_DECISION_CAPABILITY,

@@ -402,7 +402,8 @@ struct FleetDecision: Identifiable, Hashable, Sendable {
     var id: String {
         switch source {
         case .humanRequest(let requestID): "human:\(host.alias):\(requestID)"
-        case .review(let item): "review:\(item.id)"
+        // Review ids are per host: another host's item is keyed by it too.
+        case .review(let item): host.local ? "review:\(item.id)" : "review:\(host.alias):\(item.id)"
         }
     }
 
@@ -479,7 +480,29 @@ struct FleetDecision: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Daemons that take a review decision for another Fleet host from this app.
+let tendRemoteReviewCapability = "review_dispose_remote_v1"
+
 enum FleetDecisions {
+    /// Fleet hosts whose review items this app can decide through tendd:
+    /// connected, control mode, and a relay that sends its queue and applies
+    /// a decision exactly.
+    static func decidesReviews(_ host: TendFleetHost) -> Bool {
+        let capabilities = host.capabilities ?? []
+        return !host.local && host.mode == "control" && (host.state == "online" || host.state == "degraded")
+            && capabilities.contains("fleet_decision_queue_v1") && capabilities.contains("fleet_review_dispose_v1")
+    }
+
+    /// Other hosts' open review items, in each host's queue order.
+    static func remoteReviews(_ queues: [(host: TendFleetHostIdentity, queue: TendPendingQueue)]) -> [FleetDecision] {
+        queues.flatMap { entry in
+            entry.queue.items.compactMap { item -> FleetDecision? in
+                guard case .review(let review) = item, review.disposition == nil else { return nil }
+                return FleetDecision(review: review, host: entry.host)
+            }
+        }
+    }
+
     /// The queue Home shows. With the daemon's queue: its human requests and
     /// review items in its order (waiting agents are already Work cards),
     /// then the console mailbox's human requests it does not hold: other

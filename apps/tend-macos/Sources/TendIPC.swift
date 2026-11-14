@@ -722,6 +722,8 @@ struct TendFleetHost: Decodable, Hashable, Identifiable, Sendable {
     let labels: [String: String]?
     let annotations: [String: String]?
     let remote: TendRemoteSnapshot?
+    /// What the host's relay says it serves (`fleet_review_dispose_v1`, …).
+    var capabilities: [String]? = nil
 
     var nodeID: String? = nil
 
@@ -731,7 +733,7 @@ struct TendFleetHost: Decodable, Hashable, Identifiable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case alias, local, mode, state, error, labels, annotations, remote
+        case alias, local, mode, state, error, labels, annotations, remote, capabilities
         case nodeID = "node_id"
         case sshTarget = "ssh_target"
         case latencyMS = "latency_ms"
@@ -959,9 +961,12 @@ struct TendFleetCommandResult: Decodable, Sendable {
     let worktreesNode: String?
     let worktreeChanges: [TendWorktreeChangeOutcome]?
     let servers: TendServerInventory?
+    /// A Fleet host's decision queue (`fleet_decision_queue_v1`).
+    var decisionQueue: TendLenient<TendPendingQueue>? = nil
 
     enum CodingKeys: String, CodingKey {
         case accepted, message, capture, worktrees, servers
+        case decisionQueue = "decision_queue"
         case worktreesTotal = "worktrees_total"
         case worktreesNode = "worktrees_node"
         case worktreeChanges = "worktree_changes"
@@ -1572,6 +1577,27 @@ actor TendIPCClient {
     }
 
     /// Accept, return or withdraw a review item, as the person.
+    /// A Fleet host's decision queue, read there as its operator console
+    /// (`fleet_decision_queue_v1`).
+    func remoteDecisionQueue(host: TendFleetHostIdentity) async throws -> TendPendingQueue? {
+        try await fleetCommand(host: host, operation: ["kind": "decision_queue", "limit": 200], timeout: 8).decisionQueue?.value
+    }
+
+    /// Accepts, returns or withdraws a review item that lives on the Fleet
+    /// host `host` (`review_dispose_remote_v1`). tendd takes it only from
+    /// this signed app, checked by macOS code signing, never from an agent.
+    func decideRemoteReview(host: String, id: String, disposition: TendReviewDisposition, note: String?) async throws {
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "review_dispose_remote",
+            "host": host,
+            "id": id,
+            "disposition": disposition.rawValue,
+        ]
+        if let note, !note.isEmpty { request["note"] = note }
+        _ = try await call(request, timeout: 30)
+    }
+
     func decideReview(id: String, disposition: TendReviewDisposition, note: String?) async throws {
         var request: [String: Any] = [
             "protocol": Self.protocolVersion,
