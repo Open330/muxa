@@ -24,15 +24,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tend::mux_snapshot_control::InProcessSnapshot;
+use tend::mux_snapshot_control::{InProcessSnapshot, SnapshotProgress};
 use tend::work_control::WorkCommandOutput;
 use tend_work::reload::SnapshotRequest;
 
 pub(crate) fn install() {
-    let run: InProcessSnapshot =
-        Arc::new(|args: Vec<String>, socket: PathBuf, budget: Duration| {
-            Box::pin(async move { run(&args, socket, budget).await })
-        });
+    let run: InProcessSnapshot = Arc::new(
+        |args: Vec<String>,
+         socket: PathBuf,
+         budget: Duration,
+         progress: Option<SnapshotProgress>| {
+            Box::pin(async move { run(&args, socket, budget, progress).await })
+        },
+    );
     tend::mux_snapshot_control::install_in_process_snapshot(run);
 }
 
@@ -45,8 +49,13 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn run(args: &[String], socket: PathBuf, budget: Duration) -> Option<WorkCommandOutput> {
-    let request = match SnapshotRequest::parse(args) {
+async fn run(
+    args: &[String],
+    socket: PathBuf,
+    budget: Duration,
+    progress: Option<SnapshotProgress>,
+) -> Option<WorkCommandOutput> {
+    let mut request = match SnapshotRequest::parse(args) {
         Ok(request) if request.json() => request,
         Ok(_) => return None,
         Err(error) => {
@@ -54,6 +63,13 @@ async fn run(args: &[String], socket: PathBuf, budget: Duration) -> Option<WorkC
             return None;
         }
     };
+    if let Some(progress) = progress {
+        request = request.with_progress(tend_work::reload::ProgressSink(Arc::new(
+            move |now: &tend_work::reload::RestoreProgress| {
+                progress(serde_json::to_value(now).unwrap_or_default(), now.line());
+            },
+        )));
+    }
     let restore = matches!(request, SnapshotRequest::Restore(_));
     let cancel = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancel.clone());

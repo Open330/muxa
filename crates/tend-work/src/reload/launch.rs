@@ -123,6 +123,7 @@ impl LaunchWatch {
         }
     }
 
+    #[cfg(test)]
     pub fn pending(&self) -> impl Iterator<Item = &String> {
         self.pending.iter()
     }
@@ -152,6 +153,7 @@ impl LaunchWatch {
     }
 
     /// The panes that never showed their program.
+    #[cfg(test)]
     pub fn unconfirmed(self) -> BTreeSet<String> {
         self.pending
     }
@@ -367,6 +369,7 @@ impl TrustWatch {
         }
     }
 
+    #[cfg(test)]
     pub fn pending(&self) -> impl Iterator<Item = &String> {
         self.pending.keys()
     }

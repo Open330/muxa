@@ -260,6 +260,7 @@
 [snapshot]
 # auto_interval_minutes = 15         # 0 turns automatic snapshots off
 # keep_auto             = 10
+# restore_jobs          = 8          # panes a restore launches at once (default: CPU cores, at most 8)
 
 # tmux session foreground-time tracker. A session counts as active while an
 # interactive tmux client has that session foregrounded. `tend watch`

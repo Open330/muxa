@@ -61,6 +61,22 @@ pub(super) enum PaneResult {
     Failed,
 }
 
+/// Where a restored pane ended up, in the three words a person needs:
+/// back, held at a startup dialog, or not back. Beside `result`, which keeps
+/// its finer values for older readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PaneOutcome {
+    /// Its program is running (or it was only to be a shell, and is).
+    Restored,
+    /// Its agent started but stopped on a startup dialog or a screen tend
+    /// does not recognize; nothing more was typed. `error` says which.
+    WaitingDialog,
+    /// Not brought back: the restore could not, or a person has to (`error`
+    /// says why).
+    Failed,
+}
+
 /// Whether something the snapshot recorded is on the server right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +141,11 @@ pub(super) struct PanePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<PaneResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<PaneOutcome>,
+    /// How long this pane took, from its turn starting to its result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// `=session:window.pane`, the key the report records failures under.
     #[serde(skip)]
@@ -160,6 +181,8 @@ pub(super) struct Totals {
     pub shell: usize,
     pub manual: usize,
     pub failed: usize,
+    /// Of `manual`: agents held at a startup dialog.
+    pub waiting_dialog: usize,
 }
 
 /// The whole `tend restore --json` document: the plan, and with `--run` the
@@ -185,6 +208,12 @@ pub(super) struct RestoreDocument {
     pub new_sessions: Option<Vec<LiveSession>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totals: Option<Totals>,
+    /// With `--run`: milliseconds spent building the layout (`shape`),
+    /// restoring tend's marks (`marks`), bringing the panes back (`panes`)
+    /// and in all (`total`), and how many panes were worked on at once
+    /// (`jobs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<BTreeMap<&'static str, u64>>,
 }
 
 /// The server's shape right now, for comparing a snapshot against it:
@@ -364,6 +393,53 @@ pub(super) struct RestoreReport {
     pub panes_left: BTreeMap<String, String>,
     /// Panes whose command was sent but never seen running, with a note.
     pub panes_unconfirmed: BTreeMap<String, String>,
+    /// Of `panes_left`: agents held at a startup dialog, with what it shows.
+    pub panes_waiting: BTreeMap<String, String>,
+    /// Seconds each pane took to reach its result.
+    pub pane_seconds: BTreeMap<String, f64>,
+    /// See [`RestoreDocument::timings`].
+    pub timings: BTreeMap<&'static str, u64>,
+    /// Told after every pane, so a caller can show the restore moving.
+    pub progress: Option<ProgressSink>,
+}
+
+/// How far a running restore has got.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RestoreProgress {
+    /// `shape`, `marks` or `panes`.
+    pub phase: &'static str,
+    /// Panes with a result, of `panes`.
+    pub done: usize,
+    pub panes: usize,
+    pub restored: usize,
+    pub waiting_dialog: usize,
+    pub failed: usize,
+}
+
+impl RestoreProgress {
+    /// One line for a person: `12/49 panes: 10 restored, 1 waiting on a
+    /// startup dialog, 1 failed`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self.phase {
+            "shape" => format!("restoring {} pane(s): building the layout", self.panes),
+            "marks" => format!("restoring {} pane(s): restoring tend's marks", self.panes),
+            _ => format!(
+                "{}/{} panes: {} restored, {} waiting on a startup dialog, {} failed",
+                self.done, self.panes, self.restored, self.waiting_dialog, self.failed
+            ),
+        }
+    }
+}
+
+/// Where [`RestoreProgress`] goes.
+#[derive(Clone)]
+pub struct ProgressSink(pub std::sync::Arc<dyn Fn(&RestoreProgress) + Send + Sync>);
+
+impl std::fmt::Debug for ProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProgressSink")
+    }
 }
 
 impl RestoreReport {
@@ -390,6 +466,33 @@ impl RestoreReport {
 
     pub fn pane_left(&mut self, target: String, note: String) {
         self.panes_left.entry(target).or_insert(note);
+    }
+
+    /// An agent held at a startup dialog: left for a person, and counted as
+    /// waiting rather than failed.
+    pub fn pane_waiting_dialog(&mut self, target: String, note: String) {
+        self.panes_waiting.insert(target.clone(), note.clone());
+        self.pane_left(target, note);
+    }
+
+    /// Tell the progress sink, if any, where the restore is.
+    pub fn tell(&self, phase: &'static str, panes: usize) {
+        let Some(sink) = &self.progress else { return };
+        let failed = self.pane_failures.len()
+            + self.panes_unconfirmed.len()
+            + self
+                .panes_left
+                .len()
+                .saturating_sub(self.panes_waiting.len());
+        let done = self.pane_seconds.len();
+        (sink.0)(&RestoreProgress {
+            phase,
+            done,
+            panes,
+            restored: done.saturating_sub(failed + self.panes_waiting.len()),
+            waiting_dialog: self.panes_waiting.len(),
+            failed,
+        });
     }
 }
 
@@ -492,6 +595,8 @@ pub(super) fn plan(
                                     None
                                 },
                                 result: None,
+                                outcome: None,
+                                seconds: None,
                                 error: None,
                                 target: super::pane_target(pane),
                             }
@@ -565,28 +670,35 @@ pub(super) fn attach_results(sessions: &mut [SessionPlan], report: &RestoreRepor
             .iter_mut()
             .flat_map(|window| &mut window.panes)
         {
-            if let Some(error) = report.pane_failures.get(&pane.target) {
-                pane.result = Some(PaneResult::Failed);
-                pane.error = Some(error.clone());
-                continue;
-            }
-            if let Some(note) = report.panes_unconfirmed.get(&pane.target) {
-                pane.result = Some(PaneResult::Unconfirmed);
-                pane.error = Some(note.clone());
-                continue;
-            }
-            if let Some(note) = report.panes_left.get(&pane.target) {
-                pane.result = Some(PaneResult::Manual);
-                pane.error = Some(note.clone());
-                continue;
-            }
-            pane.result = Some(match pane.action {
-                PaneAction::Resume | PaneAction::Replay => PaneResult::Relaunched,
-                PaneAction::Shell => PaneResult::Shell,
-                PaneAction::Manual | PaneAction::ResumeByHand => PaneResult::Manual,
+            pane.seconds = report.pane_seconds.get(&pane.target).copied();
+            let (result, error) = pane_result(pane, report);
+            pane.outcome = Some(match result {
+                PaneResult::Relaunched | PaneResult::Shell => PaneOutcome::Restored,
+                _ if report.panes_waiting.contains_key(&pane.target) => PaneOutcome::WaitingDialog,
+                _ => PaneOutcome::Failed,
             });
+            pane.result = Some(result);
+            pane.error = error;
         }
     }
+}
+
+fn pane_result(pane: &PanePlan, report: &RestoreReport) -> (PaneResult, Option<String>) {
+    if let Some(error) = report.pane_failures.get(&pane.target) {
+        return (PaneResult::Failed, Some(error.clone()));
+    }
+    if let Some(note) = report.panes_unconfirmed.get(&pane.target) {
+        return (PaneResult::Unconfirmed, Some(note.clone()));
+    }
+    if let Some(note) = report.panes_left.get(&pane.target) {
+        return (PaneResult::Manual, Some(note.clone()));
+    }
+    let result = match pane.action {
+        PaneAction::Resume | PaneAction::Replay => PaneResult::Relaunched,
+        PaneAction::Shell => PaneResult::Shell,
+        PaneAction::Manual | PaneAction::ResumeByHand => PaneResult::Manual,
+    };
+    (result, None)
 }
 
 pub(super) fn totals(sessions: &[SessionPlan]) -> Totals {
@@ -603,6 +715,9 @@ pub(super) fn totals(sessions: &[SessionPlan]) -> Totals {
         for pane in session.windows.iter().flat_map(|window| &window.panes) {
             let Some(result) = pane.result else { continue };
             totals.panes += 1;
+            if pane.outcome == Some(PaneOutcome::WaitingDialog) {
+                totals.waiting_dialog += 1;
+            }
             match result {
                 PaneResult::Relaunched => totals.relaunched += 1,
                 PaneResult::Unconfirmed => totals.unconfirmed += 1,
@@ -880,6 +995,62 @@ mod tests {
     }
 
     #[test]
+    fn each_pane_gets_one_of_three_outcomes_and_progress_counts_them() {
+        let mut sessions = plan(&snapshot(), &BTreeSet::new(), true, false);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut report = RestoreReport::new(false);
+        let sink = seen.clone();
+        report.progress = Some(ProgressSink(std::sync::Arc::new(move |now| {
+            sink.lock().unwrap().push(now.clone());
+        })));
+        report
+            .reached
+            .extend(["work".to_owned(), "side".to_owned()]);
+        report.pane_seconds.insert("=work:0.0".into(), 2.5);
+        report.tell("panes", 3);
+        report.pane_waiting_dialog("=work:0.1".into(), "waiting on a startup dialog".into());
+        report.pane_seconds.insert("=work:0.1".into(), 20.0);
+        report.pane_failed("=side:0.0".into(), "can't find pane".into());
+        report.pane_seconds.insert("=side:0.0".into(), 0.1);
+        report.tell("panes", 3);
+        attach_results(&mut sessions, &report);
+        let outcomes: Vec<_> = sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.panes)
+            .map(|pane| (pane.target.as_str(), pane.outcome, pane.seconds))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                ("=work:0.0", Some(PaneOutcome::Restored), Some(2.5)),
+                ("=work:0.1", Some(PaneOutcome::WaitingDialog), Some(20.0)),
+                // A process title: left for a person, so not back.
+                ("=work:1.0", Some(PaneOutcome::Failed), None),
+                ("=side:0.0", Some(PaneOutcome::Failed), Some(0.1)),
+            ]
+        );
+        // Waiting is still `manual` (with the process title) for an older
+        // reader, and counted apart.
+        let counted = totals(&sessions);
+        assert_eq!(
+            (counted.manual, counted.waiting_dialog, counted.failed),
+            (2, 1, 1)
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen[0].done, seen[0].restored), (1, 1));
+        let last = seen.last().unwrap();
+        assert_eq!(
+            (last.done, last.restored, last.waiting_dialog, last.failed),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(
+            last.line(),
+            "3/3 panes: 1 restored, 1 waiting on a startup dialog, 1 failed"
+        );
+    }
+
+    #[test]
     fn an_aborted_restore_marks_the_rest_not_attempted() {
         let mut sessions = plan(&snapshot(), &BTreeSet::new(), true, false);
         let mut report = RestoreReport::new(false);
@@ -924,6 +1095,7 @@ mod tests {
             sessions: plan(&snapshot(), &live, true, false),
             new_sessions: None,
             totals: None,
+            timings: None,
         };
         let value = serde_json::to_value(&document).unwrap();
         assert_eq!(value["summary"]["origin"], "manual");
@@ -1094,6 +1266,7 @@ mod tests {
             sessions,
             new_sessions: Some(new_sessions),
             totals: None,
+            timings: None,
         };
         let value = serde_json::to_value(&document).unwrap();
         assert_eq!(value["sessions"][0]["windows"][1]["state"], "missing");

@@ -77,6 +77,21 @@ fn current() -> Option<Scope> {
     SCOPE.with(|slot| slot.borrow().clone())
 }
 
+/// The scope this thread runs under, for handing to a worker thread it
+/// starts: a scope is per thread, and work it farms out must stay inside it.
+#[must_use]
+pub fn current_scope() -> Option<Scope> {
+    current()
+}
+
+/// Run `operation` under `scope` if there is one, else as is.
+pub fn within<T>(scope: Option<Scope>, operation: impl FnOnce() -> T) -> T {
+    match scope {
+        Some(scope) => with_scope(scope, operation),
+        None => operation(),
+    }
+}
+
 /// Whether the thread's scope has run out of time or been cancelled. A
 /// failure then is the operation being abandoned, not the step failing: the
 /// `tend` child it replaces was killed at that point and reported nothing,

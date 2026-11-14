@@ -27,6 +27,7 @@ use crate::mux_control;
 
 mod agent;
 mod launch;
+mod panes;
 mod plan;
 #[cfg(not(target_os = "linux"))]
 mod process;
@@ -34,6 +35,7 @@ mod provider_home;
 mod store;
 
 use plan::RestoreReport;
+pub use plan::{ProgressSink, RestoreProgress};
 
 /// Bumped when a field stops being additive, so an old snapshot is rejected
 /// with a clear message instead of restoring a half-understood workspace.
@@ -137,6 +139,17 @@ pub struct RestoreArgs {
     /// already has sessions. Implies `--run`; no snapshot is not an error.
     #[arg(long, conflicts_with_all = ["only_missing", "json"])]
     boot: bool,
+
+    /// How many panes are brought back at once: each one waits for its shell,
+    /// starts its program and watches it come up while the others do the
+    /// same. Defaults to `[snapshot] restore_jobs`, else one per CPU core,
+    /// at most 8.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub jobs: Option<u16>,
+
+    /// Told after every pane; see [`SnapshotRequest::with_progress`].
+    #[arg(skip)]
+    progress: Option<ProgressSink>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -629,6 +642,16 @@ impl SnapshotRequest {
         }
     }
 
+    /// Have a restore tell `sink` how far it has got, after each phase and
+    /// each pane. A snapshot has nothing to tell.
+    #[must_use]
+    pub fn with_progress(mut self, sink: ProgressSink) -> Self {
+        if let Self::Restore(args) = &mut self {
+            args.progress = Some(sink);
+        }
+        self
+    }
+
     /// Run it as `tend` would, against the daemon at `daemon`. Synchronous
     /// mux work runs on the calling thread.
     pub async fn run(self, daemon: &Path) -> Result<()> {
@@ -640,13 +663,13 @@ impl SnapshotRequest {
 }
 
 /// `daemon` is the caller's tendd, which referees restored aliases.
-pub fn restore(daemon: &Path, args: RestoreArgs) -> Result<()> {
+pub fn restore(daemon: &Path, mut args: RestoreArgs) -> Result<()> {
     if args.boot {
         return restore_at_boot(daemon, args);
     }
-    let path = args.snapshot.map_or_else(newest_snapshot, Ok)?;
+    let path = args.snapshot.take().map_or_else(newest_snapshot, Ok)?;
     let snapshot = read_snapshot(&path)?;
-    let endpoint = match args.mux_socket {
+    let endpoint = match args.mux_socket.take() {
         Some(socket) => endpoint_for(&snapshot.host, socket)?,
         None => endpoint_for(&snapshot.host, snapshot.socket.clone())?,
     };
@@ -686,6 +709,7 @@ pub fn restore(daemon: &Path, args: RestoreArgs) -> Result<()> {
             sessions,
             new_sessions: new_sessions.clone(),
             totals,
+            timings: None,
         }
     };
     if !args.json {
@@ -723,26 +747,45 @@ pub fn restore(daemon: &Path, args: RestoreArgs) -> Result<()> {
             skipped.join(", ")
         );
     }
+    let (report, outcome) = run_apply(&endpoint, &target, daemon, &args);
+    if args.json {
+        plan::attach_results(&mut sessions, &report);
+        let totals = plan::totals(&sessions);
+        let mut document = document(sessions, Some(totals));
+        document.timings = Some(report.timings.clone());
+        print_json(&document)?;
+    }
+    outcome
+}
+
+/// Build `target` (the snapshot without what `--only-missing` skips) and
+/// bring its panes back, as `args` asks. The report, and how it ended.
+fn run_apply(
+    endpoint: &BackendEndpoint,
+    target: &Snapshot,
+    daemon: &Path,
+    args: &RestoreArgs,
+) -> (RestoreReport, Result<()>) {
     let mut report = RestoreReport::new(!args.json);
+    report.progress.clone_from(&args.progress);
+    let jobs = args.jobs.map_or_else(panes::default_jobs, usize::from);
     let outcome = if target.windows.is_empty() {
         report.say("nothing to restore: every session in the snapshot already exists");
         Ok(())
     } else {
         apply(
-            &endpoint,
-            &target,
+            endpoint,
+            target,
             daemon,
-            args.layout_only,
-            args.continue_text.as_deref(),
+            &Apply {
+                layout_only: args.layout_only,
+                follow_up: args.continue_text.as_deref(),
+                jobs,
+            },
             &mut report,
         )
     };
-    if args.json {
-        plan::attach_results(&mut sessions, &report);
-        let totals = plan::totals(&sessions);
-        print_json(&document(sessions, Some(totals)))?;
-    }
-    outcome
+    (report, outcome)
 }
 
 /// The session `restore --boot` holds a Windows rmux server open with until
@@ -923,8 +966,11 @@ pub async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) ->
         &endpoint,
         &snapshot,
         client.socket(),
-        args.layout_only,
-        follow_up,
+        &Apply {
+            layout_only: args.layout_only,
+            follow_up,
+            jobs: panes::default_jobs(),
+        },
         &mut RestoreReport::new(true),
     )?;
     println!(
@@ -1235,31 +1281,46 @@ fn agents_by_pane(agents: &[tend::Agent], socket: &str) -> HashMap<String, Agent
 }
 
 /// Rebuild the shape, then put back what the panes were running.
+/// How `apply` brings the panes back.
+struct Apply<'a> {
+    layout_only: bool,
+    /// `--continue`'s text.
+    follow_up: Option<&'a str>,
+    /// Panes worked on at once.
+    jobs: usize,
+}
+
 fn apply(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
     daemon: &Path,
-    layout_only: bool,
-    follow_up: Option<&str>,
+    how: &Apply<'_>,
     report: &mut RestoreReport,
 ) -> Result<()> {
     // A call that ran out of time or was dropped (tendd's scope) stops at
     // the next phase and fails, as the child it replaces was killed; the
     // report so far is still printed.
+    let started = Instant::now();
+    let panes = snapshot.panes.len();
+    let elapsed_ms =
+        |since: Instant| u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+    report.timings.insert("jobs", how.jobs as u64);
+    report.tell("shape", panes);
     let fresh = rebuild_shape(endpoint, snapshot, report)?;
+    report.timings.insert("shape", elapsed_ms(started));
     crate::subprocess::ensure_time_left()?;
     // Before any agent relaunches, so its first hook already finds the pane
     // it lands in marked with its role and Work.
-    restore_marks(endpoint, snapshot, &fresh, Some(daemon), report);
+    let marking = Instant::now();
+    report.tell("marks", panes);
+    restore_marks(endpoint, snapshot, &fresh, Some(daemon), how.jobs, report);
+    report.timings.insert("marks", elapsed_ms(marking));
     crate::subprocess::ensure_time_left()?;
-    if layout_only {
-        return Ok(());
-    }
-    let relaunched = replay_commands(endpoint, snapshot, report);
-    crate::subprocess::ensure_time_left()?;
-    if let Some(text) = follow_up {
-        continue_interrupted(endpoint, snapshot, &relaunched, text, report);
-    }
+    let relaunching = Instant::now();
+    report.tell("panes", panes);
+    panes::restore_panes(endpoint, snapshot, how, report);
+    report.timings.insert("panes", elapsed_ms(relaunching));
+    report.timings.insert("total", elapsed_ms(started));
     crate::subprocess::ensure_time_left()?;
     Ok(())
 }
@@ -1283,7 +1344,8 @@ fn restore_marks(
     snapshot: &Snapshot,
     fresh: &Fresh,
     daemon: Option<&Path>,
-    report: &mut RestoreReport,
+    jobs: usize,
+    report: &RestoreReport,
 ) {
     let listing = |args: &[&str]| -> Vec<(String, String)> {
         mux_control::capture(endpoint, args)
@@ -1313,13 +1375,15 @@ fn restore_marks(
             let _ = write(None, id, &session.marks, &SESSION_MARKS);
         }
     }
-    for window in &snapshot.windows {
+    // Each window and its panes are independent of the others: they are
+    // marked side by side.
+    panes::for_each_bounded(&snapshot.windows, jobs, |window| {
         let key = format!("{}:{}", window.session, window.index);
         let Some(session_id) = session_ids.get(&window.session) else {
-            continue;
+            return;
         };
         if !fresh.windows.contains(&key) {
-            continue;
+            return;
         }
         let saved = snapshot
             .sessions
@@ -1331,7 +1395,7 @@ fn restore_marks(
             report.say(&format!(
                 "  {key}: its session is not the workspace it was saved under; left unmarked"
             ));
-            continue;
+            return;
         }
         let window_ids: BTreeMap<String, String> = listing(&[
             "list-windows",
@@ -1343,7 +1407,7 @@ fn restore_marks(
         .into_iter()
         .collect();
         let Some(window_id) = window_ids.get(&window.index) else {
-            continue;
+            return;
         };
         // Panes are filed under their window: one that is not the saved
         // Work would get panes claiming a Work it is not.
@@ -1351,7 +1415,7 @@ fn restore_marks(
             report.say(&format!(
                 "  {key}: the window is not the Work it was saved as; left unmarked"
             ));
-            continue;
+            return;
         }
         let pane_ids: BTreeMap<String, String> = listing(&[
             "list-panes",
@@ -1371,7 +1435,7 @@ fn restore_marks(
                 restore_pane_marks(endpoint, pane, pane_id, daemon, report);
             }
         }
-    }
+    });
 }
 
 /// One rebuilt pane's role, task, alias and Work, under a window already
@@ -1381,7 +1445,7 @@ fn restore_pane_marks(
     pane: &PaneShape,
     pane_id: &str,
     daemon: Option<&Path>,
-    report: &mut RestoreReport,
+    report: &RestoreReport,
 ) {
     // Checked before reserving, so a pane that keeps its own marks does not
     // hold an alias it never receives.
@@ -1414,12 +1478,16 @@ fn write_marks(
     known: &[&str],
 ) -> bool {
     if !marks.is_empty() && !has_any_mark(endpoint, scope, id, known) {
-        for (option, value) in marks {
-            let mut args = vec!["set-option"];
-            args.extend(scope);
-            args.extend(["-t", id, option.as_str(), value.as_str()]);
-            let _ = mux_control::run(endpoint, &args);
-        }
+        let writes: Vec<Vec<String>> = marks
+            .iter()
+            .map(|(option, value)| {
+                let mut args = vec!["set-option"];
+                args.extend(scope);
+                args.extend(["-t", id, option.as_str(), value.as_str()]);
+                words(&args)
+            })
+            .collect();
+        let _ = mux_control::capture_each(endpoint, &writes);
     }
     own_marks(endpoint, scope, id, known).is_some_and(|now| carries_exactly(&now, known, marks))
 }
@@ -1456,13 +1524,22 @@ fn own_marks(
     id: &str,
     known: &[&str],
 ) -> Option<Vec<(String, String)>> {
+    // One round trip for all of them where the server allows it.
+    let reads: Vec<Vec<String>> = known
+        .iter()
+        .map(|option| {
+            let mut args = vec!["show-options", "-v", "-q"];
+            args.extend(scope);
+            args.extend(["-t", id, option]);
+            words(&args)
+        })
+        .collect();
     let mut marks = Vec::new();
-    for option in known {
-        let mut args = vec!["show-options", "-v", "-q"];
-        args.extend(scope);
-        args.extend(["-t", id, option]);
-        let out = mux_control::capture(endpoint, &args).ok()?;
-        if let Some(value) = shown_value(&out) {
+    for (option, out) in known
+        .iter()
+        .zip(mux_control::capture_each(endpoint, &reads))
+    {
+        if let Some(value) = shown_value(&out.ok()?) {
             marks.push(((*option).to_owned(), value.to_owned()));
         }
     }
@@ -1524,75 +1601,6 @@ fn reserve_alias(
         })
         .cloned()
         .collect()
-}
-
-/// The panes whose agent was mid-turn, among those that relaunched.
-fn interrupted_targets(snapshot: &Snapshot, relaunched: &BTreeSet<String>) -> Vec<String> {
-    snapshot
-        .panes
-        .iter()
-        // A conversation that did not come back has no turn to continue: a
-        // fresh agent told "continue" acts on nothing it knows.
-        .filter(|pane| {
-            pane.agent
-                .as_ref()
-                .is_some_and(|agent| agent.working && agent::resumable(&agent.session_id))
-        })
-        .map(pane_target)
-        .filter(|target| relaunched.contains(target))
-        .collect()
-}
-
-/// Tell every agent the reload cut off mid-turn to carry on, once its
-/// resumed screen has stopped redrawing.
-fn continue_interrupted(
-    endpoint: &BackendEndpoint,
-    snapshot: &Snapshot,
-    relaunched: &BTreeSet<String>,
-    text: &str,
-    report: &mut RestoreReport,
-) {
-    let targets = interrupted_targets(snapshot, relaunched);
-    if targets.is_empty() {
-        return;
-    }
-    let claude: BTreeSet<String> = snapshot
-        .panes
-        .iter()
-        .filter(|pane| {
-            pane.agent
-                .as_ref()
-                .is_some_and(|agent| agent.kind == "claude_code")
-        })
-        .map(pane_target)
-        .collect();
-    let mut continued = 0;
-    for target in targets {
-        if !screen_settled(endpoint, &target, claude.contains(&target)) {
-            report.say(&plan::manual_line(
-                &target,
-                "was mid-turn; resumed screen never settled, so nothing was sent",
-            ));
-            continue;
-        }
-        let sent = mux_control::run(endpoint, &["send-keys", "-t", &target, "-l", "--", text])
-            .and_then(|()| {
-                std::thread::sleep(CONTINUE_SUBMIT_GRACE);
-                mux_control::run(endpoint, &["send-keys", "-t", &target, "Enter"])
-            });
-        match sent {
-            Ok(()) => continued += 1,
-            Err(error) => report.say(&plan::manual_line(
-                &target,
-                &format!("was mid-turn; could not send {text:?}: {error}"),
-            )),
-        }
-    }
-    if continued > 0 {
-        report.say(&format!(
-            "sent {text:?} to {continued} agent(s) the reload interrupted mid-turn"
-        ));
-    }
 }
 
 /// Wait for a resumed agent's screen to hold still, so the follow-up lands in
@@ -1685,7 +1693,17 @@ fn rebuild_shape(
         if !fresh.contains(&format!("{}:{}", window.session, window.index)) {
             kept += have.min(wanted.len());
         }
-        for pane in wanted.iter().skip(have) {
+        let missing: Vec<&&PaneShape> = wanted.iter().skip(have).collect();
+        if split_at_once(endpoint, &target, &missing) {
+            continue;
+        }
+        // The batch stopped somewhere: count again, and split one by one
+        // only what is still missing, so nothing is split twice.
+        let Some(now) = pane_count(endpoint, &target) else {
+            report.say(&format!("  {target}: could not list its panes; left as is"));
+            continue;
+        };
+        for pane in wanted.iter().skip(now.max(1)) {
             // `split-window -d` keeps splitting the same pane, halving it
             // each time until there is no room left. Re-tiling first hands
             // the split an evenly sized pane; the recorded layout replaces
@@ -1701,44 +1719,30 @@ fn rebuild_shape(
         }
     }
 
-    // Geometry last, once every pane exists.
+    // Geometry last, once every pane exists, for every window in one go.
+    let mut geometry = Vec::new();
     for window in &snapshot.windows {
         let target = format!("={}:{}", window.session, window.index);
-        let _ = mux_control::run(endpoint, &["select-layout", "-t", &target, &window.layout]);
+        geometry.push(words(&["select-layout", "-t", &target, &window.layout]));
         // The recorded size was only needed to lay the panes out; hand the
         // window back to the attached client's size so it neither clips nor
         // leaves space unused on a different terminal.
         if fresh.contains(&format!("{}:{}", window.session, window.index)) {
-            let _ = mux_control::run(
-                endpoint,
-                &["set-option", "-w", "-u", "-t", &target, "window-size"],
-            );
-        }
-    }
-
-    // `select-layout` renumbers panes by geometry, which is not the order the
-    // splits above created them in, so directories are set per *final* index
-    // rather than inherited from `split-window -c`.
-    for pane in &snapshot.panes {
-        let target = pane_target(pane);
-        if !wait_for_shell(endpoint, &target) {
-            // Something is already running there; typing into it would be
-            // input to that program, not a directory change.
-            continue;
-        }
-        if let Err(error) = mux_control::run(
-            endpoint,
-            &[
-                "send-keys",
+            geometry.push(words(&[
+                "set-option",
+                "-w",
+                "-u",
                 "-t",
                 &target,
-                &tend::shell::Dialect::native().cd(&pane.path),
-                "Enter",
-            ],
-        ) {
-            report.pane_failed(target, error);
+                "window-size",
+            ]));
         }
     }
+    let _ = mux_control::capture_each(endpoint, &geometry);
+
+    // Directories are set per pane once the layout stands (`panes`):
+    // `select-layout` renumbers panes by geometry, which is not the order the
+    // splits above created them in.
 
     report.say(&plan::rebuilt_line(created, snapshot.panes.len(), kept));
     for (target, error) in split_failures {
@@ -1747,9 +1751,52 @@ fn rebuild_shape(
     Ok(built)
 }
 
-/// The `columns x rows` a window had, from its layout string
-/// (`b25d,238x61,0,0{…}`).
+/// Every split `window_target` lacks, re-tiling before each, in one round
+/// trip: `true` when they all went through. Only tmux runs a batch; it stops
+/// at a failing command, after which the caller recounts.
+fn split_at_once(endpoint: &BackendEndpoint, window_target: &str, missing: &[&&PaneShape]) -> bool {
+    if missing.is_empty() {
+        return true;
+    }
+    if endpoint.host != HostKind::Tmux || missing.iter().any(|pane| pane.path.ends_with(';')) {
+        return false;
+    }
+    let mut batch: Vec<&str> = Vec::new();
+    for pane in missing {
+        if !batch.is_empty() {
+            batch.push(";");
+        }
+        batch.extend([
+            "select-layout",
+            "-t",
+            window_target,
+            "tiled",
+            ";",
+            "split-window",
+            "-d",
+            "-t",
+            window_target,
+            "-c",
+            &pane.path,
+        ]);
+    }
+    mux_control::run(endpoint, &batch).is_ok()
+}
+
+fn words(args: &[&str]) -> Vec<String> {
+    args.iter().map(|&word| word.to_owned()).collect()
+}
+
+/// The `columns x rows` a window had, from its layout string: tmux's
+/// `b25d,238x61,0,0{…}`, or the JSON form newer tmux records
+/// (`{"V":2,"L":{"t":"h","w":134,"h":60,…}}`).
 fn layout_size(layout: &str) -> Option<(u32, u32)> {
+    if layout.trim_start().starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(layout).ok()?;
+        let root = value.get("L")?;
+        let read = |key: &str| root.get(key)?.as_u64().and_then(|n| u32::try_from(n).ok());
+        return Some((read("w")?, read("h")?));
+    }
     let size = layout.split(',').nth(1)?;
     let (columns, rows) = size.split_once('x')?;
     Some((columns.parse().ok()?, rows.parse().ok()?))
@@ -1876,80 +1923,6 @@ fn window_indexes(endpoint: &BackendEndpoint, session_target: &str) -> Vec<Strin
     .unwrap_or_default()
 }
 
-/// Type each pane's own command line back into it.
-/// Returns the panes whose program came back up.
-fn replay_commands(
-    endpoint: &BackendEndpoint,
-    snapshot: &Snapshot,
-    report: &mut RestoreReport,
-) -> BTreeSet<String> {
-    let mut sent = Vec::new();
-    let mut claude = BTreeMap::new();
-    let mut manual = Vec::new();
-    for pane in &snapshot.panes {
-        let target = pane_target(pane);
-        let Some(command) = relaunch_command(pane) else {
-            if let Some(hint) = resume_hint(pane) {
-                manual.push((target, hint));
-            }
-            continue;
-        };
-        if !pane.replayable {
-            manual.push((
-                target,
-                "argv was a process title, not a command — start it by hand".to_owned(),
-            ));
-            continue;
-        }
-        if !wait_for_shell(endpoint, &target) {
-            manual.push((target, "already running something; left alone".to_owned()));
-            continue;
-        }
-        match mux_control::run(endpoint, &["send-keys", "-t", &target, &command, "Enter"]) {
-            Ok(()) => {
-                if runs_claude(pane, &command) {
-                    claude.insert(target.clone(), saved_dirs(&pane.path));
-                }
-                sent.push(target);
-            }
-            Err(error) => report.pane_failed(target, error),
-        }
-    }
-    // Keys sent are not a program started: only a pane whose foreground
-    // moved off its shell counts as relaunched.
-    let unconfirmed = confirm_launches(endpoint, sent.clone());
-    let replayed = sent.len() - unconfirmed.len();
-    report.say(&plan::relaunched_line(replayed));
-    let mut relaunched: BTreeSet<String> = sent
-        .into_iter()
-        .filter(|target| !unconfirmed.contains(target))
-        .collect();
-    let trusting = claude
-        .into_iter()
-        .filter(|(target, _)| relaunched.contains(target));
-    let trust = answer_trust_prompts(endpoint, trusting);
-    for target in &trust.answered {
-        report.say(&format!(
-            "  {target}: answered Claude's folder-trust prompt for the folder it was saved in"
-        ));
-    }
-    // A pane left on the prompt is not up: nothing more may be typed into
-    // it, the follow-up nudge included.
-    for (target, note) in trust.left {
-        relaunched.remove(&target);
-        manual.push((target, note.to_owned()));
-    }
-    for target in unconfirmed {
-        report.say(&plan::manual_line(&target, launch::UNCONFIRMED_NOTE));
-        report.pane_unconfirmed(target, launch::UNCONFIRMED_NOTE.to_owned());
-    }
-    for (target, note) in manual {
-        report.say(&plan::manual_line(&target, &note));
-        report.pane_left(target, note);
-    }
-    relaunched
-}
-
 /// Whether a relaunched pane is a Claude: tend tracked a Claude there, or
 /// the command line runs one, directly (`claude …`, `/path/to/claude …`)
 /// or through an account wrapper's `name@claude` target.
@@ -1975,59 +1948,6 @@ fn saved_dirs(path: &str) -> Vec<String> {
         dirs.push(resolved.to_string_lossy().into_owned());
     }
     dirs
-}
-
-/// What the folder-trust pass did.
-#[derive(Debug, Default)]
-struct TrustOutcome {
-    answered: BTreeSet<String>,
-    /// Panes left on the prompt, with what to tell a human.
-    left: BTreeMap<String, &'static str>,
-}
-
-/// Walk relaunched Claude panes past the folder-trust prompt, but only for
-/// the directory each pane was saved in. Every pane shares one deadline; a
-/// pane that shows Claude's own screen stops being watched at once.
-fn answer_trust_prompts(
-    endpoint: &BackendEndpoint,
-    targets: impl IntoIterator<Item = (String, Vec<String>)>,
-) -> TrustOutcome {
-    let mut watch = launch::TrustWatch::new(targets);
-    let mut answered = BTreeSet::new();
-    let started = Instant::now();
-    'poll: while !watch.is_settled() && !crate::subprocess::abandoned() {
-        let pending: Vec<String> = watch.pending().cloned().collect();
-        for target in pending {
-            if started.elapsed() >= launch::TRUST_TIMEOUT || crate::subprocess::abandoned() {
-                break 'poll;
-            }
-            let Ok(screen) = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", &target])
-            else {
-                continue;
-            };
-            let Some(key) = watch.observe(&target, started.elapsed(), &screen) else {
-                continue;
-            };
-            let name = match key {
-                launch::TrustKey::Down => "Down",
-                launch::TrustKey::Enter => "Enter",
-            };
-            match mux_control::run(endpoint, &["send-keys", "-t", &target, name]) {
-                Ok(()) if key == launch::TrustKey::Enter => {
-                    answered.insert(target);
-                }
-                Ok(()) => {}
-                Err(_) => watch.leave(&target, launch::TRUST_UNRESOLVED_NOTE),
-            }
-        }
-        if !watch.is_settled() {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-    TrustOutcome {
-        answered,
-        left: watch.unresolved(),
-    }
 }
 
 /// What to tell a human about an agent pane whose command line was not
@@ -2420,28 +2340,6 @@ fn terminal_line_editing(tty: &str) -> Option<bool> {
     launch::line_editing(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Watch relaunched panes until each shows its program, and return the ones
-/// that never did. Every pane shares one deadline, so a workspace of many
-/// panes waits once, not once per pane.
-fn confirm_launches(endpoint: &BackendEndpoint, targets: Vec<String>) -> BTreeSet<String> {
-    let started = Instant::now();
-    let mut watch = launch::LaunchWatch::new(targets);
-    while !watch.is_settled()
-        && started.elapsed() < launch::CONFIRM_TIMEOUT
-        && !crate::subprocess::abandoned()
-    {
-        let pending: Vec<String> = watch.pending().cloned().collect();
-        for target in pending {
-            let command = foreground(endpoint, &target);
-            watch.observe(&target, command.as_deref());
-        }
-        if !watch.is_settled() {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-    watch.unconfirmed()
-}
-
 /// Whether anything is on the pane's screen — a prompt, for a shell.
 fn prompt_drawn(endpoint: &BackendEndpoint, target: &str) -> bool {
     mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
@@ -2825,9 +2723,9 @@ mod tests {
             started.elapsed()
         );
         let confirmed = crate::subprocess::with_scope(cancelled_scope(), || {
-            confirm_launches(&endpoint, vec!["work:0.0".into()])
+            panes::confirm_launch(&endpoint, "work:0.0")
         });
-        assert_eq!(confirmed, BTreeSet::from(["work:0.0".to_string()]));
+        assert!(!confirmed);
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "{:?}",
@@ -3109,6 +3007,12 @@ mod tests {
         );
         assert_eq!(layout_size("c3a1,80x24,0,0,5"), Some((80, 24)));
         assert_eq!(layout_size("garbage"), None);
+        // tmux 3.8's JSON form.
+        assert_eq!(
+            layout_size(r#"{"V":2,"L":{"t":"h","w":134,"h":60,"x":0,"y":0,"c":[]}}"#),
+            Some((134, 60))
+        );
+        assert_eq!(layout_size(r#"{"V":2}"#), None);
     }
 
     #[test]
@@ -3214,13 +3118,16 @@ mod tests {
         busy_but_failed.agent = agent(true);
         let shell = pane("work", "1", "1", None);
         let snapshot = snapshot_of(vec![busy, idle, busy_but_failed, shell]);
-        let relaunched: BTreeSet<String> = ["=work:0.0", "=work:0.1"]
-            .into_iter()
-            .map(str::to_owned)
+        let interrupted: Vec<String> = snapshot
+            .panes
+            .iter()
+            .filter(|pane| panes::interrupted(pane))
+            .map(pane_target)
             .collect();
+        // Only panes that relaunched are ever asked; of these two, the busy one.
         assert_eq!(
-            interrupted_targets(&snapshot, &relaunched),
-            vec!["=work:0.0".to_owned()]
+            interrupted,
+            vec!["=work:0.0".to_owned(), "=work:1.0".to_owned()]
         );
     }
 
@@ -3249,7 +3156,9 @@ mod tests {
         let endpoint = endpoint_for("tmux", socket.clone()).unwrap();
         let mut agent = pane("work", "0", "0", Some("cat"));
         agent.agent = Some(AgentShape {
-            kind: "claude_code".into(),
+            // Not Claude: `cat` never draws Claude's own screen, which a
+            // Claude pane must show before anything is typed.
+            kind: "codex".into(),
             session_id: "sid".into(),
             working: true,
         });
@@ -3261,9 +3170,14 @@ mod tests {
             &["send-keys", "-t", &target, "-l", "--", "ready"],
         )
         .unwrap();
-        let relaunched = BTreeSet::from([target.clone()]);
-        let mut report = RestoreReport::new(false);
-        continue_interrupted(&endpoint, &snapshot, &relaunched, "carry on", &mut report);
+        let report = std::sync::Mutex::new(RestoreReport::new(false));
+        assert!(panes::continue_pane(
+            &endpoint,
+            &snapshot.panes[0],
+            &target,
+            "carry on",
+            &report
+        ));
         std::thread::sleep(Duration::from_millis(300));
         let screen = mux_control::capture(&endpoint, &["capture-pane", "-p", "-t", &target]);
         let _ = mux_control::run(&endpoint, &["kill-server"]);
@@ -3389,9 +3303,7 @@ mod tests {
             session_id: "synthetic-7:default:%19".into(),
             working: true,
         });
-        let snapshot = snapshot_of(vec![fresh]);
-        let relaunched = BTreeSet::from(["=work:0.0".to_owned()]);
-        assert!(interrupted_targets(&snapshot, &relaunched).is_empty());
+        assert!(!panes::interrupted(&fresh));
     }
 
     /// The panes found in a real snapshot: a Claude started with its task

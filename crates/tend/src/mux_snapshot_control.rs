@@ -80,6 +80,11 @@ pub struct MuxSnapshotOperation {
     /// CLI got far enough to print one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// How far a restore has got (`phase`, `done` of `panes`, `restored`,
+    /// `waiting_dialog`, `failed`); `message` says the same in words while
+    /// it runs. Absent until the restore reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +102,12 @@ pub struct MuxSnapshotControl {
     root: Option<PathBuf>,
     next_id: AtomicU64,
     operations: tokio::sync::Mutex<Operations>,
+    /// The latest progress of running restores, by operation id. A plain
+    /// mutex: the restore reports from its own threads.
+    progress: std::sync::Mutex<BTreeMap<String, (serde_json::Value, String)>>,
+    /// `[snapshot] restore_jobs`, passed to every restore as `--jobs`; 0 is
+    /// unset.
+    restore_jobs: AtomicUsize,
     /// Captures in flight. Raised only while `operations` is locked and
     /// read by `restore` under the same lock, so a restore can never start
     /// in the middle of a capture — which would record a half-restored
@@ -125,11 +136,17 @@ pub type InProcessSnapshot = Arc<
             Vec<String>,
             PathBuf,
             Duration,
+            Option<SnapshotProgress>,
         )
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<WorkCommandOutput>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Told how far a running restore has got: the progress document and one
+/// line for a person. Only the in-process restore reports progress; the
+/// `tend` child answers at the end.
+pub type SnapshotProgress = Arc<dyn Fn(serde_json::Value, String) + Send + Sync>;
 
 static IN_PROCESS_SNAPSHOT: std::sync::OnceLock<InProcessSnapshot> = std::sync::OnceLock::new();
 
@@ -175,8 +192,17 @@ impl MuxSnapshotControl {
             root,
             next_id: AtomicU64::new(1),
             operations: tokio::sync::Mutex::new(Operations::default()),
+            progress: std::sync::Mutex::new(BTreeMap::new()),
+            restore_jobs: AtomicUsize::new(0),
             saving: AtomicUsize::new(0),
         })
+    }
+
+    /// How many panes each restore brings back at once; `None` leaves it
+    /// to the CLI's default.
+    pub fn set_restore_jobs(&self, jobs: Option<u16>) {
+        self.restore_jobs
+            .store(jobs.map_or(0, usize::from), Ordering::Relaxed);
     }
 
     /// `tend snapshot --list --json`.
@@ -270,6 +296,7 @@ impl MuxSnapshotControl {
             id: id.to_owned(),
             message: "Restoring snapshot…".into(),
             result: None,
+            progress: None,
         };
         operations.order.push_back(operation_id.clone());
         operations
@@ -282,6 +309,10 @@ impl MuxSnapshotControl {
             args.push("--only-missing".to_owned());
         }
         args.extend(["--run".to_owned(), "--json".to_owned()]);
+        let jobs = self.restore_jobs.load(Ordering::Relaxed);
+        if jobs > 0 {
+            args.extend(["--jobs".to_owned(), jobs.to_string()]);
+        }
         if layout_only {
             args.push("--layout-only".to_owned());
         } else if let Some(text) = continue_text.map(str::trim).filter(|text| !text.is_empty()) {
@@ -290,12 +321,29 @@ impl MuxSnapshotControl {
             args.push(format!("--continue={text}"));
         }
         let control = Arc::clone(self);
+        let reporter = Arc::downgrade(self);
+        let reported_id = operation_id.clone();
+        let progress: SnapshotProgress = Arc::new(move |value, line| {
+            if let Some(control) = reporter.upgrade() {
+                control
+                    .progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(reported_id.clone(), (value, line));
+            }
+        });
         tokio::spawn(async move {
-            let outcome = control.run(&args, RESTORE).await;
+            let outcome = control.run(&args, RESTORE, Some(progress)).await;
+            let last = control
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&operation_id);
             let mut operations = control.operations.lock().await;
             let Some(operation) = operations.values.get_mut(&operation_id) else {
                 return;
             };
+            operation.progress = last.map(|(value, _)| value);
             match outcome {
                 Ok(output) => {
                     // The CLI prints its report even when it stops early, so
@@ -319,12 +367,26 @@ impl MuxSnapshotControl {
     }
 
     pub async fn status(&self, operation_id: &str) -> Option<MuxSnapshotOperation> {
-        self.operations
+        let mut operation = self
+            .operations
             .lock()
             .await
             .values
             .get(operation_id)
-            .cloned()
+            .cloned()?;
+        if operation.state == MuxSnapshotOperationState::Running {
+            if let Some((value, line)) = self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(operation_id)
+                .cloned()
+            {
+                operation.progress = Some(value);
+                operation.message = format!("Restoring snapshot… {line}");
+            }
+        }
+        Some(operation)
     }
 
     /// Refuses while a restore runs; otherwise counts this capture in, under
@@ -360,7 +422,7 @@ impl MuxSnapshotControl {
         limits: WorkCommandLimits,
     ) -> Result<serde_json::Value, MuxSnapshotError> {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-        let output = self.run(&args, limits).await?;
+        let output = self.run(&args, limits, None).await?;
         if output.exit_code != 0 {
             return Err(MuxSnapshotError::Failed(failure_detail(&output)));
         }
@@ -371,12 +433,19 @@ impl MuxSnapshotControl {
         &self,
         args: &[String],
         limits: WorkCommandLimits,
+        progress: Option<SnapshotProgress>,
     ) -> Result<WorkCommandOutput, MuxSnapshotError> {
         if let Some(run) = IN_PROCESS_SNAPSHOT
             .get()
             .filter(|_| !snapshot_child_forced())
         {
-            if let Some(output) = run(args.to_vec(), self.socket_path.clone(), limits.timeout).await
+            if let Some(output) = run(
+                args.to_vec(),
+                self.socket_path.clone(),
+                limits.timeout,
+                progress,
+            )
+            .await
             {
                 return Ok(output);
             }
