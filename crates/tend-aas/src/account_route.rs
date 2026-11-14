@@ -3,12 +3,12 @@
 //! Without this, a tend launch runs the bare provider CLI on whichever
 //! account it happens to be logged into, even while that account is capped,
 //! so every new worker starts already stopped. `[agent.<program>].account`
-//! lets tend choose instead: `auto` takes the first configured account (or
-//! `aas`'s best-ranked one with quota left), a name pins one of that
-//! provider's accounts.
+//! lets tend choose instead: `auto` takes the configured account with the
+//! most quota tend has seen left (or `aas`'s best-ranked one with quota
+//! left), a name pins one of that provider's accounts.
 //!
 //! The accounts come from [`crate::account_provider`]: configured
-//! `[[accounts.<provider>]]` in config order, else `aas` when it is
+//! `[[accounts.<provider>]]`, ranked by observed usage, else `aas` when it is
 //! installed. Neither is required. When there is no backend,
 //! or it is slow or has nothing eligible, the agent starts bare exactly as it
 //! would without the setting. The decision is made before any pane exists,
@@ -26,10 +26,23 @@ pub use tend::swap_api::{
 /// answers from its usage cache, so this only trips when it hangs.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A configured account, by name or the first one for `auto`. Configured
-/// accounts are not ranked by quota yet; a swap moves the agent on when it
-/// is capped.
+/// A configured account, by name or, for `auto`, the first eligible one in
+/// [`crate::account_provider::configured`]'s ranking. When every account is
+/// held capped it is the first in config order, as before ranking: a swap
+/// moves the agent on when it is capped.
 fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
+    from_profiles_with(
+        route,
+        &crate::account_usage::load_default(),
+        time::OffsetDateTime::now_utc(),
+    )
+}
+
+fn from_profiles_with(
+    route: &AccountRoute,
+    usage: &crate::account_usage::Ledger,
+    now: time::OffsetDateTime,
+) -> Result<RoutedLaunch, String> {
     let provider = route.provider.as_str();
     if cfg!(windows) {
         return Err("configured accounts launch through `env`/`sh`, which this shell lacks".into());
@@ -39,10 +52,16 @@ fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
             .ok_or_else(|| {
                 format!("no {provider} account named {name} in [[accounts.{provider}]]")
             })?,
-        SpawnAccount::Auto => route
-            .profiles
-            .first()
-            .ok_or_else(|| format!("[[accounts.{provider}]] lists no account"))?,
+        SpawnAccount::Auto => {
+            let ranked =
+                crate::account_provider::configured(provider, &route.profiles, &[], usage, now);
+            ranked
+                .iter()
+                .find(|c| c.eligible)
+                .and_then(|c| route.profiles.iter().find(|p| p.name == c.name))
+                .or_else(|| route.profiles.first())
+                .ok_or_else(|| format!("[[accounts.{provider}]] lists no account"))?
+        }
     };
     Ok(RoutedLaunch {
         account: profile.name.clone(),
@@ -305,5 +324,38 @@ mod tests {
         assert!(decide_with(&route, never)
             .unwrap_err()
             .contains("no claude account named nope"));
+    }
+
+    #[test]
+    fn auto_takes_the_best_ranked_configured_account_and_falls_back_to_config_order() {
+        let mut route = route(SpawnAccount::Auto);
+        route.profiles = vec![profile("work"), profile("home")];
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let mut usage = crate::account_usage::Ledger::default();
+        usage
+            .accounts
+            .entry("claude/work".into())
+            .or_default()
+            .hold("test", now + time::Duration::hours(1));
+        assert_eq!(
+            from_profiles_with(&route, &usage, now).unwrap().account,
+            "home"
+        );
+        usage
+            .accounts
+            .entry("claude/home".into())
+            .or_default()
+            .hold("test", now + time::Duration::hours(1));
+        // Every account held capped: the first, as before ranking.
+        assert_eq!(
+            from_profiles_with(&route, &usage, now).unwrap().account,
+            "work"
+        );
+        // A pin is used whatever the ledger says.
+        route.choice = SpawnAccount::Named("work".into());
+        assert_eq!(
+            from_profiles_with(&route, &usage, now).unwrap().account,
+            "work"
+        );
     }
 }

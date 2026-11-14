@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when Copilot is installed. Checked against Copilot CLI 1.0.110; see
   `docs/COPILOT.md`.
 
+- Configured accounts (`[[accounts.<provider>]]`) are ranked by observed
+  usage. tendd credits a quota reading or a cap to an account only when the
+  agent process that reported it runs with that account's environment, and
+  only once the value changes under that process. A relaunched agent's row
+  therefore never passes the previous account's numbers to the new one.
+  `auto` launches and swaps skip accounts held capped and prefer the one with
+  the most quota left. With nothing observed, the order is config order, as
+  before. The record is `<data dir>/tend/account-usage.json`. Replaces #367.
+
 ### Changed
 
 - `tend work done --summary` files its result record and completes the

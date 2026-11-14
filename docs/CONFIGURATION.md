@@ -206,9 +206,9 @@ The accounts come from an account provider (see [Account
 swap](ACCOUNT_SWAP.md)):
 
 - `[[accounts.claude]]` / `[[accounts.codex]]` entries, with no external
-  tool: the launch is `env K=V … claude …`, and `auto` takes the first
-  listed account (ranking configured accounts by observed usage is coming in
-  a follow-up);
+  tool: the launch is `env K=V … claude …`, and `auto` takes the best-ranked
+  account by the usage tend has observed on it, config order when nothing is
+  observed (see [Account swap](ACCOUNT_SWAP.md));
 - otherwise [`aas`](ACCOUNT_SWAP.md), when it is installed: the launch is
   `aas e <account> …`, `auto` takes the best-ranked eligible account from
   `aas candidates` (it never changes `aas active`). The binary is
