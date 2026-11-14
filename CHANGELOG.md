@@ -144,6 +144,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across rows, on any platform: a space dropped at the break could make
   another folder read as a trusted one. Such a prompt is left for a person.
 
+- A tendd started with its own XDG directories (a scratch, test or demo
+  daemon) no longer writes its socket into the user's tmux server as the
+  global `TEND_SOCKET`. Its own `XDG_RUNTIME_DIR` made its socket its
+  "default", so it passed as the user's daemon. It then followed an
+  inherited `$TMUX` and pointed every newly spawned pane on the owner's
+  server at a socket that went away with it. Only the daemon that owns the
+  default data directory, with no XDG directory overridden to somewhere
+  non-standard, heals. Any other daemon also keeps to its own `TMUX_TMPDIR`
+  and drops an inherited `$TMUX`. `tend init` skips its live
+  `TEND_SOCKET` pin under the same condition.
+
 - `docs/ACCOUNT_SWAP.md` now says where `[swap] relaunch = "respawn"`
   applies: the daemon's automation and `tend swap --local`. A `tend swap`
   daemon job still types into a pane that has its shell. It also says that

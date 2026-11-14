@@ -1,6 +1,6 @@
 //! XDG-aware default paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const SOCKET_FILENAME: &str = "tend.sock";
 pub const CONFIG_DIRNAME: &str = "tend";
@@ -210,6 +210,55 @@ pub fn data_dir() -> Option<PathBuf> {
     xdg_dir("XDG_DATA_HOME", dirs::data_dir)
 }
 
+/// The XDG directory variables this process overrides to somewhere other
+/// than their conventional place, by name. A scratch or test daemon is
+/// started with these pointing at its own directories, which makes every
+/// `default_*` path here (socket, config, data) its own, so comparing a
+/// path with its default cannot tell it from the user's daemon. Setting a
+/// variable to its spec default (`$HOME/.config`, `/run/user/<uid>`, …) is
+/// not an override.
+#[must_use]
+pub fn xdg_dirs_overridden() -> Vec<&'static str> {
+    let home = dirs::home_dir();
+    XDG_DIRS
+        .iter()
+        .filter(|(key, _)| {
+            std::env::var_os(key).is_some_and(|value| {
+                !value.is_empty() && !is_conventional(key, Path::new(&value), home.as_deref())
+            })
+        })
+        .map(|(key, _)| *key)
+        .collect()
+}
+
+/// The XDG variables tend reads, with their spec default under `$HOME`
+/// (`None`: the runtime dir, whose default is `/run/user/<uid>`).
+const XDG_DIRS: &[(&str, Option<&str>)] = &[
+    ("XDG_RUNTIME_DIR", None),
+    ("XDG_CONFIG_HOME", Some(".config")),
+    ("XDG_DATA_HOME", Some(".local/share")),
+    ("XDG_STATE_HOME", Some(".local/state")),
+];
+
+fn is_conventional(key: &str, value: &Path, home: Option<&Path>) -> bool {
+    let value = value.to_string_lossy();
+    let value = Path::new(value.trim_end_matches('/'));
+    match XDG_DIRS.iter().find(|(k, _)| *k == key) {
+        Some((_, Some(relative))) => home.is_some_and(|home| value == home.join(relative)),
+        Some((_, None)) => {
+            #[cfg(unix)]
+            {
+                value == Path::new(&format!("/run/user/{}", posix_uid()))
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
+        None => false,
+    }
+}
+
 fn xdg_dir(key: &str, fallback: fn() -> Option<PathBuf>) -> Option<PathBuf> {
     absolute_override(std::env::var_os(key)).or_else(fallback)
 }
@@ -240,6 +289,55 @@ mod tests {
         assert!(is_remote_host(Some("dev")));
         assert!(!is_remote_host(Some("local")));
         assert!(!is_remote_host(None));
+    }
+
+    #[test]
+    fn only_a_non_conventional_xdg_dir_is_an_override() {
+        let home = Path::new("/home/u");
+        assert!(is_conventional(
+            "XDG_CONFIG_HOME",
+            Path::new("/home/u/.config"),
+            Some(home)
+        ));
+        assert!(is_conventional(
+            "XDG_CONFIG_HOME",
+            Path::new("/home/u/.config/"),
+            Some(home)
+        ));
+        assert!(is_conventional(
+            "XDG_DATA_HOME",
+            Path::new("/home/u/.local/share"),
+            Some(home)
+        ));
+        assert!(!is_conventional(
+            "XDG_DATA_HOME",
+            Path::new("/tmp/scratch/data"),
+            Some(home)
+        ));
+        assert!(!is_conventional(
+            "XDG_STATE_HOME",
+            Path::new("/home/u/.local/share"),
+            Some(home)
+        ));
+        assert!(!is_conventional(
+            "XDG_CONFIG_HOME",
+            Path::new("/home/u/.config"),
+            None
+        ));
+        #[cfg(unix)]
+        {
+            let run = format!("/run/user/{}", posix_uid());
+            assert!(is_conventional(
+                "XDG_RUNTIME_DIR",
+                Path::new(&run),
+                Some(home)
+            ));
+            assert!(!is_conventional(
+                "XDG_RUNTIME_DIR",
+                Path::new("/private/tmp/claude-501/cpw4/run"),
+                Some(home)
+            ));
+        }
     }
 
     #[test]
