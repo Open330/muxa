@@ -652,7 +652,7 @@ fn process_table() -> Option<HashMap<u32, Proc>> {
     (!table.is_empty()).then_some(table)
 }
 
-/// Windows PowerShell's TCP table, one connection per line:
+/// Windows `PowerShell`'s TCP table, one connection per line:
 /// `<local address> <local port> <remote address> <remote port> <state> <pid>`,
 /// numbers and addresses only, so nothing in it is localized.
 #[cfg(windows)]
@@ -664,10 +664,10 @@ const TCP_TABLE_SCRIPT: &str = "$ProgressPreference = 'SilentlyContinue'; \
 
 /// Every TCP listening endpoint, by pid; `scan` keeps this user's.
 ///
-/// GetExtendedTcpTable would need unsafe FFI, which this crate forbids, and
+/// `GetExtendedTcpTable` would need unsafe FFI, which this crate forbids, and
 /// `netstat` is no substitute: its header and state words are localized, and
 /// on some Windows builds it leaves out listeners whose state the kernel
-/// misreports. Get-NetTCPConnection lists them all, by number.
+/// misreports. `Get-NetTCPConnection` lists them all, by number.
 #[cfg(windows)]
 fn listening_sockets(_me: &Owner) -> Result<Vec<(u32, Vec<Endpoint>)>, String> {
     let powershell = std::env::var_os("SystemRoot").map_or_else(
@@ -757,6 +757,7 @@ fn group(pairs: Vec<(u32, Endpoint)>) -> Vec<(u32, Vec<Endpoint>)> {
 
 /// `lsof -F0pn` output: a `p<pid>` field starts a process, each `n<addr>`
 /// field after it is one of its listening sockets.
+#[cfg(any(unix, test))]
 fn parse_lsof(out: &str) -> Vec<(u32, Endpoint)> {
     let mut pairs = Vec::new();
     let mut pid = None;
