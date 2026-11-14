@@ -32,7 +32,7 @@ fn selected_endpoint() -> Option<BackendEndpoint> {
 pub fn rmux_endpoint() -> Option<String> {
     match selected_endpoint() {
         Some(endpoint) => (endpoint.host == HostKind::Rmux).then_some(endpoint.socket),
-        None => tend::backend::rmux::endpoint_from_env(),
+        None => tend::backend::rmux::ambient_endpoint(),
     }
 }
 

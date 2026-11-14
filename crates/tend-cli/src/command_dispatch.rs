@@ -30,7 +30,8 @@ pub(super) async fn main() -> Result<()> {
     // Before anything reads a multiplexer (popups, moves, the sidebar, any
     // topology): a command aimed at a daemon that is not the user's never
     // reads the user's tmux/rmux server.
-    keep_off_the_users_mux(&cmd, args.socket.as_deref(), args.config.as_deref());
+    let mut early_config =
+        keep_off_the_users_mux(&cmd, args.socket.as_deref(), args.config.as_deref());
     if let Cmd::Agent {
         action: AgentCmd::Move(move_args),
     } = &cmd
@@ -68,7 +69,12 @@ pub(super) async fn main() -> Result<()> {
     }
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let skill_path = config_path.clone();
-    let cfg = match Config::load_or_default(config_path.as_deref()) {
+    // Loaded once: the ownership check above read this same file.
+    let loaded = match early_config.take() {
+        Some(cfg) => Ok(cfg),
+        None => Config::load_or_default(config_path.as_deref()),
+    };
+    let cfg = match loaded {
         Ok(cfg) => cfg,
         // A hook handler must not hard-fail on an unreadable config. agy
         // reads a non-zero hook exit as its verdict
@@ -364,14 +370,14 @@ fn keep_off_the_users_mux(
     cmd: &Cmd,
     socket: Option<&std::path::Path>,
     config: Option<&std::path::Path>,
-) -> bool {
+) -> Option<Config> {
+    let mut loaded = None;
     let restrict = mux_restriction_needed(cmd, || {
         let config_path = config
             .map(std::path::Path::to_path_buf)
             .or_else(paths::default_config_file);
-        let cfg_socket = Config::load_or_default(config_path.as_deref())
-            .ok()
-            .and_then(|cfg| cfg.socket);
+        loaded = Config::load_or_default(config_path.as_deref()).ok();
+        let cfg_socket = loaded.as_ref().and_then(|cfg| cfg.socket.clone());
         let socket = socket
             .map(std::path::Path::to_path_buf)
             .or_else(|| cfg_socket.clone())
@@ -381,7 +387,7 @@ fn keep_off_the_users_mux(
     if restrict {
         tend::tmux::scanner::restrict_to_own_tmux_dir();
     }
-    restrict
+    loaded
 }
 
 fn mux_restriction_needed(cmd: &Cmd, users_daemon: impl FnOnce() -> bool) -> bool {

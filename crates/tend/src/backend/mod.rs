@@ -162,6 +162,21 @@ pub type SharedBackend = Arc<dyn PaneBackend>;
 /// running tend outside a multiplexer at all are debugging the
 /// daemon, not driving it. A future "noop" backend could replace
 /// this fallback if that assumption stops holding.
+/// The backend that names this process's own pane (`current_pane`): the
+/// host its environment says it runs in, with that host's endpoint, even
+/// for a process restricted from observing the user's servers. Never use it
+/// to list or act on panes; that is [`default_backend`]'s job.
+#[must_use]
+pub fn identity_backend() -> SharedBackend {
+    match detect_host_env() {
+        Some(HostKind::Cmux) => Arc::new(cmux::CmuxBackend::new()),
+        Some(HostKind::Rmux) => Arc::new(rmux::RmuxBackend::for_identity()),
+        Some(HostKind::Zellij) => Arc::new(zellij::ZellijBackend::new()),
+        Some(HostKind::Herdr) => Arc::new(herdr::HerdrBackend::new()),
+        _ => Arc::new(tmux::TmuxBackend::new()),
+    }
+}
+
 pub fn default_backend() -> SharedBackend {
     // Not the user's daemon (or a CLI for another one): tmux only, kept to
     // its own directory, as in [`active_backends`].

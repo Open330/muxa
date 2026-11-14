@@ -143,10 +143,15 @@ fn canonical(endpoint: &BackendEndpoint, pane: &str) -> String {
 fn endpoint(args: &Args) -> Result<BackendEndpoint> {
     let host = match args.host {
         Some(HostArg::Rmux) => HostKind::Rmux,
+        // Identity, not permission (see agent_move::endpoint).
         None if args
             .pane
             .as_deref()
             .is_some_and(|pane| pane.starts_with("rmux:"))
+            || args
+                .mux_socket
+                .as_deref()
+                .is_some_and(tend::backend::rmux::is_endpoint)
             || tend::backend::rmux::endpoint_from_env().is_some() =>
         {
             HostKind::Rmux
@@ -158,7 +163,7 @@ fn endpoint(args: &Args) -> Result<BackendEndpoint> {
         .clone()
         .or_else(|| {
             if host == HostKind::Rmux {
-                tend::backend::rmux::endpoint_from_env()
+                tend::backend::rmux::ambient_endpoint()
             } else if !tend::tmux::scanner::ambient_mux_allowed() {
                 // Never the user's server for a command aimed at another daemon.
                 None
@@ -248,7 +253,7 @@ pub async fn run(
     if matches!(args.action, Some(Action::Run)) {
         let pane = args
             .pane
-            .or_else(|| tend::default_backend().current_pane())
+            .or_else(|| tend::identity_backend().current_pane())
             .context("sidebar could not identify its own pane")?;
         let pane = canonical(&endpoint, &pane);
         return crate::watch::sidebar::run(client, config, endpoint, pane, launch).await;

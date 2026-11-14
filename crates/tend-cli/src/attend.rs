@@ -217,7 +217,7 @@ pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Op
     let chosen = if args.cycle {
         // "Where am I" is inherently single-host — resolve the cursor's
         // current pane via the env-preferred backend.
-        let current = tend::default_backend()
+        let current = tend::identity_backend()
             .current_pane()
             .map(|p| spatial_key(&p, &panes));
         next_after(&cands, current.as_ref())

@@ -1164,7 +1164,14 @@ impl MoveMenu {
 fn endpoint(args: &MoveArgs) -> Result<BackendEndpoint> {
     let host = match args.host {
         Some(HostArg::Rmux) => HostKind::Rmux,
+        // Which host is identity, not permission: an explicit rmux socket,
+        // or a `$RMUX` this process runs under, says rmux even when that
+        // inherited endpoint may not be borrowed.
         None if args.pane.as_deref().is_some_and(|p| p.starts_with("rmux:"))
+            || args
+                .server_socket
+                .as_deref()
+                .is_some_and(tend::backend::rmux::is_endpoint)
             || tend::backend::rmux::endpoint_from_env().is_some() =>
         {
             HostKind::Rmux
@@ -1175,7 +1182,7 @@ fn endpoint(args: &MoveArgs) -> Result<BackendEndpoint> {
         .server_socket
         .clone()
         .or_else(|| match host {
-            HostKind::Rmux => tend::backend::rmux::endpoint_from_env(),
+            HostKind::Rmux => tend::backend::rmux::ambient_endpoint(),
             // Never the user's server for a command aimed at another daemon.
             _ if !tend::tmux::scanner::ambient_mux_allowed() => None,
             _ => std::env::var("TMUX")
@@ -1368,6 +1375,22 @@ fn interactive(menu: &mut MoveMenu) -> Result<Option<MoveOutcome>> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_explicit_rmux_socket_is_rmux_without_borrowing_any_endpoint() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            args: super::MoveArgs,
+        }
+        let args = Wrap::parse_from(["move", "--server-socket", "/tmp/rmux-501/private"]).args;
+        let endpoint = super::endpoint(&args).unwrap();
+        assert_eq!(endpoint.host, tend::HostKind::Rmux);
+        assert_eq!(endpoint.socket, "/tmp/rmux-501/private");
+        let args = Wrap::parse_from(["move", "--server-socket", "/tmp/tmux-501/private"]).args;
+        assert_eq!(super::endpoint(&args).unwrap().host, tend::HostKind::Tmux);
+    }
+
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 

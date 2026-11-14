@@ -132,8 +132,8 @@ pub mod worktree_receipt;
 // ---------------------------------------------------------------------------
 
 pub use backend::{
-    active_backends, default_backend, rmux::RmuxBackend, tmux::TmuxBackend, zellij::ZellijBackend,
-    BackendCaps, HostKind, PaneBackend, SharedBackend,
+    active_backends, default_backend, identity_backend, rmux::RmuxBackend, tmux::TmuxBackend,
+    zellij::ZellijBackend, BackendCaps, HostKind, PaneBackend, SharedBackend,
 };
 pub use config::Config;
 pub use error::CoreError as Error;

@@ -54,6 +54,15 @@ impl RmuxBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            endpoint: ambient_endpoint(),
+        }
+    }
+
+    /// The backend for naming this process's own pane: the `$RMUX` it runs
+    /// under, whether or not it may act on that server.
+    #[must_use]
+    pub fn for_identity() -> Self {
+        Self {
             endpoint: endpoint_from_env(),
         }
     }
@@ -466,12 +475,28 @@ pub fn endpoint_from_value(value: &str) -> Option<String> {
 /// Socket path advertised to the current rmux pane.
 #[must_use]
 pub fn endpoint_from_env() -> Option<String> {
-    // A daemon that is not the user's never follows an inherited `$RMUX`
-    // to the user's server (see `tmux::scanner::restrict_to_own_tmux_dir`).
-    if crate::tmux::scanner::own_tmux_dir_only() {
-        return None;
-    }
     endpoint_from_value(&std::env::var("RMUX").ok()?)
+}
+
+/// [`endpoint_from_env`] as a server to act on or observe: `None` for a
+/// process restricted to its own multiplexer (a daemon that is not the
+/// user's, or a CLI aimed at one), whose inherited `$RMUX` names the user's
+/// server. [`endpoint_from_env`] itself stays readable as identity (which
+/// host and pane this process runs in).
+#[must_use]
+pub fn ambient_endpoint() -> Option<String> {
+    ambient_endpoint_with(
+        crate::tmux::scanner::ambient_mux_allowed(),
+        endpoint_from_env,
+    )
+}
+
+fn ambient_endpoint_with(allowed: bool, env: impl FnOnce() -> Option<String>) -> Option<String> {
+    if allowed {
+        env()
+    } else {
+        None
+    }
 }
 
 /// Whether `socket` is an rmux server's control endpoint: a socket under an
@@ -999,5 +1024,15 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn an_inherited_rmux_is_identity_but_not_a_server_to_use_when_restricted() {
+        let env = || Some("/tmp/rmux-501/default".to_owned());
+        assert_eq!(
+            ambient_endpoint_with(true, env).as_deref(),
+            Some("/tmp/rmux-501/default")
+        );
+        assert_eq!(ambient_endpoint_with(false, env), None);
     }
 }
