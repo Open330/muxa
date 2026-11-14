@@ -239,8 +239,10 @@ pub fn install_in_process_work_up(run: InProcessWorkUp) {
 }
 
 /// Whether `TEND_WORK_UP_CHILD` forces the `tend` child, the path every
-/// release before this one used.
-fn work_up_child_forced() -> bool {
+/// release before this one used. Also read for a `work up` that arrives
+/// over Fleet.
+#[must_use]
+pub fn work_up_child_forced() -> bool {
     std::env::var_os("TEND_WORK_UP_CHILD").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
@@ -474,7 +476,9 @@ pub fn validate_swap_argv(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn is_work_up(args: &[String]) -> bool {
+/// Whether `args` is a `work up` argv.
+#[must_use]
+pub fn is_work_up(args: &[String]) -> bool {
     args.first().is_some_and(|command| command == "work")
         && args.get(1).is_some_and(|subcommand| subcommand == "up")
 }

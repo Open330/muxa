@@ -599,8 +599,9 @@ impl LocalTask {
     }
 }
 
-/// Run an allowlisted `tend work …` argv next to this daemon with the sibling
-/// `tend` binary, pinned to the daemon's own socket.
+/// Run an allowlisted `tend work …` argv next to this daemon: in-process
+/// for `work up` and `agent start` (`relay_in_process`), else with the
+/// sibling `tend` binary, pinned to the daemon's own socket.
 async fn run_local_work_command(
     args: Vec<String>,
     stdin: Option<String>,
@@ -613,6 +614,9 @@ async fn run_local_work_command(
         "work_command",
         stdin.as_ref().map_or(0, String::len),
     );
+    if let Some(output) = crate::relay_in_process::run(&args, socket).await {
+        return Ok(FleetCommandResult::command(output));
+    }
     let limits = WorkCommandLimits::for_args(&args);
     work_control::execute_work_command(
         &work_control::resolve_tend_binary(),

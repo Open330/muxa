@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A `work up` or `agent start` that another Fleet host sends this one runs
+  inside its tendd too, through the same code as a local request, instead
+  of a `tend` child. The controller gets the same exit code, JSON and error
+  line. `TEND_WORK_UP_CHILD=1` / `TEND_AGENT_START_CHILD=1` bring the child
+  back for those as well; the other Fleet commands still run the child.
+
 ### Added
 
 - Results on other Fleet hosts can be accepted, sent back or withdrawn from
