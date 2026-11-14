@@ -65,14 +65,8 @@ pub(crate) async fn run_argv(
             return None;
         }
     };
-    // Only the JSON document can be handed back.
-    if !args.json {
-        return None;
-    }
-    // A ticket lookup starts a headless agent through `tend::ask`, outside
-    // the subprocess scope below, so it would miss the socket the child
-    // pinned for its hooks. Leave those to the child.
-    if args.external.is_some() && !args.no_ticket {
+    if let Some(reason) = needs_the_cli(&args) {
+        tracing::info!(reason, "in-process work up declined; running the tend CLI");
         return None;
     }
     let config_path = cli_config_path(
@@ -107,6 +101,36 @@ pub(crate) async fn run_argv(
         Ok(result) => result,
         Err(error) => Err(format!("work up task: {error}")),
     })
+}
+
+/// Why `args` is left to the `tend` child, or `None` when
+/// `run_noninteractive` does exactly what the child would. A local request
+/// never trips these (`WorkUpRequest::arguments`); a Fleet argv can.
+fn needs_the_cli(args: &tend_work::work_up::UpArgs) -> Option<&'static str> {
+    if !args.json {
+        // Only the JSON document can be handed back.
+        return Some("no --json");
+    }
+    if !args.yes {
+        // The child, with no terminal, refused what it would have asked.
+        return Some("no --yes");
+    }
+    if !args.no_ticket {
+        // A ticket lookup, with `--external` or on the Work id itself,
+        // starts a headless agent through `tend::ask`, outside the
+        // subprocess scope, so it would miss the socket the child pinned
+        // for its hooks.
+        return Some("ticket lookup");
+    }
+    if !args.acceptance.is_empty() || !args.checks.is_empty() {
+        // The CLI's own wrapper binds verification before applying.
+        return Some("--accept/--check");
+    }
+    if args.show_prompts {
+        // Printed by the CLI's wrapper, before the document.
+        return Some("--show-prompts");
+    }
+    None
 }
 
 /// Sets a scope's cancel flag when the call that owns it is dropped.
@@ -197,6 +221,49 @@ mod tests {
         );
         assert_eq!(cli_config_path(Some("".into()), default.clone()), default);
         assert_eq!(cli_config_path(None, default.clone()), default);
+    }
+
+    #[test]
+    fn only_what_run_noninteractive_does_like_the_child_runs_in_process() {
+        let parse = |words: &[&str]| {
+            let words: Vec<String> = ["work", "up", "ENG-1"]
+                .iter()
+                .chain(words)
+                .map(|word| (*word).to_string())
+                .collect();
+            tend_work::work_up::parse_up_argv(&words).unwrap()
+        };
+        assert_eq!(
+            needs_the_cli(&parse(&["--json", "--yes", "--no-ticket"])),
+            None
+        );
+        for (words, reason) in [
+            (&["--yes", "--no-ticket"][..], "no --json"),
+            (&["--json", "--no-ticket"], "no --yes"),
+            (&["--json", "--yes"], "ticket lookup"),
+            (&["--json", "--yes", "--external=ENG-1"], "ticket lookup"),
+            (
+                &["--json", "--yes", "--no-ticket", "--accept=tests pass"],
+                "--accept/--check",
+            ),
+            (
+                &["--json", "--yes", "--no-ticket", "--check=cargo test"],
+                "--accept/--check",
+            ),
+            (
+                &["--json", "--yes", "--no-ticket", "--show-prompts"],
+                "--show-prompts",
+            ),
+        ] {
+            assert_eq!(needs_the_cli(&parse(words)), Some(reason), "{words:?}");
+        }
+        let local: tend::work_control::WorkUpRequest =
+            serde_json::from_value(serde_json::json!({"work": "ENG-1"})).unwrap();
+        assert_eq!(
+            needs_the_cli(&tend_work::work_up::parse_up_argv(&local.arguments()).unwrap()),
+            None,
+            "a local request runs in-process"
+        );
     }
 
     #[test]

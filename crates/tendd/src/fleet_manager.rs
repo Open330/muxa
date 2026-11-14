@@ -614,7 +614,7 @@ async fn run_local_work_command(
         "work_command",
         stdin.as_ref().map_or(0, String::len),
     );
-    if let Some(output) = crate::relay_in_process::run(&args, socket).await {
+    if let Some(output) = crate::relay_in_process::run(&args, stdin.as_deref(), socket).await {
         return Ok(FleetCommandResult::command(output));
     }
     let limits = WorkCommandLimits::for_args(&args);

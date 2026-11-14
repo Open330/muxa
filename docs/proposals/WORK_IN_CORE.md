@@ -209,10 +209,13 @@ pub struct WorkContext {
   Each honours its own forcing variable. The rest of the allowlist (`work
   options|preset|pipeline|route|dispatch…|fleet-ask`, `swap`) still runs the
   child, because that code is still in the CLI crate.
+  - A Fleet `work up` declines what only the CLI's wrapper does (see
+    below), and a frame with stdin runs the child.
   - Proven on a scratch daemon with `[fleet] enabled`, through
     `fleet_command` to `local` with `TEND_CLI` pointing nowhere: a relayed
-    `agent start` created and stamped its window; a relayed `work up`
-    answered exit 1 with the CLI's error line; with both forcing variables
+    `agent start` created and stamped its window; a relayed `work up
+    --no-ticket` answered exit 1 with the CLI's error line; one without
+    `--no-ticket` declined to the (missing) CLI; with both forcing variables
     set, both failed for the missing CLI, and with the built `tend` the
     forced child worked.
 
@@ -223,8 +226,8 @@ still reaches the CLI child, and when it can be removed:
 
 | Fallback | Shipped in-process in | Remove the forcing variable in |
 | --- | --- | --- |
-| `TEND_WORK_UP_CHILD` (`work up`, local and Fleet) | 0.10.17 | 0.10.18, if 0.10.17 hosts never set it |
-| `TEND_RECONCILE_CHILD` (pipeline reconcile) | 0.10.17 | 0.10.18, likewise |
+| `TEND_RECONCILE_CHILD` (pipeline reconcile) | 0.10.17 | 0.10.18, if 0.10.17 hosts never set it |
+| `TEND_WORK_UP_CHILD` (`work up`: local in 0.10.17, Fleet in 0.10.18) | 0.10.17 / 0.10.18 | 0.10.19, after the Fleet path's first release |
 | `TEND_AGENT_START_CHILD` (`agent start`, local and Fleet) | 0.10.18 | 0.10.19 |
 | `TEND_SNAPSHOT_CHILD` (snapshots) | 0.10.18 | 0.10.19 |
 
@@ -235,13 +238,20 @@ names the program, not a fallback, and stays.
 
 Removing a forcing variable does not remove the child path itself. These
 cases decline to it by design, and each logs `in-process … declined`:
-- a `work up` with a ticket lookup (`--external` without `--no-ticket`),
-  which starts a headless agent outside the subprocess scope;
+- a `work up` whose argv asks for what only the CLI's wrapper does: a
+  ticket lookup (no `--no-ticket`, with or without `--external`), which
+  starts a headless agent outside the subprocess scope; `--accept` /
+  `--check`; `--show-prompts`; or no `--yes`. A local request never does
+  (`WorkUpRequest::arguments`), but a Fleet argv can;
 - an `agent start` for an rmux server, or a native one whose `env` changes
   the daemon's values;
-- any argv without `--json`, or one that does not parse;
-- the CLI-only commands: IPC `work_command` (`work options|preset|…`), the
-  same subcommands over Fleet, `swap`, and the dashboard sharing routes.
+- a Fleet frame that carries stdin, which the child handed to a route's
+  `prepare`;
+- any argv without `--json`, or one that does not parse.
+
+These never go in-process at all, because their code is still in the CLI
+crate: IPC `work_command` (`work options|preset|…`), the same subcommands
+over Fleet, `swap`, and the dashboard sharing routes.
 
 These go when `WorkContext` (step 2) passes the environment and endpoint
 explicitly and the remaining command code moves into `tend-work`. That

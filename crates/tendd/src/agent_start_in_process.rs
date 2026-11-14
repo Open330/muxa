@@ -100,6 +100,7 @@ pub(crate) async fn launch_argv(
     };
     // Only the JSON envelope can be handed back.
     if !args.json {
+        tracing::info!("in-process agent start declined (no --json); running the tend CLI");
         return None;
     }
     let config_path = crate::work_up_in_process::cli_config_path(
