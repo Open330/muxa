@@ -9,7 +9,10 @@ use super::{
 use crate::{tmux::PaneInfo, Agent, AgentKind, AgentState};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -294,9 +297,21 @@ impl CollaborationStore {
             .collect()
     }
     /// Test fixture: an unresolved stop on `pane`, which pauses its input
-    /// until cleared, without standing up a real worker to drain.
+    /// until cleared, without standing up a real worker to drain. Its fence
+    /// is this live test process, so the stop cannot resolve as exited.
     #[cfg(test)]
     pub(crate) async fn block_worker_input_for_test(&self, pane: &str, socket: Option<&str>) {
+        let live = ProcessFence::capture(std::process::id()).expect("own process birth");
+        self.plant_uncertain_stop_for_test(pane, socket, live).await;
+    }
+    /// Test fixture: an unresolved stop on `pane` fenced to `fence`.
+    #[cfg(test)]
+    pub(crate) async fn plant_uncertain_stop_for_test(
+        &self,
+        pane: &str,
+        socket: Option<&str>,
+        fence: ProcessFence,
+    ) {
         self.worker_drains.lock().await.push(WorkerDrainRecord {
             view: WorkerDrainView {
                 token: WorkerDrainToken {
@@ -313,10 +328,7 @@ impl CollaborationStore {
                             window_id: "@1".into(),
                         },
                     },
-                    process_fence: ProcessFence {
-                        pid: 0,
-                        birth: String::new(),
-                    },
+                    process_fence: fence,
                     expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
                 },
                 phase: WorkerDrainPhase::Uncertain,
@@ -331,6 +343,68 @@ impl CollaborationStore {
             finished_at: None,
             stop_outcome: None,
         });
+    }
+    /// Close unresolved stops whose fenced process has definitely exited:
+    /// the outcome they were waiting to verify. Until then the stop pauses
+    /// all Tend input to its pane id, and a pane id is reused (a tmux
+    /// restore renumbers every pane), so a stale record kept refusing typed
+    /// wakes to whichever agent took the id next. The same process evidence
+    /// as [`Self::worker_drain_complete_stop`]; a live or unobservable
+    /// process keeps its record. Returns how many were closed.
+    pub async fn resolve_exited_drains(&self) -> Result<usize, CollaborationError> {
+        let unresolved: Vec<(String, ProcessFence)> = self
+            .worker_drains
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r.view.phase == WorkerDrainPhase::Uncertain)
+            .map(|r| {
+                (
+                    r.view.token.drain_id.clone(),
+                    r.view.token.process_fence.clone(),
+                )
+            })
+            .collect();
+        if unresolved.is_empty() {
+            return Ok(0);
+        }
+        // Process probes may shell out; keep them off the runtime and locks.
+        let exited: HashSet<String> = tokio::task::spawn_blocking(move || {
+            unresolved
+                .into_iter()
+                .filter(|(_, fence)| fence.definitely_exited())
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        if exited.is_empty() {
+            return Ok(0);
+        }
+        let mut spawns = self.worker_spawns.lock().await;
+        let _transaction = self.transaction_lock.lock().await;
+        let mut records = self.worker_drains.lock().await;
+        let mut closed = 0;
+        for r in records.iter_mut().filter(|r| {
+            r.view.phase == WorkerDrainPhase::Uncertain && exited.contains(&r.view.token.drain_id)
+        }) {
+            let mut updated = r.clone();
+            updated.close(
+                WorkerDrainPhase::Exited,
+                "the drained process has exited; the uncertain stop is resolved",
+            );
+            updated.stop_outcome = Some(WorkerDrainStopOutcome::Exited);
+            for spawn in spawns.iter_mut() {
+                self.close_drained_spawn(spawn, &updated.view.token)?;
+            }
+            self.persist_drain(&updated)?;
+            *r = updated;
+            closed += 1;
+        }
+        if closed > 0 {
+            self.publish_change();
+        }
+        Ok(closed)
     }
     pub async fn worker_input_blocked(&self, pane: &str, socket: Option<&str>) -> bool {
         self.worker_drains

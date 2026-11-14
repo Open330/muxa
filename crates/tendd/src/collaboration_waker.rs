@@ -166,6 +166,13 @@ async fn wake_idle_collaboration_peers_with_inflight(
     wake_payload: CollaborationWakePayload,
     wake_inflight: &mut HashSet<(String, Option<String>, String)>,
 ) {
+    // An unresolved stop pauses Tend input to its pane id; release the ones
+    // whose process is gone before that id refuses the next agent's wake.
+    match collaboration.resolve_exited_drains().await {
+        Ok(0) => {}
+        Ok(closed) => tracing::info!(closed, "resolved worker stops whose process exited"),
+        Err(error) => tracing::warn!(%error, "failed to resolve exited worker stops"),
+    }
     let requests = collaboration.pending_unnotified().await;
     let replies = collaboration.pending_reply_unnotified().await;
     let agents = store.snapshot().await;

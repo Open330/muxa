@@ -61,6 +61,18 @@ person to look at the pane. `notified_at` keeps the first delivery, so such a
 request is never handed to a slot successor as undelivered work. Full-body
 direct wakes keep their own phase-based recovery and are never re-typed.
 
+A wake that is never typed at all is bounded too. If a request that expects a
+typed wake (to a worker, with `wake` not `never`) is still queued, unclaimed
+and unoffered five minutes after it was created, and its exact recipient has
+been Idle for those five minutes, it is marked `peer_interrupted` with reason
+`wake_undelivered`. That returns the sender's wait and, after the grace, opens
+a recovery item; it clears once the request is delivered or claimed. The
+recipient's pane refused the wake, for example because a stop recorded for
+that pane id was still unresolved, or the terminal write failed. An unresolved
+(`uncertain`) worker stop pauses Tend input to its pane id; once its fenced
+process has definitely exited, the waker closes it as exited, so a pane id
+reused after a tmux restore takes wakes again.
+
 Apart from that, Tend does not resend the body or repeat Enter merely because an acknowledgement
 is missing. Hooks can arrive late or be unavailable, and a retry could submit a
 different user draft. Inspect the pane before an explicit Enter-only recovery.

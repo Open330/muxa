@@ -95,7 +95,8 @@ message.
 A `peer_interrupted` result keeps the work open: read `interruption`, reuse
 its `action_request_id`, do not resend. Reasons include provider approval,
 caps, a lost binding, `reply_overdue` (claimed, reminded, still silent) and
-`wake_unsubmitted` (the wake never reached a turn). Check fresh recipient
+`wake_unsubmitted` (the wake never reached a turn), `wake_undelivered` (no
+wake reached the idle recipient). Check fresh recipient
 state once at a checkpoint; reassign only after a verified stop or in an
 isolated worktree. `tend_guide(workflows=true)` has recovery examples.
 
