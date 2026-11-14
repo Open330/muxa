@@ -96,6 +96,8 @@ pub struct ListenerRow {
         skip_serializing_if = "Option::is_none"
     )]
     pub started_at: Option<OffsetDateTime>,
+    /// The owning user's numeric uid. Windows users are SIDs, not numbers,
+    /// so it is 0 there; either way every row is this user's own process.
     pub uid: u32,
     /// The executable's name, control characters replaced.
     pub process_name: String,
@@ -156,17 +158,12 @@ fn scan(agents: &AgentsView, limit: Option<usize>, deadline: Instant) -> Listene
         attribution: Coverage::Complete,
         observed_at,
     };
-    if cfg!(windows) {
-        return empty(Coverage::Unavailable {
-            reason: "listening servers are not listed on Windows yet".into(),
-        });
-    }
     let Some(me) = own_uid() else {
         return empty(Coverage::Unavailable {
             reason: "could not tell which user this is".into(),
         });
     };
-    let listeners = match listening_sockets(me) {
+    let listeners = match listening_sockets(&me) {
         Ok(listeners) => listeners,
         Err(reason) => return empty(Coverage::Unavailable { reason }),
     };
@@ -191,7 +188,7 @@ fn scan(agents: &AgentsView, limit: Option<usize>, deadline: Instant) -> Listene
         let Some(process) = table.get(&pid) else {
             continue;
         };
-        if process.uid != Some(me) {
+        if process.uid.as_ref() != Some(&me) {
             continue;
         }
         // An agent CLI's own listener (Codex's app-server, say) is part of
@@ -210,7 +207,7 @@ fn scan(agents: &AgentsView, limit: Option<usize>, deadline: Instant) -> Listene
             started_at: process
                 .started_at
                 .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok()),
-            uid: me,
+            uid: wire_uid(&me),
             process_name: printable(&process.name),
             cwd: process
                 .cwd
@@ -520,11 +517,30 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
+/// Who owns a process: a numeric uid on Unix, a SID on Windows.
+#[cfg(unix)]
+type Owner = u32;
+#[cfg(windows)]
+type Owner = sysinfo::Uid;
+
+#[cfg(unix)]
+// By reference to share the signature with Windows, whose SID is not Copy.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn wire_uid(me: &Owner) -> u32 {
+    *me
+}
+
+/// A SID has no number; see [`ListenerRow::uid`].
+#[cfg(windows)]
+fn wire_uid(_me: &Owner) -> u32 {
+    0
+}
+
 /// One process, as much as tend reads of it.
 #[derive(Debug, Clone)]
 struct Proc {
     ppid: u32,
-    uid: Option<u32>,
+    uid: Option<Owner>,
     start: Option<String>,
     started_at: Option<i64>,
     name: String,
@@ -537,8 +553,8 @@ fn own_uid() -> Option<u32> {
     std::fs::metadata("/proc/self").ok().map(|meta| meta.uid())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn own_uid() -> Option<u32> {
+#[cfg(not(target_os = "linux"))]
+fn own_uid() -> Option<Owner> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let pid = sysinfo::get_current_pid().ok()?;
     let mut system = System::new();
@@ -547,24 +563,17 @@ fn own_uid() -> Option<u32> {
         true,
         ProcessRefreshKind::nothing().with_user(UpdateKind::Always),
     );
-    system.process(pid)?.user_id().map(|uid| **uid)
-}
-
-/// Windows has no numeric uid (sysinfo reports a SID) and no listener
-/// source here yet; `scan` reports the inventory unavailable before asking.
-#[cfg(windows)]
-fn own_uid() -> Option<u32> {
-    None
+    system.process(pid).and_then(process_uid)
 }
 
 #[cfg(all(not(target_os = "linux"), unix))]
-fn process_uid(process: &sysinfo::Process) -> Option<u32> {
+fn process_uid(process: &sysinfo::Process) -> Option<Owner> {
     process.user_id().map(|uid| **uid)
 }
 
 #[cfg(windows)]
-fn process_uid(_process: &sysinfo::Process) -> Option<u32> {
-    None
+fn process_uid(process: &sysinfo::Process) -> Option<Owner> {
+    process.user_id().cloned()
 }
 
 #[cfg(target_os = "linux")]
@@ -643,8 +652,58 @@ fn process_table() -> Option<HashMap<u32, Proc>> {
     (!table.is_empty()).then_some(table)
 }
 
+/// Windows `PowerShell`'s TCP table, one connection per line:
+/// `<local address> <local port> <remote address> <remote port> <state> <pid>`,
+/// numbers and addresses only, so nothing in it is localized.
+#[cfg(windows)]
+const TCP_TABLE_SCRIPT: &str = "$ProgressPreference = 'SilentlyContinue'; \
+    try { Get-NetTCPConnection -ErrorAction Stop | ForEach-Object { \
+    '{0} {1} {2} {3} {4} {5}' -f $_.LocalAddress, $_.LocalPort, $_.RemoteAddress, \
+    $_.RemotePort, [int]$_.State, $_.OwningProcess } } \
+    catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }";
+
+/// Every TCP listening endpoint, by pid; `scan` keeps this user's.
+///
+/// `GetExtendedTcpTable` would need unsafe FFI, which this crate forbids, and
+/// `netstat` is no substitute: its header and state words are localized, and
+/// on some Windows builds it leaves out listeners whose state the kernel
+/// misreports. `Get-NetTCPConnection` lists them all, by number.
+#[cfg(windows)]
+fn listening_sockets(_me: &Owner) -> Result<Vec<(u32, Vec<Endpoint>)>, String> {
+    let powershell = std::env::var_os("SystemRoot").map_or_else(
+        || PathBuf::from("powershell.exe"),
+        |root| {
+            Path::new(&root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        },
+    );
+    let run = worktree_inventory::bounded_status(
+        &powershell.to_string_lossy(),
+        &[
+            "-NoProfile".as_ref(),
+            "-NonInteractive".as_ref(),
+            "-Command".as_ref(),
+            TCP_TABLE_SCRIPT.as_ref(),
+        ],
+    )
+    .ok_or("PowerShell could not list TCP connections in time")?;
+    if run.code != Some(0) {
+        return Err(format!(
+            "Get-NetTCPConnection failed: {}",
+            first_line(&run.stderr)
+        ));
+    }
+    Ok(group(parse_tcp_table(&run.stdout)))
+}
+
 /// Every TCP listening endpoint this user's processes hold, by pid.
-fn listening_sockets(me: u32) -> Result<Vec<(u32, Vec<Endpoint>)>, String> {
+#[cfg(unix)]
+// By reference to share the signature with Windows, whose SID is not Copy.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn listening_sockets(me: &Owner) -> Result<Vec<(u32, Vec<Endpoint>)>, String> {
     #[cfg(target_os = "linux")]
     {
         if let Some(run) = worktree_inventory::bounded_status("ss", &["-Hltnp".as_ref()]) {
@@ -698,6 +757,7 @@ fn group(pairs: Vec<(u32, Endpoint)>) -> Vec<(u32, Vec<Endpoint>)> {
 
 /// `lsof -F0pn` output: a `p<pid>` field starts a process, each `n<addr>`
 /// field after it is one of its listening sockets.
+#[cfg(any(unix, test))]
 fn parse_lsof(out: &str) -> Vec<(u32, Endpoint)> {
     let mut pairs = Vec::new();
     let mut pid = None;
@@ -709,6 +769,44 @@ fn parse_lsof(out: &str) -> Vec<(u32, Endpoint)> {
                 pairs.push((pid, endpoint));
             }
         }
+    }
+    pairs
+}
+
+/// [`TCP_TABLE_SCRIPT`] lines. A listener is told by its shape, not only
+/// its state (which some Windows builds misreport): no remote port, an
+/// unspecified remote address (`0.0.0.0` or `::`), and not merely bound
+/// (state 100, a socket that will connect out). The idle process (pid 0)
+/// owns nothing; malformed lines are skipped.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tcp_table(out: &str) -> Vec<(u32, Endpoint)> {
+    const BOUND: u32 = 100;
+    let mut pairs = Vec::new();
+    for line in out.lines() {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        let [local, local_port, remote, remote_port, state, pid] = columns.as_slice() else {
+            continue;
+        };
+        let (Ok(port), Ok(remote_port), Ok(state), Ok(pid)) = (
+            local_port.parse::<u16>(),
+            remote_port.parse::<u16>(),
+            state.parse::<u32>(),
+            pid.parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if remote_port != 0 || !matches!(*remote, "0.0.0.0" | "::") || state == BOUND || pid == 0 {
+            continue;
+        }
+        let bare = local.split('%').next().unwrap_or(local);
+        pairs.push((
+            pid,
+            Endpoint {
+                address: (*local).to_string(),
+                port,
+                bind: bind_of(bare),
+            },
+        ));
     }
     pairs
 }
@@ -814,10 +912,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_listeners_are_told_by_shape_even_when_the_state_is_wrong() {
+        // Columns: local, port, remote, remote port, state, pid. States seen
+        // on a Windows Insider build include nonsense for listeners (1 is
+        // Closed, 4 FinWait1, 0 none at all).
+        let table = "0.0.0.0 3000 0.0.0.0 0 2 6168\r\n\
+                     0.0.0.0 445 0.0.0.0 0 4 4\r\n\
+                     127.0.0.1 18765 0.0.0.0 0 0 69232\r\n\
+                     127.0.0.1 4647 0.0.0.0 0 1 44292\r\n\
+                     127.0.0.1 4647 127.0.0.1 0 2 44292\r\n\
+                     127.0.0.1 4647 127.0.0.1 2928 5 44292\r\n\
+                     127.0.0.1 11575 127.0.0.1 11576 11 0\r\n\
+                     127.0.0.1 11585 0.0.0.0 0 2 0\r\n\
+                     192.168.1.4 50123 0.0.0.0 0 100 900\r\n\
+                     :: 3000 :: 0 2 6168\r\n\
+                     ::1 8080 :: 0 2 7\r\n\
+                     fe80::1%12 5000 :: 0 2 7\r\n\
+                     \r\n\
+                     garbage line\r\n";
+        let grouped = group(parse_tcp_table(table));
+        let pids: Vec<u32> = grouped.iter().map(|(pid, _)| *pid).collect();
+        assert_eq!(pids, vec![6168, 4, 69232, 44292, 7]);
+        assert_eq!(
+            grouped[0]
+                .1
+                .iter()
+                .map(|e| (e.address.as_str(), e.port, e.bind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("0.0.0.0", 3000, Bind::Wildcard),
+                ("::", 3000, Bind::Wildcard)
+            ]
+        );
+        assert_eq!(grouped[2].1[0].bind, Bind::Loopback);
+        // A remote address of its own is not a listener's shape; the
+        // listener itself is listed once.
+        assert_eq!(grouped[3].1.len(), 1);
+        assert_eq!(
+            grouped[4]
+                .1
+                .iter()
+                .map(|e| (e.address.as_str(), e.bind))
+                .collect::<Vec<_>>(),
+            vec![("::1", Bind::Loopback), ("fe80::1%12", Bind::Interface)]
+        );
+    }
+
     fn proc(ppid: u32, started_at: i64) -> Proc {
         Proc {
             ppid,
-            uid: Some(1),
+            uid: None,
             start: Some(format!("epoch:{started_at}")),
             started_at: Some(started_at),
             name: "node".into(),
