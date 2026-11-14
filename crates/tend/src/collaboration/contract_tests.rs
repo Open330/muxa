@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 fn actor(session: &str, pane: &str) -> Participant {
-    serde_json::from_value(json!({"agent_kind":"codex","agent_session_id":session,"pane":pane,"room":{"host":"rmux","socket":"test","window_id":"@1"},"socket":"test","cwd":"/repo","state":"idle","launch_purpose":"worker"})).unwrap()
+    serde_json::from_value(json!({"agent_kind":"codex","agent_session_id":session,"pane":pane,"room":{"host":"rmux","socket":"test","window_id":"@1"},"socket":"test","cwd":crate::test_paths::abs("/repo"),"state":"idle","launch_purpose":"worker"})).unwrap()
 }
 
 fn contract() -> TaskContract {

@@ -427,6 +427,10 @@ struct Fingerprint {
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    /// Where there is no inode (Windows), a file replaced through a rename
+    /// still shows a new creation time.
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
 }
 
 impl Fingerprint {
@@ -448,6 +452,8 @@ impl Fingerprint {
             dev: metadata.dev(),
             #[cfg(unix)]
             ino: metadata.ino(),
+            #[cfg(not(unix))]
+            created: metadata.created().ok(),
         }
     }
 }
@@ -1101,7 +1107,12 @@ mod tests {
         let mut cache = RolloutCache::default();
         cache.read("fresh", &path).unwrap();
         std::fs::write(&path, &next).unwrap();
-        File::open(&path).unwrap().set_modified(stamp).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
         let reading = cache.read("fresh", &path).unwrap();
         assert_eq!(
             reading.rate_limits.unwrap().five_hour.unwrap().used_percent,

@@ -340,8 +340,9 @@ mod tests {
         )
         .unwrap();
         let json = format!(
-            r#"{{"conversationId":"c","invocationNum":0,"transcriptPath":"{}"}}"#,
-            f.path().display()
+            r#"{{"conversationId":"c","invocationNum":0,"transcriptPath":{}}}"#,
+            // A JSON string: a Windows temp path has backslashes.
+            serde_json::to_string(&f.path().display().to_string()).unwrap()
         );
         match normalize("pre_invocation", &json) {
             AgentEvent::PromptSubmitted { prompt, .. } => assert_eq!(prompt, "ship it"),
@@ -449,8 +450,9 @@ mod tests {
         )
         .unwrap();
         let json = format!(
-            r#"{{"conversationId":"c","terminationReason":"NO_TOOL_CALL","error":"","fullyIdle":true,"transcriptPath":"{}"}}"#,
-            f.path().display()
+            r#"{{"conversationId":"c","terminationReason":"NO_TOOL_CALL","error":"","fullyIdle":true,"transcriptPath":{}}}"#,
+            // A JSON string: a Windows temp path has backslashes.
+            serde_json::to_string(&f.path().display().to_string()).unwrap()
         );
         match normalize("stop", &json) {
             AgentEvent::TurnStopped {

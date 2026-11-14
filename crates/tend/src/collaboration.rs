@@ -5983,7 +5983,7 @@ mod tests {
         let worker_a = participant("%2", "a");
         let worker_b = participant("%3", "b");
         let mut elsewhere = participant("%4", "c");
-        elsewhere.cwd = Some("/other-worktree".into());
+        elsewhere.cwd = Some(crate::test_paths::abs("/other-worktree"));
         let task = |paths: &[&str]| NewRequest {
             kind: RequestKind::Task,
             work_mode: WorkMode::Execute,
@@ -6050,16 +6050,20 @@ mod tests {
             .unwrap();
         // Sibling directories reaching the same files are one reservation.
         let mut left = participant("%5", "left");
-        left.cwd = Some("/mono/a".into());
+        left.cwd = Some(crate::test_paths::abs("/mono/a"));
         let mut right = participant("%6", "right");
-        right.cwd = Some("/mono/b".into());
+        right.cwd = Some(crate::test_paths::abs("/mono/b"));
         store
             .create(lead.clone(), left, task(&["../shared"]))
             .await
             .unwrap();
         assert!(matches!(
             store
-                .create(lead.clone(), right, task(&["/mono/shared/x.rs"]))
+                .create(
+                    lead.clone(),
+                    right,
+                    task(&[crate::test_paths::abs("/mono/shared/x.rs").as_str()])
+                )
                 .await,
             Err(CollaborationError::PathOverlap { .. })
         ));
@@ -6115,7 +6119,7 @@ mod tests {
             .await
             .unwrap();
         let mut pending = participant("%3", "pending-pane:default:%3");
-        pending.cwd = Some("/isolated".into());
+        pending.cwd = Some(crate::test_paths::abs("/isolated"));
         let queued = store.create(lead.clone(), pending, task).await.unwrap();
         // The session that registers in that pane works in the holder's
         // checkout: it does not get the request, which stays queued.
@@ -6131,13 +6135,13 @@ mod tests {
         assert_eq!(still.status, RequestStatus::Queued);
         // Working where the reservation was made, it adopts it.
         let mut adopter = participant("%3", "real-session");
-        adopter.cwd = Some("/isolated".into());
+        adopter.cwd = Some(crate::test_paths::abs("/isolated"));
         let claimed = store.claim_for(&adopter).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].to.agent_session_id, "real-session");
         assert_eq!(
             claimed[0].execute_scope.as_deref(),
-            Some(&["/isolated/src".to_owned()][..])
+            Some(&[crate::test_paths::abs("/isolated/src")][..])
         );
     }
 
@@ -6147,7 +6151,7 @@ mod tests {
         let lead = participant("%1", "lead");
         let holder = participant("%2", "holder");
         let mut isolated = participant("%3", "isolated");
-        isolated.cwd = Some("/isolated".into());
+        isolated.cwd = Some(crate::test_paths::abs("/isolated"));
         let successor = participant("%4", "successor");
         let task = NewRequest {
             kind: RequestKind::Task,
@@ -6166,7 +6170,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             moving.execute_scope.as_deref(),
-            Some(&["/isolated/src".to_owned()][..])
+            Some(&[crate::test_paths::abs("/isolated/src")][..])
         );
         // Its successor works in the checkout the holder is editing.
         let rebound = store
@@ -6175,7 +6179,7 @@ mod tests {
             .unwrap();
         assert!(rebound.is_none(), "the move is refused, the request stays");
         let mut elsewhere = participant("%5", "elsewhere");
-        elsewhere.cwd = Some("/isolated-2".into());
+        elsewhere.cwd = Some(crate::test_paths::abs("/isolated-2"));
         let rebound = store
             .rebind_recipient(&moving.id, &isolated, elsewhere)
             .await
@@ -6183,7 +6187,7 @@ mod tests {
             .expect("a free checkout takes it");
         assert_eq!(
             rebound.execute_scope.as_deref(),
-            Some(&["/isolated-2/src".to_owned()][..])
+            Some(&[crate::test_paths::abs("/isolated-2/src")][..])
         );
     }
 
@@ -6558,7 +6562,7 @@ mod tests {
             tmux_session_name: Some("main".into()),
             window_name: Some("feature".into()),
             state: AgentState::Idle,
-            cwd: Some("/repo".into()),
+            cwd: Some(crate::test_paths::abs("/repo")),
             alias: None,
             roles: Vec::new(),
             console: false,
@@ -6731,7 +6735,7 @@ mod tests {
                         surface: None,
                         pane: Some(pane.into()),
                         tmux_socket: Some("default".into()),
-                        cwd: Some("/repo".into()),
+                        cwd: Some(crate::test_paths::abs("/repo")),
                     },
                     at: OffsetDateTime::now_utc(),
                 })
@@ -6796,7 +6800,7 @@ mod tests {
                     surface: None,
                     pane: Some("%1".into()),
                     tmux_socket: Some("default".into()),
-                    cwd: Some("/repo".into()),
+                    cwd: Some(crate::test_paths::abs("/repo")),
                 },
                 at: OffsetDateTime::now_utc(),
             })
@@ -6920,7 +6924,7 @@ mod tests {
             surface: None,
             pane: Some("%2".into()),
             tmux_socket: Some("default".into()),
-            cwd: Some("/repo".into()),
+            cwd: Some(crate::test_paths::abs("/repo")),
         };
         store
             .apply(&crate::event::AgentEvent::Started {
@@ -7157,7 +7161,7 @@ mod tests {
                     surface: None,
                     pane: Some("%1".into()),
                     tmux_socket: Some("default".into()),
-                    cwd: Some("/repo".into()),
+                    cwd: Some(crate::test_paths::abs("/repo")),
                 },
                 at: OffsetDateTime::now_utc(),
             })
@@ -7261,7 +7265,7 @@ mod tests {
                 surface: None,
                 pane: Some("%1".into()),
                 tmux_socket: Some("default".into()),
-                cwd: Some("/repo".into()),
+                cwd: Some(crate::test_paths::abs("/repo")),
             },
             at: OffsetDateTime::now_utc(),
         };
@@ -9919,6 +9923,9 @@ mod tests {
         assert_eq!(second_page.requests.len(), 2);
     }
 
+    // Renames the open database away; Windows refuses that (file in use),
+    // so the case it fences cannot arise there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn missing_database_fences_reads_writes_and_requires_reload() {
         let dir = tempfile::tempdir().unwrap();

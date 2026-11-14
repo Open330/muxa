@@ -18,7 +18,7 @@ fn agent(pane: &str, session: &str) -> Participant {
         tmux_session_name: Some("main".into()),
         window_name: Some("feature".into()),
         state: AgentState::Idle,
-        cwd: Some("/repo".into()),
+        cwd: Some(crate::test_paths::abs("/repo")),
         alias: None,
         roles: Vec::new(),
         console: false,

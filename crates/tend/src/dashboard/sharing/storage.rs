@@ -297,7 +297,8 @@ impl Sharing {
     }
 }
 
-#[cfg(test)]
+// Only the sharing tests use these, and they run on Unix (see `mod tests`).
+#[cfg(all(test, unix))]
 impl Storage {
     pub(super) fn test_block_next_write(&self) -> WriteGate {
         let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));

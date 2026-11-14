@@ -18,6 +18,36 @@ pub const SNAPSHOT_DIRNAME: &str = "snapshots";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
 pub const BACKUPS_DIRNAME: &str = "backups";
 
+/// Whether `path` is absolute where it will be used. On this host that is
+/// this platform's rule. A path for a request another Fleet host runs is
+/// that host's, whose platform this one cannot assume: it must be absolute in
+/// Unix form (`/srv/x`) or Windows form (`C:\x`, `\\server\share`), and that
+/// host checks it again by its own rule when it runs the request.
+#[must_use]
+pub fn absolute_where_used(path: &std::path::Path, on_another_host: bool) -> bool {
+    if path.is_absolute() {
+        return true;
+    }
+    if !on_another_host {
+        return false;
+    }
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    text.starts_with('/')
+        || text.starts_with(r"\\")
+        || (bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+/// Whether a request's Fleet `host` alias names another host (absent or
+/// `local` is this one).
+#[must_use]
+pub fn is_remote_host(host: Option<&str>) -> bool {
+    host.is_some_and(|host| host.trim() != "local")
+}
+
 /// [`std::fs::canonicalize`] in the form the rest of the system writes paths.
 ///
 /// Windows canonicalizes to a verbatim path (`\\?\F:\work`), which no shell,
@@ -193,6 +223,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn another_hosts_path_is_absolute_in_either_platforms_form() {
+        use std::path::Path;
+        for path in ["/srv/x", r"C:\x", "C:/x", r"\\server\share"] {
+            assert!(absolute_where_used(Path::new(path), true), "{path}");
+        }
+        for path in ["srv", r"C:x", r"..\x", ""] {
+            assert!(!absolute_where_used(Path::new(path), true), "{path}");
+        }
+        // Here, this platform's own rule.
+        assert_eq!(
+            absolute_where_used(Path::new("/srv/x"), false),
+            Path::new("/srv/x").is_absolute()
+        );
+        assert!(!absolute_where_used(Path::new("srv"), false));
+        assert!(is_remote_host(Some("dev")));
+        assert!(!is_remote_host(Some("local")));
+        assert!(!is_remote_host(None));
+    }
+
+    #[test]
     fn verbatim_windows_paths_come_back_plain() {
         let plain = |raw: &str| without_verbatim_prefix(PathBuf::from(raw));
         assert_eq!(
@@ -214,9 +264,10 @@ mod tests {
 
     #[test]
     fn explicit_xdg_paths_support_sandbox_isolation_on_every_platform() {
+        let data = crate::test_paths::abs("/tmp/tend-test/data");
         assert_eq!(
-            absolute_override(Some("/tmp/tend-test/data".into())),
-            Some(PathBuf::from("/tmp/tend-test/data"))
+            absolute_override(Some(data.clone().into())),
+            Some(PathBuf::from(data))
         );
         assert_eq!(absolute_override(Some("relative/data".into())), None);
         assert_eq!(absolute_override(Some("".into())), None);

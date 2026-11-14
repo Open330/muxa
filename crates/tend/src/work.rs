@@ -1489,7 +1489,7 @@ mod tests {
 
         let record = WorkEdit {
             title: Some("x".into()),
-            cwd: Some("/src/tend".into()),
+            cwd: Some(crate::test_paths::abs("/src/tend")),
             acceptance: Some(vec![" tests pass ".into()]),
             checks: Some(checks),
             ..WorkEdit::default()
@@ -1542,7 +1542,7 @@ mod tests {
         };
         let declare = |command: &str| WorkEdit {
             title: Some("x".into()),
-            cwd: Some("/src".into()),
+            cwd: Some(crate::test_paths::abs("/src")),
             checks: Some(vec![WorkCheck::new(command)]),
             ..WorkEdit::default()
         };
@@ -1588,7 +1588,7 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let declared = WorkEdit {
             title: Some("x".into()),
-            cwd: Some("/original".into()),
+            cwd: Some(crate::test_paths::abs("/original")),
             checks: Some(vec![WorkCheck::new("cargo test")]),
             ..WorkEdit::default()
         }
@@ -1596,14 +1596,20 @@ mod tests {
         .unwrap();
         // Any caller may still edit the plan's cwd, but not where the checks run.
         let moved = WorkEdit {
-            cwd: Some("/elsewhere".into()),
+            cwd: Some(crate::test_paths::abs("/elsewhere")),
             ..WorkEdit::default()
         }
         .apply(&identity, Some(declared), now)
         .unwrap();
         let plan = moved.plan.unwrap();
-        assert_eq!(plan.cwd.as_deref(), Some("/elsewhere"));
-        assert_eq!(plan.checks_dir(), Some("/original"));
+        assert_eq!(
+            plan.cwd.as_deref(),
+            Some(crate::test_paths::abs("/elsewhere").as_str())
+        );
+        assert_eq!(
+            plan.checks_dir(),
+            Some(crate::test_paths::abs("/original").as_str())
+        );
     }
 
     #[test]
@@ -1613,14 +1619,14 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let declared = WorkEdit {
             title: Some("x".into()),
-            cwd: Some("/repo".into()),
+            cwd: Some(crate::test_paths::abs("/repo")),
             checks: Some(vec![WorkCheck::new("cargo test")]),
             ..WorkEdit::default()
         }
         .apply_as(&identity, None, now, &Declarer::Operator)
         .unwrap();
         let repin = || WorkEdit {
-            verify_cwd: Some("/worktrees/ENG-5".into()),
+            verify_cwd: Some(crate::test_paths::abs("/worktrees/ENG-5")),
             ..WorkEdit::default()
         };
         assert!(repin()
@@ -1639,6 +1645,9 @@ mod tests {
         let moved = repin()
             .apply_as(&identity, Some(declared), now, &Declarer::Operator)
             .unwrap();
-        assert_eq!(moved.plan.unwrap().checks_dir(), Some("/worktrees/ENG-5"));
+        assert_eq!(
+            moved.plan.unwrap().checks_dir(),
+            Some(crate::test_paths::abs("/worktrees/ENG-5").as_str())
+        );
     }
 }

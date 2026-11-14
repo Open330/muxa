@@ -1559,6 +1559,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn bounded_command_returns_fast_output() {
         let mut cmd = std::process::Command::new("sh");
@@ -1580,6 +1581,7 @@ mod tests {
     /// then returned nothing and every status row fell back to a raw `%42`.
     /// 1 MiB clears both the 64 KB default capacity and the one-page minimum
     /// a host over `fs.pipe-user-pages-soft` hands out.
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn bounded_command_drains_output_larger_than_a_pipe_buffer() {
         const MIB: usize = 1024 * 1024;
@@ -1601,6 +1603,7 @@ mod tests {
 
     /// Same deadlock, stderr side: a child that only writes to stderr must
     /// not stall either, and its bytes must survive into `Output`.
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn bounded_command_drains_large_stderr() {
         const MIB: usize = 1024 * 1024;
@@ -1621,6 +1624,7 @@ mod tests {
         assert!(out.stdout.is_empty());
     }
 
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn bounded_command_times_out_slow_process() {
         let mut cmd = std::process::Command::new("sh");

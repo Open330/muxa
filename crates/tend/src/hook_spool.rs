@@ -397,10 +397,9 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         append(&path, &entry("a", now, IngestFailure::Unreachable)).unwrap();
         // Force a rotation on the next append.
-        let big = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
+        // `write`, not `append`: Windows resizes only through a handle with
+        // write (not just append) access.
+        let big = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         big.set_len(MAX_SPOOL_BYTES).unwrap();
         append(&path, &entry("b", now, IngestFailure::Timeout)).unwrap();
         assert!(rotated_path(&path).exists());

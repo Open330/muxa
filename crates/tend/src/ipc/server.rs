@@ -250,7 +250,7 @@ impl Server {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))] // its tests unlink a Unix socket file
     #[must_use]
     pub(super) fn with_endpoint_check(mut self, interval: Duration) -> Self {
         self.endpoint_check = interval;

@@ -209,7 +209,10 @@ impl AgentStartRequest {
         {
             return invalid("host alias is empty");
         }
-        if !self.cwd.is_absolute() {
+        if !crate::paths::absolute_where_used(
+            &self.cwd,
+            crate::paths::is_remote_host(self.host.as_deref()),
+        ) {
             return invalid("cwd must be an absolute path");
         }
         let target = present(self.target.as_deref());
@@ -518,7 +521,7 @@ mod tests {
             target: None,
             tmux_socket: None,
             direction: None,
-            cwd: PathBuf::from("/srv/app"),
+            cwd: crate::test_paths::abs_path("/srv/app"),
             prompt: None,
             name: None,
             role: None,
@@ -536,6 +539,7 @@ mod tests {
         pane.role = Some("reviewer".into());
         pane.options = Some(vec!["--model".into(), "opus".into()]);
         pane.validate().unwrap();
+        let cwd = format!("--cwd={}", crate::test_paths::abs("/srv/app"));
         assert_eq!(
             pane.arguments(),
             [
@@ -547,7 +551,7 @@ mod tests {
                 "--placement=pane",
                 "--target=%12",
                 "--direction=down",
-                "--cwd=/srv/app",
+                cwd.as_str(),
                 "--prompt=-v means verbose; review it",
                 "--role=reviewer",
                 "--option=--model",
@@ -565,6 +569,7 @@ mod tests {
             .env
             .insert("PATH".into(), "/opt/homebrew/bin:/usr/bin".into());
         native.validate().unwrap();
+        let cwd = format!("--cwd={}", crate::test_paths::abs("/srv/app"));
         assert_eq!(
             native.arguments(),
             [
@@ -574,7 +579,7 @@ mod tests {
                 "--agent=claude",
                 "--host=native",
                 "--direction=auto",
-                "--cwd=/srv/app",
+                cwd.as_str(),
                 "--name=claude",
             ]
         );
