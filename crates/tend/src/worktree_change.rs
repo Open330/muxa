@@ -403,11 +403,19 @@ fn delete(
         Err(why) => return outcome(&receipt, Outcome::Refused, why),
     };
     let dest = receipt.location().to_path_buf();
+    let guard = if guarded_delete() {
+        match delete_guard(&dest, op_id) {
+            Ok(guard) => Some(guard),
+            Err(why) => return outcome(&receipt, Outcome::Refused, why),
+        }
+    } else {
+        None
+    };
     receipt.pending = Some(PendingChange {
         op_id: op_id.into(),
         action: ChangeAction::Delete,
         from: dest.clone(),
-        to: dest.clone(),
+        to: guard.clone().unwrap_or_else(|| dest.clone()),
         head: head.clone(),
         branch: item.branch.clone(),
         started_at: OffsetDateTime::now_utc(),
@@ -424,11 +432,70 @@ fn delete(
     if let Err(why) = pin(&receipt.repo, &pin_name(&receipt.id, &head), &head) {
         return undo_pending(dir, receipt, why);
     }
+    let target = match &guard {
+        None => dest,
+        Some(guard) => {
+            // Windows will not rename a directory that is, or holds, any
+            // process's current directory, including a process whose
+            // directory tend could not read. A refusal here is that lock.
+            let moved = run_git(
+                &receipt.repo,
+                &[
+                    "worktree".as_ref(),
+                    "move".as_ref(),
+                    dest.as_os_str(),
+                    guard.as_os_str(),
+                ],
+            );
+            if moved != Some(true) {
+                return finish(
+                    dir,
+                    receipt,
+                    moved,
+                    "Windows would not move it, so something is still working in it; nothing was deleted",
+                );
+            }
+            guard.clone()
+        }
+    };
     let removed = run_git(
         &receipt.repo,
-        &["worktree".as_ref(), "remove".as_ref(), dest.as_os_str()],
+        &["worktree".as_ref(), "remove".as_ref(), target.as_os_str()],
     );
     finish(dir, receipt, removed, "git refused to delete it")
+}
+
+/// Whether a delete first moves the worktree to a fresh name and deletes
+/// it there. On Windows, tend skips processes whose directory it cannot
+/// read (elevated or protected ones, even the user's own), so it cannot
+/// tell that nothing works inside; but Windows refuses to rename a tree a
+/// process is in. `git worktree remove` unlinks files before it reaches a
+/// locked directory, so it must only ever run on a tree that just moved.
+fn guarded_delete() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = tests::GUARDED_DELETE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    cfg!(windows)
+}
+
+/// `<set-aside dest>.deleting.<op prefix>`, beside it and free.
+fn delete_guard(dest: &Path, op_id: &str) -> Result<PathBuf, String> {
+    let name = dest
+        .file_name()
+        .ok_or("it has no folder name")?
+        .to_string_lossy()
+        .into_owned();
+    let short: String = op_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    let guard = dest.with_file_name(format!("{name}.deleting.{short}"));
+    match std::fs::symlink_metadata(&guard) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(guard),
+        _ => Err(format!("something is already at {}", guard.display())),
+    }
 }
 
 /// `<parent>/.tend-set-aside/<name>.<id prefix>`, with the set-aside folder
@@ -578,19 +645,33 @@ fn reconcile(dir: &Path, mut receipt: WorktreeReceipt) -> Settled {
                 _ => None,
             }
         }
+        // Moved to its delete name but not deleted: still set aside, there.
+        ChangeAction::Delete
+            if pending.to != pending.from
+                && from == Place::Absent
+                && place(&receipt, &pending.to) == Place::Here =>
+        {
+            if let Some(aside) = receipt.set_aside.as_mut() {
+                aside.dest.clone_from(&pending.to);
+            }
+            Some(false)
+        }
         ChangeAction::Delete => match from {
             // Gone as a delete leaves it; trust that only while the pin
-            // that keeps its commit is there.
+            // that keeps its commit is there (and, for a guarded delete,
+            // while nothing is at its delete name either).
             Place::Absent
-                if run_git(
-                    &receipt.repo,
-                    &[
-                        "rev-parse".as_ref(),
-                        "--verify".as_ref(),
-                        "--quiet".as_ref(),
-                        pin_name(&receipt.id, &pending.head).as_ref(),
-                    ],
-                ) == Some(true) =>
+                if (pending.to == pending.from
+                    || place(&receipt, &pending.to) == Place::Absent)
+                    && run_git(
+                        &receipt.repo,
+                        &[
+                            "rev-parse".as_ref(),
+                            "--verify".as_ref(),
+                            "--quiet".as_ref(),
+                            pin_name(&receipt.id, &pending.head).as_ref(),
+                        ],
+                    ) == Some(true) =>
             {
                 Some(true)
             }
@@ -681,6 +762,16 @@ fn branch_at(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::worktree_receipt::ReceiptOrigin;
+
+    thread_local! {
+        /// Forces [`guarded_delete`] for this test thread.
+        pub(super) static GUARDED_DELETE: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    fn guarded(on: bool) {
+        GUARDED_DELETE.with(|cell| cell.set(Some(on)));
+    }
 
     fn run_git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -856,6 +947,130 @@ mod tests {
         assert!(!r.set_aside.unwrap().dest.exists());
         // The branch stays.
         run_git(&f.repo, &["rev-parse", "--verify", "feat"]);
+    }
+
+    fn registered(repo: &Path, path: &Path) -> bool {
+        matches!(
+            worktree_inventory::registration(repo, path),
+            Some(Registration::Registered | Registration::Locked)
+        )
+    }
+
+    #[test]
+    fn a_guarded_delete_moves_the_tree_then_deletes_it_there() {
+        guarded(true);
+        let f = fixture();
+        assert_eq!(
+            f.run("op1", ChangeAction::SetAside, vec![f.item()])[0].outcome,
+            Outcome::Done
+        );
+        let dest = f.current().set_aside.unwrap().dest;
+        let out = f.run("op2-del", ChangeAction::Delete, vec![f.item()]);
+        assert_eq!(out[0].outcome, Outcome::Done, "{out:?}");
+        assert_eq!(f.current().state, ReceiptState::Deleted);
+        assert!(!dest.exists());
+        assert!(!delete_guard(&dest, "op2-del").unwrap().exists());
+        run_git(&f.repo, &["rev-parse", "--verify", "feat"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_guarded_delete_that_cannot_move_the_tree_deletes_nothing() {
+        // A read-only set-aside folder stands in for Windows refusing to
+        // rename a tree a process works in: the move fails the same way.
+        use std::os::unix::fs::PermissionsExt;
+        guarded(true);
+        let f = fixture();
+        assert_eq!(
+            f.run("op1", ChangeAction::SetAside, vec![f.item()])[0].outcome,
+            Outcome::Done
+        );
+        let dest = f.current().set_aside.unwrap().dest;
+        let aside = dest.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = f.run("op2", ChangeAction::Delete, vec![f.item()]);
+        std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out[0].outcome, Outcome::Refused, "{out:?}");
+        assert!(out[0].message.contains("nothing was deleted"), "{out:?}");
+        assert_eq!(std::fs::read_to_string(dest.join("a")).unwrap(), "a");
+        assert!(registered(&f.repo, &dest));
+        let after = f.current();
+        assert_eq!(after.state, ReceiptState::SetAside);
+        assert!(after.pending.is_none());
+    }
+
+    #[test]
+    fn a_guarded_delete_interrupted_after_the_move_stays_set_aside_there() {
+        guarded(true);
+        let f = fixture();
+        assert_eq!(
+            f.run("op1", ChangeAction::SetAside, vec![f.item()])[0].outcome,
+            Outcome::Done
+        );
+        let mut r = f.current();
+        let dest = r.set_aside.clone().unwrap().dest;
+        let guard = delete_guard(&dest, "crash").unwrap();
+        let head = run_git(&dest, &["rev-parse", "HEAD"]);
+        r.pending = Some(PendingChange {
+            op_id: "crash".into(),
+            action: ChangeAction::Delete,
+            from: dest.clone(),
+            to: guard.clone(),
+            head,
+            branch: Some("feat".into()),
+            started_at: OffsetDateTime::now_utc(),
+        });
+        r.save_in(&f.receipts).unwrap();
+        run_git(
+            &f.repo,
+            &[
+                "worktree",
+                "move",
+                dest.to_str().unwrap(),
+                guard.to_str().unwrap(),
+            ],
+        );
+        f.run("check", ChangeAction::Delete, vec![]);
+        let after = f.current();
+        assert!(after.pending.is_none());
+        assert_eq!(after.state, ReceiptState::SetAside);
+        assert_eq!(after.location(), guard.as_path());
+        assert!(guard.join("a").exists());
+        // And a delete from there finishes the job.
+        let out = f.run("again", ChangeAction::Delete, vec![f.item()]);
+        assert_eq!(out[0].outcome, Outcome::Done, "{out:?}");
+        assert!(!guard.exists());
+    }
+
+    /// The case the guard exists for: a process tend does not see (here it
+    /// is simply left out of the observation, as an elevated one would be)
+    /// works inside a set-aside tree. Nothing of the tree may go.
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_to_delete_a_tree_an_unseen_process_works_in() {
+        let f = fixture();
+        assert_eq!(
+            f.run("op1", ChangeAction::SetAside, vec![f.item()])[0].outcome,
+            Outcome::Done
+        );
+        let dest = f.current().set_aside.unwrap().dest;
+        let mut holder = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 60 127.0.0.1 >NUL"])
+            .current_dir(&dest)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let out = f.run("op2", ChangeAction::Delete, vec![f.item()]);
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert_eq!(out[0].outcome, Outcome::Refused, "{out:?}");
+        assert_eq!(std::fs::read_to_string(dest.join("a")).unwrap(), "a");
+        assert!(registered(&f.repo, &dest));
+        assert!(crate::worktree_receipt::admin_dir(&dest).is_some_and(|admin| admin.is_dir()));
+        assert_eq!(f.current().state, ReceiptState::SetAside);
+        // With the process gone it deletes.
+        let out = f.run("op3", ChangeAction::Delete, vec![f.item()]);
+        assert_eq!(out[0].outcome, Outcome::Done, "{out:?}");
     }
 
     #[test]
