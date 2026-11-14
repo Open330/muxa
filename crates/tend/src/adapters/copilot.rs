@@ -20,7 +20,7 @@
 //! | `postToolUse` / `postToolUseFailure` | `ToolCompleted` |
 //! | `notification` (`permission_prompt`) | `NotificationFired` waiting |
 //! | `agentStop` | `TurnStopped`, answer read from `transcriptPath` |
-//! | `errorOccurred` | `NotificationFired` error |
+//! | `errorOccurred` | `NotificationFired`: warning while `recoverable` (Copilot retries), else error |
 //! | `sessionEnd` | `SessionEnded` |
 //!
 //! `permissionRequest` is **not** a wait: on 1.0.110 it also fires for a
@@ -141,9 +141,14 @@ pub struct Input {
     /// `agentStop`: `end_turn` on a clean turn.
     #[serde(default)]
     pub stop_reason: Option<String>,
-    /// `errorOccurred`: a string or an object with `message`.
+    /// `errorOccurred`: `{message, name, stack}`; `postToolUseFailure`: a
+    /// string.
     #[serde(default)]
     pub error: Option<Value>,
+    /// `errorOccurred`: Copilot retries a recoverable error itself (a
+    /// dropped model connection fires one per retry, all `true`).
+    #[serde(default)]
+    pub recoverable: Option<bool>,
 }
 
 impl Input {
@@ -181,6 +186,10 @@ impl Input {
                 .map_or_else(|| value.to_string(), str::to_string),
             None => self.message.clone().unwrap_or_else(|| "error".into()),
         }
+        // 1.0.110 quotes the message inside the string (`"\"WebSocket …\""`).
+        .trim()
+        .trim_matches('"')
+        .to_string()
     }
 }
 
@@ -269,6 +278,15 @@ fn normalize(event: Event, input: Input, pane: Option<String>) -> Option<AgentEv
             ai_title: None,
             // Reserved for producers that observed the pane go idle.
             idle_confirmed: false,
+            id,
+            at,
+        },
+        // A recoverable error is one Copilot is retrying: a warning, not a
+        // failed row. When the retries run out Copilot fires no further hook
+        // (it logs `session.error`), which the session-log reader settles.
+        Event::ErrorOccurred if input.recoverable == Some(true) => AgentEvent::NotificationFired {
+            level: NotificationLevel::Warning,
+            message: truncate(format!("copilot (retrying): {}", input.error_text()), 1_000),
             id,
             at,
         },
@@ -454,18 +472,42 @@ mod tests {
             one("post_tool_use", failed),
             AgentEvent::ToolCompleted { success: false, .. }
         ));
-        assert!(matches!(
-            one(
-                "post_tool_use_failure",
-                r#"{"sessionId":"s","toolName":"bash"}"#
-            ),
-            AgentEvent::ToolCompleted { success: false, .. }
-        ));
+        // Recorded on 1.0.110: a `view` of a missing file, then a model
+        // connection dropped mid-answer (one `errorOccurred` per retry).
+        let real: Vec<AgentEvent> = include_str!("testdata/copilot-1.0.110-failures.jsonl")
+            .lines()
+            .map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                one(
+                    record["event"].as_str().unwrap(),
+                    &record["input"].to_string(),
+                )
+            })
+            .collect();
+        match &real[0] {
+            AgentEvent::ToolCompleted { tool, success, .. } => {
+                assert_eq!(tool, "view");
+                assert!(!success);
+            }
+            other => panic!("{other:?}"),
+        }
+        for event in &real[1..] {
+            match event {
+                AgentEvent::NotificationFired { level, message, .. } => {
+                    // Copilot is retrying: not a failed row.
+                    assert_eq!(*level, NotificationLevel::Warning);
+                    assert!(message.starts_with("copilot (retrying): "), "{message}");
+                    assert!(!message.contains('"'), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // An error Copilot does not retry fails the row.
         for error in [
             r#""rate limited""#,
             r#"{"message":"rate limited","name":"x"}"#,
         ] {
-            let json = format!(r#"{{"sessionId":"s","error":{error}}}"#);
+            let json = format!(r#"{{"sessionId":"s","recoverable":false,"error":{error}}}"#);
             match one("error_occurred", &json) {
                 AgentEvent::NotificationFired { level, message, .. } => {
                     assert_eq!(level, NotificationLevel::Error);

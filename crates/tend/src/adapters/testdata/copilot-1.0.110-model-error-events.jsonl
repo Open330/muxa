@@ -1,0 +1,5 @@
+{"type": "user.message", "timestamp": "2026-11-14T16:54:55.369Z", "data": {"content": "", "source": "memory"}}
+{"type": "user.message", "timestamp": "2026-11-14T16:54:55.370Z", "data": {"content": "Write the numbers from 1 to 600, one per line, with no other text."}}
+{"type": "assistant.turn_start", "timestamp": "2026-11-14T16:54:55.378Z", "data": {"turnId": "0"}}
+{"type": "assistant.turn_end", "timestamp": "2026-11-14T16:55:26.486Z", "data": {"turnId": "0"}}
+{"type": "session.error", "timestamp": "2026-11-14T16:55:26.487Z", "data": {"errorType": "query", "message": "Execution failed: Failed to get response from the AI model; retried 5 times (total retry wait time: 23.00 seconds) Last error: Failed native model HTTP request: error sending request for url (https://api.individual.githubcopilot.com/responses): client error (Connect): tunnel error: unsuccessful: proxy CONNECT failed with status 502 Bad Gateway"}}
