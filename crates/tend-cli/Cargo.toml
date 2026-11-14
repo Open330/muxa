@@ -31,11 +31,6 @@ tend-aas = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
-# Signal forwarding for interactive tmux/ssh attach children, so the
-# `--fit` restore guards run when the surrounding PTY hangs up. Both are
-# already in the dependency graph; they only add safe wrappers here.
-signal-hook = "0.3"
-nix = { version = "0.29", features = ["signal"] }
 dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -83,6 +78,14 @@ reqwest = { workspace = true }
 unicode-width = "0.2"
 # Cryptographically-strong dashboard tokens via the OS RNG.
 rand = "0.8"
+
+# Signal forwarding for interactive tmux/ssh attach children, so the
+# `--fit` restore guards run when the surrounding PTY hangs up. Both are
+# already in the dependency graph; they only add safe wrappers here. Unix
+# only: nothing uses them on Windows.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+nix = { version = "0.29", features = ["signal"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # `tend reload` reads each pane's argv with its argument boundaries (macOS
