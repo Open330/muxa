@@ -584,6 +584,15 @@ fn parse_pane_observation(stdout: &str, endpoint: Option<&str>) -> PaneObservati
 fn rmux_command(endpoint: Option<&str>) -> Command {
     let mut command = Command::new(rmux_binary());
     command.env("LC_ALL", "en_US.UTF-8");
+    if endpoint.is_none_or(|endpoint| endpoint.trim().is_empty())
+        && !crate::tmux::scanner::ambient_mux_allowed()
+    {
+        // No endpoint and not allowed the user's servers: rmux's default
+        // server (or an inherited `$RMUX`) would be the user's. Point it
+        // nowhere instead.
+        fail_closed(&mut command);
+        return command;
+    }
     if let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) {
         // rmux 0.10 can let an inherited pane override an explicit grouped
         // window target in display-message, returning empty identity fields.
@@ -594,6 +603,20 @@ fn rmux_command(endpoint: Option<&str>) -> Command {
     }
     command
 }
+
+/// An rmux command that can reach no server: no inherited endpoint or pane,
+/// and an explicit socket that does not exist.
+fn fail_closed(command: &mut Command) {
+    command
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .arg("-S")
+        .arg(UNREACHABLE_SOCKET);
+}
+
+const UNREACHABLE_SOCKET: &str = "/nonexistent/tend-not-the-users-daemon/rmux";
 
 /// The pipe the server behind `endpoint` listens on now.
 ///
@@ -1034,5 +1057,25 @@ mod tests {
             Some("/tmp/rmux-501/default")
         );
         assert_eq!(ambient_endpoint_with(false, env), None);
+    }
+
+    #[test]
+    fn a_fail_closed_command_names_only_an_unreachable_socket() {
+        let mut command = Command::new("rmux");
+        fail_closed(&mut command);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-S", UNREACHABLE_SOCKET]);
+        assert!(!std::path::Path::new(UNREACHABLE_SOCKET).exists());
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE"] {
+            assert!(removed.iter().any(|k| k == key), "{key}");
+        }
     }
 }

@@ -1492,6 +1492,11 @@ fn doctor_mux_command() -> Option<Command> {
     if !doctor_uses_rmux() {
         return Some(tend::tmux::tmux_command_scoped());
     }
+    // Aimed at a daemon that is not the user's: neither the inherited rmux
+    // server nor its default socket is this check's to read.
+    if !tend::tmux::scanner::ambient_mux_allowed() {
+        return None;
+    }
     let endpoint = tend::backend::rmux::endpoint_from_env();
     #[cfg(windows)]
     let endpoint = endpoint?; // Never ask an unscoped Windows rmux to start a server.

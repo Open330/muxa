@@ -1162,35 +1162,73 @@ impl MoveMenu {
 }
 
 fn endpoint(args: &MoveArgs) -> Result<BackendEndpoint> {
-    let host = match args.host {
-        Some(HostArg::Rmux) => HostKind::Rmux,
-        // Which host is identity, not permission: an explicit rmux socket,
-        // or a `$RMUX` this process runs under, says rmux even when that
-        // inherited endpoint may not be borrowed.
-        None if args.pane.as_deref().is_some_and(|p| p.starts_with("rmux:"))
-            || args
-                .server_socket
-                .as_deref()
-                .is_some_and(tend::backend::rmux::is_endpoint)
-            || tend::backend::rmux::endpoint_from_env().is_some() =>
-        {
-            HostKind::Rmux
-        }
-        Some(HostArg::Tmux) | None => HostKind::Tmux,
-    };
-    let socket = args
-        .server_socket
-        .clone()
-        .or_else(|| match host {
-            HostKind::Rmux => tend::backend::rmux::ambient_endpoint(),
-            // Never the user's server for a command aimed at another daemon.
-            _ if !tend::tmux::scanner::ambient_mux_allowed() => None,
-            _ => std::env::var("TMUX")
+    resolve_endpoint(
+        args.host.map(|host| match host {
+            HostArg::Tmux => HostKind::Tmux,
+            HostArg::Rmux => HostKind::Rmux,
+        }),
+        args.pane.as_deref(),
+        args.server_socket.as_deref(),
+        &AmbientMux::from_env(),
+    )
+    .context("no server endpoint; specify --server-socket and --host")
+}
+
+/// What this process's environment says about the multiplexer it runs in,
+/// and whether it may use that server (see
+/// `tend::tmux::scanner::ambient_mux_allowed`).
+pub(crate) struct AmbientMux {
+    pub rmux: Option<String>,
+    pub tmux: Option<String>,
+    pub allowed: bool,
+}
+
+impl AmbientMux {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            rmux: tend::backend::rmux::endpoint_from_env(),
+            tmux: std::env::var("TMUX")
                 .ok()
                 .and_then(|v| v.split(',').next().map(str::to_string)),
-        })
-        .context("no server endpoint; specify --server-socket and --host")?;
-    Ok(BackendEndpoint { host, socket })
+            allowed: tend::tmux::scanner::ambient_mux_allowed(),
+        }
+    }
+}
+
+/// The server a move or the sidebar acts on. The host is, in order: the one
+/// `--host` names, the kind of an explicit socket, an `rmux:` pane, the
+/// host this process runs in. The socket is the explicit one, else, only
+/// when `ambient.allowed`, the one this process runs under. A command aimed
+/// at a daemon that is not the user's never borrows that.
+pub(crate) fn resolve_endpoint(
+    host: Option<HostKind>,
+    pane: Option<&str>,
+    explicit: Option<&str>,
+    ambient: &AmbientMux,
+) -> Option<BackendEndpoint> {
+    let host = host.unwrap_or_else(|| {
+        if let Some(socket) = explicit {
+            if tend::backend::rmux::is_endpoint(socket) {
+                HostKind::Rmux
+            } else {
+                HostKind::Tmux
+            }
+        } else if pane.is_some_and(|p| p.starts_with("rmux:")) || ambient.rmux.is_some() {
+            HostKind::Rmux
+        } else {
+            HostKind::Tmux
+        }
+    });
+    let socket = explicit.map(str::to_owned).or_else(|| {
+        if !ambient.allowed {
+            return None;
+        }
+        match host {
+            HostKind::Rmux => ambient.rmux.clone(),
+            _ => ambient.tmux.clone(),
+        }
+    })?;
+    Some(BackendEndpoint { host, socket })
 }
 
 fn resolve_source_pane(control: &Control, args: &MoveArgs) -> Result<String> {
@@ -1376,19 +1414,37 @@ fn interactive(menu: &mut MoveMenu) -> Result<Option<MoveOutcome>> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn an_explicit_rmux_socket_is_rmux_without_borrowing_any_endpoint() {
-        use clap::Parser;
-        #[derive(Parser)]
-        struct Wrap {
-            #[command(flatten)]
-            args: super::MoveArgs,
+    fn an_explicit_socket_decides_the_host_and_nothing_inherited_is_borrowed_when_restricted() {
+        use super::{resolve_endpoint, AmbientMux};
+        use tend::HostKind::{Rmux, Tmux};
+        let inside = |rmux: bool, allowed: bool| AmbientMux {
+            rmux: rmux.then(|| "/tmp/rmux-501/owner".to_owned()),
+            tmux: Some("/tmp/tmux-501/owner".to_owned()),
+            allowed,
+        };
+        for rmux_env in [false, true] {
+            for allowed in [false, true] {
+                let ambient = inside(rmux_env, allowed);
+                let e =
+                    resolve_endpoint(None, None, Some("/tmp/rmux-501/private"), &ambient).unwrap();
+                assert_eq!((e.host, e.socket.as_str()), (Rmux, "/tmp/rmux-501/private"));
+                let e =
+                    resolve_endpoint(None, None, Some("/tmp/tmux-501/private"), &ambient).unwrap();
+                assert_eq!((e.host, e.socket.as_str()), (Tmux, "/tmp/tmux-501/private"));
+                // `--host` wins over the socket's look.
+                let e = resolve_endpoint(Some(Rmux), None, Some("/x/sock"), &ambient).unwrap();
+                assert_eq!(e.host, Rmux);
+                // No explicit socket: borrowed only when allowed.
+                let found = resolve_endpoint(None, Some("%1"), None, &ambient);
+                assert_eq!(
+                    found.is_some(),
+                    allowed,
+                    "rmux_env={rmux_env} allowed={allowed}"
+                );
+            }
         }
-        let args = Wrap::parse_from(["move", "--server-socket", "/tmp/rmux-501/private"]).args;
-        let endpoint = super::endpoint(&args).unwrap();
-        assert_eq!(endpoint.host, tend::HostKind::Rmux);
-        assert_eq!(endpoint.socket, "/tmp/rmux-501/private");
-        let args = Wrap::parse_from(["move", "--server-socket", "/tmp/tmux-501/private"]).args;
-        assert_eq!(super::endpoint(&args).unwrap().host, tend::HostKind::Tmux);
+        let e = resolve_endpoint(None, None, None, &inside(true, true)).unwrap();
+        assert_eq!((e.host, e.socket.as_str()), (Rmux, "/tmp/rmux-501/owner"));
     }
 
     use super::*;
