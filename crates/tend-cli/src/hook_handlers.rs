@@ -261,6 +261,13 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
 /// `tend hook copilot`. Fail-open like agy: a payload tend cannot use is
 /// logged and dropped, never surfaced as output or a failing exit, since
 /// Copilot reads a tool hook's stdout and status as its verdict.
+///
+/// The one output is at `agent_stop`: Copilot reads `{"decision": "block",
+/// "reason": TEXT}` there as "run another turn with TEXT as its prompt"
+/// (checked on 1.0.110), the same shape Claude Code's Stop hook takes, so
+/// the requests the user authorized for this session are offered the same
+/// way. The offers are asked for before the stop is recorded, as at a
+/// Claude/Codex Stop, so the waker cannot type a wake for them first.
 async fn copilot_hook(client: &Client, event: &str) {
     let mut text = String::new();
     if std::io::stdin().read_to_string(&mut text).is_err() {
@@ -270,13 +277,49 @@ async fn copilot_hook(client: &Client, event: &str) {
     match tend::adapters::copilot::parse(event, &text, place.pane.clone()) {
         Ok(Some(ev)) => {
             let ev = place.bind(ev);
+            let output = if event == "agent_stop" {
+                turn_boundary_delivery(client, &ev, "stop")
+                    .await
+                    .and_then(|stop| copilot_stop_output(&stop))
+            } else {
+                None
+            };
             best_effort_ingest(client, &ev).await;
             best_effort_default_alias(client, &ev).await;
+            if let Some(output) = output {
+                println!("{output}");
+            }
         }
         Ok(None) => {}
         Err(e) => tracing::debug!(error = %e, event, "copilot hook payload ignored"),
     }
 }
+
+/// The Stop-hook output re-emitted with exactly the two fields Copilot's
+/// `agentStop` reads, or `None` unless it is a block with a reason. Copilot
+/// takes stdout as one JSON document, so nothing else may be printed.
+///
+/// Copilot has no tend MCP server (`tend init` registers it for Claude Code
+/// and Codex only). Given the shared text, which names `tend_inbox` first,
+/// a 1.0.110 session answered that it could not access `tend_inbox` and
+/// stopped. So the reason starts by naming the shell commands.
+fn copilot_stop_output(stop_output: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stop_output).ok()?;
+    if value.get("decision")?.as_str()? != "block" {
+        return None;
+    }
+    let reason = value.get("reason")?.as_str()?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    let reason = format!("{COPILOT_TEND_CLI_NOTE}\n\n{reason}");
+    Some(serde_json::json!({ "decision": "block", "reason": reason }).to_string())
+}
+
+/// Leads every Copilot offer: this session reaches tend through its shell.
+const COPILOT_TEND_CLI_NOTE: &str = "This session has no tend_* tools; use the `tend` command in \
+the shell instead. Claim a request with `tend msg accept ID --json`, reply with \
+`tend msg reply ID BODY`, and read a ready reply with `tend msg wait ID`.";
 
 /// Record the hook event and ask for turn-boundary offers. At `stop` the
 /// offers are asked for first, while the session still reads as working:
@@ -536,7 +579,28 @@ fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<Str
 
 #[cfg(test)]
 mod turn_boundary_tests {
-    use super::{opencode_prompt_output, turn_boundary_output};
+    use super::{copilot_stop_output, opencode_prompt_output, turn_boundary_output};
+
+    #[test]
+    fn copilot_gets_exactly_a_block_with_the_offer_text() {
+        let offers = vec![serde_json::json!({"request_id": "req_1", "offer": "request"})];
+        let stop = turn_boundary_output("stop", &offers).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&copilot_stop_output(&stop).unwrap()).unwrap();
+        assert_eq!(out["decision"], "block");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(reason.contains("req_1"));
+        assert!(reason.starts_with(super::COPILOT_TEND_CLI_NOTE), "{reason}");
+        assert_eq!(out.as_object().unwrap().len(), 2, "{out}");
+        for not_a_block in [
+            r#"{"decision":"allow","reason":"x"}"#,
+            r#"{"decision":"block","reason":"  "}"#,
+            r#"{"decision":"block"}"#,
+            "not json",
+        ] {
+            assert!(copilot_stop_output(not_a_block).is_none(), "{not_a_block}");
+        }
+    }
 
     #[test]
     fn opencode_gets_the_stop_offer_text_as_a_prompt() {
