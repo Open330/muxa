@@ -1176,6 +1176,8 @@ fn endpoint(args: &MoveArgs) -> Result<BackendEndpoint> {
         .clone()
         .or_else(|| match host {
             HostKind::Rmux => tend::backend::rmux::endpoint_from_env(),
+            // Never the user's server for a command aimed at another daemon.
+            _ if !tend::tmux::scanner::ambient_mux_allowed() => None,
             _ => std::env::var("TMUX")
                 .ok()
                 .and_then(|v| v.split(',').next().map(str::to_string)),

@@ -159,6 +159,9 @@ fn endpoint(args: &Args) -> Result<BackendEndpoint> {
         .or_else(|| {
             if host == HostKind::Rmux {
                 tend::backend::rmux::endpoint_from_env()
+            } else if !tend::tmux::scanner::ambient_mux_allowed() {
+                // Never the user's server for a command aimed at another daemon.
+                None
             } else {
                 std::env::var("TMUX")
                     .ok()

@@ -252,16 +252,27 @@ fn dirs_overridden(
 }
 
 /// Whether a client using `socket` talks to the user's own daemon: the
-/// default socket (or the one `config.toml` names) in the account's own
-/// HOME/XDG setup. A CLI pointed at a scratch or test daemon is not, and
-/// must not read the user's tmux/rmux server through its own `$TMUX`/`$RMUX`
-/// (`tmux::scanner::restrict_to_own_tmux_dir`).
+/// default socket, or the one the *default* `config.toml` names, in the
+/// account's own HOME/XDG setup. A socket named by another config file
+/// (`--config /tmp/demo.toml`) is not evidence of ownership. A CLI pointed
+/// at a scratch or test daemon must not read the user's tmux/rmux server
+/// through its own `$TMUX`/`$RMUX` (`tmux::scanner::restrict_to_own_tmux_dir`).
+///
+/// `config` is the config file given explicitly (`--config`/`TEND_CONFIG`),
+/// `None` for the default one; `cfg_socket` is the `socket` that file names.
 #[must_use]
-pub fn talks_to_users_daemon(socket: &Path, cfg_socket: Option<&Path>) -> bool {
+pub fn talks_to_users_daemon(
+    socket: &Path,
+    config: Option<&Path>,
+    cfg_socket: Option<&Path>,
+) -> bool {
+    let default_config = config.is_none_or(|config| {
+        default_config_file().is_some_and(|default| same_dir(config, &default))
+    });
     users_daemon(
         socket,
         &default_socket(),
-        cfg_socket,
+        cfg_socket.filter(|_| default_config),
         &default_dirs_overridden(),
     )
 }
@@ -272,7 +283,20 @@ fn users_daemon(
     cfg_socket: Option<&Path>,
     overrides: &[&str],
 ) -> bool {
-    (socket == default || cfg_socket == Some(socket)) && overrides.is_empty()
+    (same_endpoint(socket, default) || cfg_socket.is_some_and(|cfg| same_endpoint(socket, cfg)))
+        && overrides.is_empty()
+}
+
+/// Two spellings of one daemon endpoint. On Unix a socket path and its
+/// aliases (a symlink, `/tmp` vs `/private/tmp` on macOS) are one socket.
+/// On Windows the transport hashes the string into a pipe name, so only an
+/// equal string is the same endpoint.
+fn same_endpoint(a: &Path, b: &Path) -> bool {
+    if cfg!(unix) {
+        same_dir(a, b)
+    } else {
+        a == b
+    }
 }
 
 /// The XDG variables tend reads, with their spec default under the home
@@ -388,15 +412,38 @@ mod tests {
 
     #[test]
     fn only_the_default_socket_in_the_accounts_own_setup_is_the_users_daemon() {
-        let default = Path::new("/tmp/tend-501.sock");
-        let named = Path::new("/srv/tend/main.sock");
-        let scratch = Path::new("/private/tmp/claude-501/x/run/tend.sock");
+        let default = Path::new("/nonexistent/tend-501.sock");
+        let named = Path::new("/nonexistent/srv/main.sock");
+        let scratch = Path::new("/nonexistent/claude-501/x/run/tend.sock");
         assert!(users_daemon(default, default, None, &[]));
         assert!(users_daemon(named, default, Some(named), &[]));
         assert!(!users_daemon(scratch, default, None, &[]));
         assert!(!users_daemon(scratch, default, Some(named), &[]));
         // Its own XDG setup makes the scratch socket "default": still not.
         assert!(!users_daemon(scratch, scratch, None, &["XDG_RUNTIME_DIR"]));
+        // A socket only another config file names is no evidence.
+        assert!(!talks_to_users_daemon(
+            scratch,
+            Some(Path::new("/nonexistent/demo.toml")),
+            Some(scratch)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_default_socket_is_the_same_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("tend.sock");
+        std::fs::write(&real, b"").unwrap();
+        let link = dir.path().join("alias.sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(users_daemon(&link, &real, None, &[]));
+        assert!(!users_daemon(
+            &dir.path().join("other.sock"),
+            &real,
+            None,
+            &[]
+        ));
     }
 
     #[test]

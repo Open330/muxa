@@ -27,17 +27,10 @@ pub(super) async fn main() -> Result<()> {
         return Ok(());
     }
     let cmd = args.cmd.unwrap_or(Cmd::Start);
-    let early_socket = args.socket.clone().unwrap_or_else(paths::default_socket);
-    if matches!(
-        &cmd,
-        Cmd::Agent {
-            action: AgentCmd::Move(_)
-        } | Cmd::Window {
-            action: WindowCmd::Move(_)
-        }
-    ) {
-        keep_off_the_users_mux(&cmd, &early_socket, None);
-    }
+    // Before anything reads a multiplexer (popups, moves, the sidebar, any
+    // topology): a command aimed at a daemon that is not the user's never
+    // reads the user's tmux/rmux server.
+    keep_off_the_users_mux(&cmd, args.socket.as_deref(), args.config.as_deref());
     if let Cmd::Agent {
         action: AgentCmd::Move(move_args),
     } = &cmd
@@ -95,7 +88,6 @@ pub(super) async fn main() -> Result<()> {
         .socket
         .or_else(|| cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
-    keep_off_the_users_mux(&cmd, &socket, cfg.socket.as_deref());
     let client =
         Client::new(socket.clone()).with_collaboration_client_kind(collaboration_client_kind(&cmd));
 
@@ -361,17 +353,31 @@ pub(super) async fn main() -> Result<()> {
     result
 }
 
-/// A CLI talking to a daemon that is not the user's (`--socket` / its own
-/// HOME or XDG setup) reads panes only from that daemon's side: never the
-/// user's tmux/rmux server through its own `$TMUX`/`$RMUX`, which inside a
-/// real pane would merge the owner's panes into a scratch daemon's
-/// topology. `tend hook` is left alone: it names its own pane from them.
+/// A CLI talking to a daemon that is not the user's (`--socket`,
+/// `--config` naming another socket, or its own HOME/XDG setup) reads panes
+/// only from that daemon's side: never the user's tmux/rmux server through
+/// its own `$TMUX`/`$RMUX`, which inside a real pane would merge the owner's
+/// panes into a scratch daemon's topology. Decided once, with the same
+/// socket and config the command will use. `tend hook` is left alone: it
+/// names its own pane from them.
 fn keep_off_the_users_mux(
     cmd: &Cmd,
-    socket: &std::path::Path,
-    cfg_socket: Option<&std::path::Path>,
+    socket: Option<&std::path::Path>,
+    config: Option<&std::path::Path>,
 ) -> bool {
-    let restrict = mux_restriction_needed(cmd, || paths::talks_to_users_daemon(socket, cfg_socket));
+    let restrict = mux_restriction_needed(cmd, || {
+        let config_path = config
+            .map(std::path::Path::to_path_buf)
+            .or_else(paths::default_config_file);
+        let cfg_socket = Config::load_or_default(config_path.as_deref())
+            .ok()
+            .and_then(|cfg| cfg.socket);
+        let socket = socket
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| cfg_socket.clone())
+            .unwrap_or_else(paths::default_socket);
+        paths::talks_to_users_daemon(&socket, config, cfg_socket.as_deref())
+    });
     if restrict {
         tend::tmux::scanner::restrict_to_own_tmux_dir();
     }
@@ -399,6 +405,8 @@ mod mux_restriction_tests {
                 event: "stop".into(),
             },
         };
-        assert!(!mux_restriction_needed(&hook, || panic!("not asked for a hook")));
+        assert!(!mux_restriction_needed(&hook, || panic!(
+            "not asked for a hook"
+        )));
     }
 }

@@ -163,6 +163,11 @@ pub type SharedBackend = Arc<dyn PaneBackend>;
 /// daemon, not driving it. A future "noop" backend could replace
 /// this fallback if that assumption stops holding.
 pub fn default_backend() -> SharedBackend {
+    // Not the user's daemon (or a CLI for another one): tmux only, kept to
+    // its own directory, as in [`active_backends`].
+    if crate::tmux::scanner::own_tmux_dir_only() {
+        return Arc::new(tmux::TmuxBackend::new());
+    }
     match detect_host_env() {
         Some(HostKind::Cmux) => Arc::new(cmux::CmuxBackend::new()),
         Some(HostKind::Rmux) => Arc::new(rmux::RmuxBackend::new()),

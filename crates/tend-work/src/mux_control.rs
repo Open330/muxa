@@ -68,7 +68,10 @@ pub fn supported(host: HostKind) -> bool {
 pub fn ambient_rmux() -> Option<tend::RmuxBackend> {
     match rmux_endpoint() {
         Some(socket) => Some(tend::RmuxBackend::with_endpoint(socket)),
-        None => (cfg!(windows) && selected_endpoint().is_none()).then(tend::RmuxBackend::new),
+        None => (cfg!(windows)
+            && selected_endpoint().is_none()
+            && tend::tmux::scanner::ambient_mux_allowed())
+        .then(tend::RmuxBackend::new),
     }
 }
 
