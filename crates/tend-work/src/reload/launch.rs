@@ -218,10 +218,12 @@ pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustPrompt> {
         + lines[header + 1..]
             .iter()
             .position(|line| !line.is_empty())?;
-    let path_len = lines[path_start..]
+    // The path ends at a row with nothing but ASCII padding: a row holding
+    // only a wrapped no-break space is part of it.
+    let path_len = raw[path_start..]
         .iter()
-        .position(|line| line.is_empty())
-        .unwrap_or(lines.len() - path_start);
+        .position(|row| row.trim_matches([' ', '\r']).is_empty())
+        .unwrap_or(raw.len() - path_start);
     // The path keeps every character but the dialog's ASCII indent and
     // padding: a name may end in other whitespace (Windows keeps a trailing
     // no-break space), and trimming it would name another folder.
@@ -657,6 +659,11 @@ mod tests {
         );
         assert_eq!(claude_trust_prompt(&wrapped), None);
         assert_eq!(watch(&[trusted]).observe("=a:0.0", ms(0), &wrapped), None);
+        // Nor when that no-break space wraps onto a row of its own.
+        let nbsp_row =
+            moved_to_yes().replace("/tmp/untrusted-probe", &format!("{trusted}\n\u{a0}"));
+        assert_eq!(claude_trust_prompt(&nbsp_row), None);
+        assert_eq!(watch(&[trusted]).observe("=a:0.0", ms(0), &nbsp_row), None);
         // The exact folder on one row is still answered.
         let exact = moved_to_yes().replace("/tmp/untrusted-probe", trusted);
         assert_eq!(
