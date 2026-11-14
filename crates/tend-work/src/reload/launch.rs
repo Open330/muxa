@@ -231,10 +231,12 @@ pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustPrompt> {
         .iter()
         .map(|row| row.trim_matches([' ', '\r']))
         .collect();
-    // A long path wraps across rows of the capture. Where a row breaks, a
-    // space may have been dropped, so a wrapped Windows path (where names
-    // with spaces are the rule) is not trusted automatically.
-    if rows.len() > 1 && !rows[0].starts_with('/') {
+    // A path wider than the pane wraps, and where a row breaks a space may
+    // have been dropped (Claude breaks text at spaces), so the rows cannot
+    // be joined back into the one exact path: `trust ed` reads as `trusted`.
+    // Such a prompt is left for a person, as a wrapped question already is:
+    // in a pane too narrow for the path, the person answers it.
+    if rows.len() > 1 {
         return None;
     }
     let workspace: String = rows.concat();
@@ -616,12 +618,10 @@ mod tests {
             claude_trust_prompt(&moved_to_yes()).map(|prompt| prompt.cursor),
             Some(TrustCursor::OnYes)
         );
-        // A path wider than the pane wraps; the rows join back up.
+        // A path wider than the pane wraps; a space may be gone at the
+        // break, so it is not read as any one path.
         let wrapped = TRUST_PROMPT_NO.replace(" /tmp/untrusted-probe", " /tmp/untrusted-\n probe");
-        assert_eq!(
-            claude_trust_prompt(&wrapped).map(|prompt| prompt.workspace),
-            Some("/tmp/untrusted-probe".into())
-        );
+        assert_eq!(claude_trust_prompt(&wrapped), None);
     }
 
     #[test]
@@ -659,6 +659,12 @@ mod tests {
         );
         assert_eq!(claude_trust_prompt(&wrapped), None);
         assert_eq!(watch(&[trusted]).observe("=a:0.0", ms(0), &wrapped), None);
+        // The same on Unix: `/srv/trust ed` broken at its space.
+        let unix = moved_to_yes().replace(" /tmp/untrusted-probe", " /srv/trust\n ed");
+        assert_eq!(
+            watch(&["/srv/trusted"]).observe("=a:0.0", ms(0), &unix),
+            None
+        );
         // Nor when that no-break space wraps onto a row of its own.
         let nbsp_row =
             moved_to_yes().replace("/tmp/untrusted-probe", &format!("{trusted}\n\u{a0}"));
