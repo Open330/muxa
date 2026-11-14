@@ -57,6 +57,19 @@ Notes from the 1.0.110 check:
 ## Esc on a permission prompt
 
 Esc cancels the prompt and the turn, and Copilot fires no hook for it: no
-`postToolUse`, no `agentStop`. With hooks alone the row stays waiting until
-the next prompt. Copilot records the cancel only in its session log
-(`abort`, then `assistant.turn_end`).
+`postToolUse`, no `agentStop`. Copilot records the cancel only in its session
+log (`permission.completed` cancelled, `assistant.turn_end`, `abort`).
+
+tendd reads that log. Every two seconds, for each Copilot row that is working
+or waiting, it reads the end of `$COPILOT_HOME/session-state/<id>/events.jsonl`;
+when the turn there ended in `abort` (after the turn's prompt and its last
+`assistant.turn_start`), the row goes idle, dated at the abort. A hook newer
+than that (the next prompt) always wins. `assistant.turn_end` alone settles
+nothing, because Copilot writes one after every model call. Idle rows are not
+read. Set `[reconciler] copilot_session_log_enabled = false` to turn it off
+(see [CONFIGURATION.md](CONFIGURATION.md)); tendd reads `COPILOT_HOME` from
+its own environment, so a Copilot run with a different `COPILOT_HOME` than
+tendd's keeps the hooks-only behaviour.
+
+On 1.0.110, Esc on a permission prompt settled the row within two seconds;
+the next prompt then worked as usual.

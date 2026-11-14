@@ -513,6 +513,7 @@ interval_secs = 30
 stuck_working_timeout_secs = 0
 stuck_waiting_timeout_secs = 0
 codex_rollout_enabled = true
+copilot_session_log_enabled = true
 paneless_stale_timeout_secs = 86400
 ```
 
@@ -524,6 +525,9 @@ Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초�
 원래 이벤트 시각으로 활동을 갱신하고 실행·턴 완료·실제 오류를 복구합니다.
 사용량 비율과 credit 잔액만으로 상태를 바꾸지 않습니다.
 `codex_rollout_enabled = false`로 끌 수 있습니다.
+같은 주기로 `copilot_session_log_enabled`는 working·waiting 상태인 Copilot CLI 행의
+세션 로그(`$COPILOT_HOME/session-state/<id>/events.jsonl`)를 읽어, hook 없이 취소된 턴
+(권한 확인에서 Esc)을 취소된 시각으로 정리합니다. `false`로 끌 수 있습니다.
 `paneless_stale_timeout_secs`는 pane·surface·pid가 모두 없는 레지스트리 행을
 기본 24시간 후 stopped로 전환하며, `0`이면 이 정리를 끕니다.
 
