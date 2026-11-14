@@ -172,18 +172,23 @@ fn cancelled_at(records: &[Value]) -> Option<OffsetDateTime> {
 /// read its session log and, when the turn there was cancelled, record the
 /// stop at the cancel's own time. The Store's precedence drops it when a
 /// newer hook (the next prompt) has already moved the row.
+/// The states a missing hook can leave a Copilot row in, and so the only
+/// ones [`poll`] reads and settles.
+const SETTLED_STATES: &[crate::event::AgentState] = &[
+    crate::event::AgentState::Working,
+    crate::event::AgentState::WaitingInput,
+    crate::event::AgentState::WaitingChoice,
+];
+
 pub async fn poll(store: &crate::state::SharedStore, home: &Path) {
-    use crate::event::{AgentEvent, AgentId, AgentKind, AgentState};
+    use crate::event::{AgentEvent, AgentId, AgentKind};
     let targets: Vec<AgentId> = store
         .snapshot()
         .await
         .into_iter()
         .filter(|agent| {
             agent.kind == AgentKind::Copilot
-                && matches!(
-                    agent.state,
-                    AgentState::Working | AgentState::WaitingInput | AgentState::WaitingChoice
-                )
+                && SETTLED_STATES.contains(&agent.state)
                 // A session id names a directory; refuse anything that
                 // could leave `session-state/`.
                 && !agent.session_id.is_empty()
@@ -232,8 +237,14 @@ pub async fn poll(store: &crate::state::SharedStore, home: &Path) {
             idle_confirmed: true,
             at,
         };
+        // Only a row that still exists and still needs settling: the user
+        // may have forgotten it while the log was read.
         store
-            .apply_observed(&event, crate::provenance::StateSource::ProviderRecord)
+            .apply_observed_if_in(
+                &event,
+                crate::provenance::StateSource::ProviderRecord,
+                SETTLED_STATES,
+            )
             .await;
     }
 }
@@ -528,6 +539,68 @@ mod tests {
             assert_eq!(
                 store.by_session("s2").await.unwrap().state,
                 AgentState::Working
+            );
+        }
+
+        /// From the #538 review: the row is forgotten while its log is read.
+        #[test]
+        fn a_row_forgotten_during_the_read_is_not_recreated() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let home = tempfile::tempdir().unwrap();
+                let store = Store::shared();
+                waiting_row(&store, "gone", "%1").await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                write_log(
+                    home.path(),
+                    "gone",
+                    &[prompt_line(at(-2)), abort_line(OffsetDateTime::now_utc())],
+                );
+                // Hold the only blocking thread so the poll's read waits.
+                let (release, held) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || held.recv().ok());
+                let polling = {
+                    let store = store.clone();
+                    let home = home.path().to_path_buf();
+                    tokio::spawn(async move { poll(&store, &home).await })
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(store.forget_agent("gone").await);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                polling.await.unwrap();
+                assert!(store.by_session("gone").await.is_none());
+            });
+        }
+
+        #[tokio::test]
+        async fn a_row_that_moved_on_during_the_read_is_left_alone() {
+            let store = Store::shared();
+            waiting_row(&store, "s4", "%1").await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let stop = AgentEvent::TurnStopped {
+                id: id("s4", "%1"),
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: true,
+                at: OffsetDateTime::now_utc(),
+            };
+            store
+                .apply_observed_if_in(
+                    &stop,
+                    crate::provenance::StateSource::ProviderRecord,
+                    &[AgentState::Working],
+                )
+                .await;
+            assert_eq!(
+                store.by_session("s4").await.unwrap().state,
+                AgentState::WaitingInput
             );
         }
 
