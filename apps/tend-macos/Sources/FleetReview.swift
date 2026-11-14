@@ -257,6 +257,9 @@ struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
     /// Set once someone decided the item (`decision_history`).
     var disposition: Disposition? = nil
     var idempotencyKey: String? = nil
+    /// What tendd ran itself (the Work's declared checks) before the item
+    /// reached the person; nil when it ran nothing.
+    var verification: TendVerification? = nil
 
     struct Disposition: Decodable, Hashable, Sendable {
         let kind: String
@@ -266,7 +269,7 @@ struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, target, generation, summary, anchor, decision, disposition
+        case id, target, generation, summary, anchor, decision, disposition, verification
         case requestedAt = "requested_at"
         case requestedBy = "requested_by"
         case idempotencyKey = "idempotency_key"

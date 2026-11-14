@@ -40,3 +40,10 @@ main { padding: 0 1rem 2rem; max-width: 46rem; margin: 0 auto; }
 .host { padding: .75rem .25rem 0; }
 .host h2 { font-size: .95rem; margin: 0; }
 .card.linked { border-color: var(--accent); }
+.card .checks { margin: .4rem 0 .5rem; padding: .5rem .65rem; border: 1px solid var(--line); border-left: 3px solid var(--good); border-radius: .5rem; font-size: .9rem; }
+.card .checks.fail { border-left-color: var(--bad); }
+.card .checks .headline { font-weight: 600; }
+.card .checks ul { margin: .25rem 0 0; padding-left: 1.2rem; overflow-wrap: anywhere; }
+.card .checks .pass { color: var(--good); }
+.card .checks .fail { color: var(--bad); }
+.card .checks code { display: block; color: var(--muted); font-size: .8rem; }

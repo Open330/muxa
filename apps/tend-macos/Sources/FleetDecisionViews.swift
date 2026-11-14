@@ -428,6 +428,50 @@ struct FleetEvidenceChips: View {
     }
 }
 
+// MARK: - Checks
+
+/// The Work's declared checks as tendd ran them: a headline, then one line
+/// per check; a failed check shows how it ended and the end of its output.
+struct FleetVerificationChecks: View {
+    let verification: TendVerification
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label {
+                Text(verbatim: verification.headline)
+                    .fontWeight(.semibold)
+            } icon: {
+                Image(systemName: verification.passed ? "checkmark.seal.fill" : "xmark.seal.fill")
+                    .foregroundStyle(verification.passed ? .green : .red)
+            }
+            ForEach(Array(verification.checks.enumerated()), id: \.offset) { _, check in
+                VStack(alignment: .leading, spacing: 1) {
+                    Label {
+                        Text(verbatim: check.ending.map { "\(check.label) (\($0))" } ?? check.label)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } icon: {
+                        Image(systemName: check.passed ? "checkmark" : "xmark")
+                            .foregroundStyle(check.passed ? .green : .red)
+                    }
+                    .help(check.command)
+                    if !check.passed, !check.tail.isEmpty {
+                        Text(verbatim: check.tail)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
+        .font(TendType.detail)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .help(String(localized: "Checks tend ran itself, before the agent's own account"))
+    }
+}
+
 // MARK: - Card
 
 /// One decision: what to decide, the asker's options and recommendation,
@@ -464,6 +508,11 @@ struct FleetDecisionCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             header
+            // What tend checked itself comes first; the asker's account
+            // (title, recommendation, evidence) follows.
+            if let verification = decision.verification {
+                FleetVerificationChecks(verification: verification)
+            }
             Text(verbatim: decision.title)
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(4)

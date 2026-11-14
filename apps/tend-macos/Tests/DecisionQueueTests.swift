@@ -312,4 +312,46 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
         #expect(model.compare == .revision)
         #expect(model.draftKey == nil)
     }
+
+    @Test func tendsOwnChecksComeFirstAndAreNotRepeatedAsEvidence() throws {
+        let json = """
+        {"kind":"review","id":"rv_9","target":{"kind":"work","workspace":"tend","work":"ENG-2"},
+         "generation":1,"summary":"Done","requested_at":"2026-11-12T01:02:00Z",
+         "requested_by":{"kind":"agent","label":"impl"},
+         "verification":{"passed":true,"ran_at":"2026-11-12T01:01:00Z","checks":[
+           {"command":"cargo test -p tend","name":"unit","passed":true,"exit_code":0,"tail":"ok"},
+           {"command":"node --test","passed":true,"exit_code":0,"tail":"","future":1}]},
+         "decision":{"evidence":[
+           {"kind":"test","command":"cargo test -p tend","passed":true,"verified":true},
+           {"kind":"test","command":"make lint","passed":true}]}}
+        """
+        let item = try JSONDecoder().decode(TendReviewItem.self, from: Data(json.utf8))
+        let verification = try #require(item.verification)
+        #expect(verification.passed)
+        #expect(verification.checks.map(\.label) == ["unit", "node --test"])
+        #expect(verification.checks.allSatisfy { $0.ending == nil })
+        let decision = FleetDecision(review: item, host: local)
+        #expect(decision.verification == verification)
+        // The agent's own test stays; tend's copy of its check does not.
+        #expect(decision.evidence == [.test(command: "make lint", passed: true, tail: nil)])
+    }
+
+    @Test func aFailedCheckSaysHowItEnded() throws {
+        let json = """
+        {"passed":true,"checks":[{"command":"a","passed":false,"exit_code":2,"tail":"boom"},
+                                 {"command":"b","passed":false,"timed_out":true,"tail":""},
+                                 {"command":"c","passed":false,"tail":""},{"bogus":true}]}
+        """
+        let verification = try JSONDecoder().decode(TendVerification.self, from: Data(json.utf8))
+        // A record that says it passed while a check failed reads as failed.
+        #expect(!verification.passed)
+        #expect(verification.checks.map(\.ending) == ["exit 2", "timed out", "killed"])
+    }
+
+    @Test func aReviewWithoutChecksShowsNone() throws {
+        let queue = try JSONDecoder().decode(TendPendingQueue.self, from: Data(queueJSON.utf8))
+        guard case .review(let review) = queue.items[2] else { Issue.record("not a review"); return }
+        #expect(review.verification == nil)
+        #expect(FleetDecision(review: review, host: local).verification == nil)
+    }
 }

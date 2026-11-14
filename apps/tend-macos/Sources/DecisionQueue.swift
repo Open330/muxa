@@ -241,11 +241,99 @@ struct TendPendingQueue: Decodable, Hashable, Sendable {
     }
 }
 
+/// What tendd established itself before a result reached the person: the
+/// Work's declared checks, run by tendd (`work_verify_v1`). Unlike the
+/// decision, nothing here is the agent's claim. Lenient: a field this app
+/// does not read never hides the item.
+struct TendVerification: Decodable, Hashable, Sendable {
+    struct Check: Decodable, Hashable, Sendable {
+        var command: String
+        var name: String?
+        var passed: Bool
+        var exitCode: Int?
+        var timedOut: Bool
+        var tail: String
+
+        enum CodingKeys: String, CodingKey {
+            case command, name, passed, tail
+            case exitCode = "exit_code"
+            case timedOut = "timed_out"
+        }
+
+        init(command: String, name: String? = nil, passed: Bool, exitCode: Int? = nil, timedOut: Bool = false, tail: String = "") {
+            self.command = command
+            self.name = name
+            self.passed = passed
+            self.exitCode = exitCode
+            self.timedOut = timedOut
+            self.tail = tail
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            command = try values.decode(String.self, forKey: .command)
+            name = try? values.decodeIfPresent(String.self, forKey: .name)
+            passed = (try? values.decodeIfPresent(Bool.self, forKey: .passed)) ?? false
+            exitCode = try? values.decodeIfPresent(Int.self, forKey: .exitCode)
+            timedOut = (try? values.decodeIfPresent(Bool.self, forKey: .timedOut)) ?? false
+            tail = (try? values.decodeIfPresent(String.self, forKey: .tail)) ?? ""
+        }
+
+        /// `unit`, or the command when the check has no name.
+        var label: String { name?.nilIfEmpty ?? command }
+
+        /// How a failed check ended: `exit 2`, `timed out`, `killed`.
+        var ending: String? {
+            guard !passed else { return nil }
+            if timedOut { return String(localized: "timed out") }
+            if let exitCode { return String(localized: "exit \(exitCode)") }
+            return String(localized: "killed")
+        }
+    }
+
+    var passed: Bool
+    var ranAt: String?
+    var checks: [Check]
+
+    enum CodingKeys: String, CodingKey {
+        case passed, checks
+        case ranAt = "ran_at"
+    }
+
+    init(passed: Bool, ranAt: String? = nil, checks: [Check]) {
+        self.passed = passed
+        self.ranAt = ranAt
+        self.checks = checks
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        checks = ((try? values.decodeIfPresent([TendLenient<Check>].self, forKey: .checks)) ?? []).compactMap(\.value)
+        passed = ((try? values.decodeIfPresent(Bool.self, forKey: .passed)) ?? false) && checks.allSatisfy(\.passed)
+        ranAt = try? values.decodeIfPresent(String.self, forKey: .ranAt)
+    }
+
+    /// `tend ran 3/3 checks, all passed`.
+    var headline: String {
+        let ok = checks.filter(\.passed).count
+        return checks.count == 1
+            ? String(localized: "tend ran 1 check: \(ok == 1 ? String(localized: "passed") : String(localized: "failed"))")
+            : String(localized: "tend ran \(checks.count) checks: \(ok) passed")
+    }
+}
+
 extension TendReviewItem {
     /// The typed evidence, then the free-form anchor when it reads as
     /// evidence and is not already listed (as `tend review show` does).
+    /// tendd also copies its checks into the evidence for clients that read
+    /// only the decision; with the checks shown on their own, those copies
+    /// are left out.
     var allEvidence: [TendEvidence] {
-        var evidence = decision?.evidence ?? []
+        let ran = verification.map { Set($0.checks.map(\.command)) } ?? []
+        var evidence = (decision?.evidence ?? []).filter { evidence in
+            if case .test(let command, _, _) = evidence, ran.contains(command) { return false }
+            return true
+        }
         if let anchor = anchor.flatMap(TendEvidence.fromAnchor), !evidence.contains(anchor) {
             evidence.append(anchor)
         }
@@ -321,6 +409,12 @@ struct FleetDecision: Identifiable, Hashable, Sendable {
 
     var recommendation: String? {
         decision?.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    /// The checks tendd ran itself, shown ahead of the asker's account.
+    var verification: TendVerification? {
+        guard case .review(let item) = source, let verification = item.verification, !verification.checks.isEmpty else { return nil }
+        return verification
     }
 
     init(humanRequest entry: TendHumanRequestEntry, host: TendFleetHostIdentity) {
