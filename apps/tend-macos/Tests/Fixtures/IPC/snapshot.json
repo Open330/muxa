@@ -23,6 +23,28 @@
         "deterministic_at": "2026-11-12T00:00:01Z",
         "source": "hook"
       }
+    },
+    {
+      "agent_session_id": "c1",
+      "context_used_pct": null,
+      "cost_usd": null,
+      "cwd": "/repo",
+      "kind": "copilot",
+      "last_activity_at": "2026-11-12T00:00:02Z",
+      "last_event_at": "2026-11-12T00:00:02Z",
+      "last_notification": null,
+      "last_prompt": null,
+      "last_response": null,
+      "model": null,
+      "pane": "%2",
+      "started_at": "2026-11-12T00:00:02Z",
+      "state": "idle",
+      "state_entered_at": "2026-11-12T00:00:02Z",
+      "state_source": {
+        "at": "2026-11-12T00:00:02Z",
+        "deterministic_at": "2026-11-12T00:00:02Z",
+        "source": "hook"
+      }
     }
   ],
   "ok": true,

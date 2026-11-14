@@ -23,6 +23,9 @@ pub enum AgentKind {
     Codex,
     /// Google's Antigravity CLI (`agy`), the retired Gemini CLI's successor.
     Antigravity,
+    /// GitHub Copilot CLI (`copilot`): user hooks in
+    /// `$COPILOT_HOME/hooks/`, plus its session log for what hooks miss.
+    Copilot,
     /// A non-agent background process (shell script, game, automation loop,
     /// or a `tend run` PTY child) registered via `tend register` / the
     /// `Register` IPC. Tracked by pid liveness rather than tmux pane
@@ -51,14 +54,15 @@ impl AgentKind {
             Self::ClaudeCode => Some("claude"),
             Self::Codex => Some("codex"),
             Self::Antigravity => Some("agy"),
-            Self::Opencode | Self::Task | Self::Unknown => None,
+            Self::Opencode | Self::Copilot | Self::Task | Self::Unknown => None,
         }
     }
 
     /// Can this agent's hook stream tell tend it is waiting on the operator?
     ///
-    /// Claude Code (`Notification`), Codex (`PermissionRequest`) and opencode
-    /// (`permission.asked`) all can, so their
+    /// Claude Code (`Notification`), Codex (`PermissionRequest`), opencode
+    /// (`permission.asked`) and Copilot (`notification` with
+    /// `permission_prompt`) all can, so their
     /// rows reach [`AgentState::WaitingInput`] from hooks alone and screen
     /// inference must stay out of the way.
     ///
@@ -74,7 +78,7 @@ impl AgentKind {
     #[must_use]
     pub fn hooks_report_attention(self) -> bool {
         match self {
-            Self::ClaudeCode | Self::Codex | Self::Opencode => true,
+            Self::ClaudeCode | Self::Codex | Self::Opencode | Self::Copilot => true,
             Self::Antigravity => false,
             // Neither is a hook-driven agent: `Task` rows have no attention
             // states at all (only Working/Stopped), and `Unknown` is the kind

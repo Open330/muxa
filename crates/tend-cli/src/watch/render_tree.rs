@@ -58,6 +58,7 @@ pub(crate) fn agent_kind_short(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "codex",
         AgentKind::Antigravity => "agy",
         AgentKind::Opencode => "opencode",
+        AgentKind::Copilot => "copilot",
         AgentKind::Task => "task",
         AgentKind::Unknown => "agent",
     }

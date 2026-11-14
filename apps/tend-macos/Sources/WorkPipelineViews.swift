@@ -717,6 +717,7 @@ func agentProgramTint(_ program: String) -> Color {
     case "codex": .green
     case "opencode": .purple
     case "agy": .teal
+    case "copilot": .indigo
     default: .secondary
     }
 }

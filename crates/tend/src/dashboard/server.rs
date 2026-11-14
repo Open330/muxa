@@ -2723,6 +2723,7 @@ fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
         "codex" => Ok(AgentKind::Codex),
         "antigravity" => Ok(AgentKind::Antigravity),
         "opencode" => Ok(AgentKind::Opencode),
+        "copilot" => Ok(AgentKind::Copilot),
         "unknown" => Ok(AgentKind::Unknown),
         _ => Err(format!("unknown agent kind {raw:?}")),
     }

@@ -4030,8 +4030,9 @@ fn provider_rank(kind: AgentKind) -> u8 {
         AgentKind::ClaudeCode => 1,
         AgentKind::Antigravity => 2,
         AgentKind::Opencode => 3,
-        AgentKind::Task => 4,
-        AgentKind::Unknown => 5,
+        AgentKind::Copilot => 4,
+        AgentKind::Task => 5,
+        AgentKind::Unknown => 6,
     }
 }
 
@@ -4098,9 +4099,11 @@ fn peer_spawn_program(
     let fallback = match current.agent_kind {
         AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Codex,
         AgentKind::Codex => crate::agent_launch::AgentProgram::Claude,
-        AgentKind::Antigravity | AgentKind::Opencode | AgentKind::Task | AgentKind::Unknown => {
-            crate::agent_launch::AgentProgram::Codex
-        }
+        AgentKind::Antigravity
+        | AgentKind::Opencode
+        | AgentKind::Copilot
+        | AgentKind::Task
+        | AgentKind::Unknown => crate::agent_launch::AgentProgram::Codex,
     };
     if let Some(chosen) = requested.or(targeted) {
         return Ok(chosen);
@@ -4119,7 +4122,10 @@ fn peer_spawn_program(
 fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram {
     match kind {
         AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Claude,
-        AgentKind::Codex | AgentKind::Task | AgentKind::Unknown => {
+        // tend does not launch Copilot (it only watches one), and
+        // `provider_kind` never names it, so it falls back like the kinds
+        // that are not launchable agents.
+        AgentKind::Codex | AgentKind::Copilot | AgentKind::Task | AgentKind::Unknown => {
             crate::agent_launch::AgentProgram::Codex
         }
         AgentKind::Antigravity => crate::agent_launch::AgentProgram::Antigravity,

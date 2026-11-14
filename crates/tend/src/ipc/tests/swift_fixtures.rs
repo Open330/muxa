@@ -59,8 +59,8 @@ async fn call_ok(socket: &Path, request: Value) -> Value {
     reply
 }
 
-/// State the replies describe: one agent with a prompt, an open and a
-/// decided review, one planned Work.
+/// State the replies describe: one agent with a prompt, a Copilot CLI
+/// agent, an open and a decided review, one planned Work.
 async fn seed(socket: &Path) {
     for event in [
         json!({"type": "started", "id": {"kind": "claude_code", "session_id": "s1",
@@ -68,6 +68,9 @@ async fn seed(socket: &Path) {
         json!({"type": "prompt_submitted", "id": {"kind": "claude_code", "session_id": "s1",
                "pane": "%1", "cwd": "/repo"}, "at": "2026-11-12T00:00:01Z",
                "prompt": "fix the flaky test"}),
+        // A watched-only provider the app has no program for.
+        json!({"type": "started", "id": {"kind": "copilot", "session_id": "c1",
+               "pane": "%2", "cwd": "/repo"}, "at": "2026-11-12T00:00:02Z"}),
     ] {
         call_ok(socket, request("ingest", json!({ "event": event }))).await;
     }

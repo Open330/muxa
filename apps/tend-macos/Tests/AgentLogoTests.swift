@@ -4,6 +4,12 @@ import Testing
 
 @Test func everyAgentMarkResolvesToAShippedLogoAsset() throws {
     for mark in TendAgentMark.all {
+        // Copilot CLI is watched, not launched, and ships no mark yet: it
+        // shows its symbol and name.
+        if mark.wire == "copilot" {
+            #expect(mark.logo == nil)
+            continue
+        }
         let logo = try #require(mark.logo, "\(mark.wire) has no logo")
         #expect(NSImage(named: logo.assetName) != nil, "\(logo.assetName) is missing from the asset catalog")
     }
@@ -29,6 +35,8 @@ import Testing
     #expect(TendAgentLogoAsset(kind: "antigravity") == .antigravity)
     #expect(TendAgentLogoAsset(kind: "agy") == .antigravity)
     #expect(TendAgentLogoAsset(kind: "opencode") == .opencode)
+    #expect(TendAgentLogoAsset(kind: "copilot") == nil)
+    #expect(TendAgentMark.productName(forKind: "copilot") == "Copilot CLI")
     #expect(TendAgentLogoAsset(kind: "aider") == nil)
     #expect(AskProviderEngine.anthropic.logo == .anthropic)
     #expect(AskProviderEngine.apple.logo == nil)

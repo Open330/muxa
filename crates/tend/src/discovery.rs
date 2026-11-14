@@ -64,6 +64,10 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
         "agy" | "antigravity" => Some(AgentKind::Antigravity),
         // opencode ships a compiled binary named for itself.
         "opencode" => Some(AgentKind::Opencode),
+        // GitHub Copilot CLI: a native binary named `copilot` (Homebrew), or
+        // the same binary behind npm's `node` loader, found by the
+        // wrapper walk.
+        "copilot" => Some(AgentKind::Copilot),
         _ => None,
     }
 }
@@ -460,13 +464,14 @@ pub struct DiscoveryReport {
     pub codex: usize,
     pub antigravity: usize,
     pub opencode: usize,
+    pub copilot: usize,
     pub skipped_known: usize,
     pub failed: usize,
 }
 
 impl DiscoveryReport {
     pub fn total_ingested(&self) -> usize {
-        self.claude_code + self.codex + self.antigravity + self.opencode
+        self.claude_code + self.codex + self.antigravity + self.opencode + self.copilot
     }
 
     fn bump(&mut self, kind: AgentKind) {
@@ -475,6 +480,7 @@ impl DiscoveryReport {
             AgentKind::Codex => self.codex += 1,
             AgentKind::Antigravity => self.antigravity += 1,
             AgentKind::Opencode => self.opencode += 1,
+            AgentKind::Copilot => self.copilot += 1,
             // We never synthesize for Unknown/Task.
             AgentKind::Unknown | AgentKind::Task => {}
         }
@@ -579,6 +585,7 @@ mod tests {
         assert_eq!(classify_command("gemini"), None);
         assert_eq!(classify_command("gemini-cli"), None);
         assert_eq!(classify_command("opencode"), Some(AgentKind::Opencode));
+        assert_eq!(classify_command("copilot"), Some(AgentKind::Copilot));
         assert_eq!(classify_command("agy"), Some(AgentKind::Antigravity));
         assert_eq!(
             classify_command("antigravity"),

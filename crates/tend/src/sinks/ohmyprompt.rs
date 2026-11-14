@@ -504,6 +504,7 @@ pub fn agent_kind_to_source(kind: AgentKind) -> Option<&'static str> {
         // replaced, so a per-tool breakdown downstream stays honest.
         AgentKind::Antigravity => Some("antigravity"),
         AgentKind::Opencode => Some("opencode"),
+        AgentKind::Copilot => Some("copilot-cli"),
         AgentKind::Unknown | AgentKind::Task => None,
     }
 }
@@ -515,6 +516,7 @@ pub fn agent_kind_to_cli_name(kind: AgentKind) -> Option<&'static str> {
         AgentKind::Codex => Some("codex"),
         AgentKind::Antigravity => Some("agy"),
         AgentKind::Opencode => Some("opencode"),
+        AgentKind::Copilot => Some("copilot"),
         AgentKind::Unknown | AgentKind::Task => None,
     }
 }
