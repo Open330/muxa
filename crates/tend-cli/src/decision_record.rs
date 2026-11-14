@@ -57,6 +57,21 @@ pub(crate) fn take_decision(
     Ok(decision.into_option())
 }
 
+fn take_commits(args: &mut Map<String, Value>) -> Result<Vec<String>, String> {
+    match args.remove("commit") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(sha)) => Ok(vec![sha]),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(sha) => Ok(sha),
+                _ => Err("commit must be an array of SHAs".to_owned()),
+            })
+            .collect(),
+        Some(_) => Err("commit must be an array of SHAs".into()),
+    }
+}
+
 fn take_string(args: &mut Map<String, Value>, key: &str) -> Result<Option<String>, String> {
     match args.remove(key) {
         None | Some(Value::Null) => Ok(None),
@@ -182,7 +197,8 @@ pub(crate) fn definitions() -> Vec<Value> {
         "summary": { "type": "string", "description": "What you finished, in one paragraph the person can read without your pane." },
         "commit": { "type": "array", "items": { "type": "string" }, "description": "Commit SHAs holding the result, in your working directory's checkout." },
         "request_id": { "type": "string", "description": "File the record against this collaboration request's result instead of your own Work or session." },
-        "key": { "type": "string", "description": "Retry key: the same key returns the same record instead of filing another. Reuse it when retrying one result." }
+        "key": { "type": "string", "description": "Retry key: the same key returns the same record instead of filing another. Reuse it when retrying one result." },
+        "complete": { "type": "boolean", "description": "Also report your pipeline alias done, in the same tendd operation as filing the record (what `tend work done --summary` does). Only inside a managed Work alias; not with request_id." }
     });
     if let (Some(properties), Value::Object(decision)) =
         (properties.as_object_mut(), decision_schema_properties())
@@ -191,7 +207,7 @@ pub(crate) fn definitions() -> Vec<Value> {
     }
     vec![serde_json::json!({
         "name": FILE_RESULT_TOOL,
-        "description": "File the durable result record for finished work: what you did, the decision the person needs to make (if any), the options, your recommendation and evidence (commits, PR, tests). It becomes an open review item the person decides from (`tend review show`); it does not wait for an answer and is not approval. The record targets your managed Work alias when you run in one, else your session. If your Work declares checks, tend runs them first: a failure returns checks_failed with each check's output and files nothing, so fix and call again. Call it once when you finish a result someone must look at; inside a pipeline, `tend work done --summary ...` files the same record and completes the alias.",
+        "description": "File the durable result record for finished work: what you did, the decision the person needs to make (if any), the options, your recommendation and evidence (commits, PR, tests). It becomes an open review item the person decides from (`tend review show`); it does not wait for an answer and is not approval. The record targets your managed Work alias when you run in one, else your session. If your Work declares checks, tend runs them first: a failure returns checks_failed with each check's output and files nothing, so fix and call again. Call it once when you finish a result someone must look at; inside a pipeline, pass complete=true (or run `tend work done --summary ...`) to file it and complete your alias as one operation.",
         "inputSchema": {
             "type": "object",
             "properties": properties,
@@ -210,18 +226,17 @@ pub(crate) async fn call(client: &tend::ipc::Client, args: Value) -> Result<Valu
     let summary = take_string(&mut args, "summary")?.ok_or("summary is required")?;
     let request_id = take_string(&mut args, "request_id")?;
     let key = take_string(&mut args, "key")?;
-    let commits = match args.remove("commit") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(sha)) => vec![sha],
-        Some(Value::Array(items)) => items
-            .into_iter()
-            .map(|item| match item {
-                Value::String(sha) => Ok(sha),
-                _ => Err("commit must be an array of SHAs".to_owned()),
-            })
-            .collect::<Result<_, _>>()?,
-        Some(_) => return Err("commit must be an array of SHAs".into()),
+    let complete = match args.remove("complete") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(complete)) => complete,
+        Some(_) => return Err("complete must be a boolean".into()),
     };
+    if complete && request_id.is_some() {
+        return Err(
+            "complete reports your own pipeline alias done; it does not go with request_id".into(),
+        );
+    }
+    let commits = take_commits(&mut args)?;
     let origin = crate::mcp::resolve_collaboration_origin(client).await?;
     let me = client
         .collaboration_context(&origin)
@@ -263,6 +278,23 @@ pub(crate) async fn call(client: &tend::ipc::Client, args: Value) -> Result<Valu
         },
         None => own_target(&me).await,
     };
+    let completion = if complete {
+        Some(completion_of(&target)?)
+    } else {
+        None
+    };
+    // A completion's record always has a key: a retry, or tendd finishing
+    // it after a crash, must return the same item.
+    let key = key.or_else(|| {
+        completion.as_ref().map(|(identity, alias, generation)| {
+            crate::review_cmd::result_key(
+                &identity.workspace_id,
+                &identity.work_id,
+                alias,
+                *generation,
+            )
+        })
+    });
     let review = tend::review::NewReview {
         target,
         summary,
@@ -274,12 +306,67 @@ pub(crate) async fn call(client: &tend::ipc::Client, args: Value) -> Result<Valu
         },
         decision,
     };
+    if let Some((identity, alias, generation)) = completion {
+        return file_and_complete(client, &review, &identity, &alias, generation).await;
+    }
     let item = crate::review_cmd::file(client, &review)
         .await
         .map_err(|error| format!("{error:#}"))?;
     Ok(serde_json::json!({
         "record": item,
         "next": format!("The person decides with `tend review accept|return {}`; nothing waits on it here.", item.id),
+    }))
+}
+
+/// The pipeline alias `complete` reports done: the record's own target,
+/// which must be the caller's managed Work alias.
+fn completion_of(
+    target: &tend::review::ReviewTarget,
+) -> Result<(tend::work::WorkIdentity, String, u64), String> {
+    match target {
+        tend::review::ReviewTarget::Work {
+            workspace,
+            work,
+            alias: Some(alias),
+            pipeline_generation: Some(generation),
+        } => Ok((
+            tend::work::WorkIdentity::new(workspace.clone(), work.clone()),
+            alias.clone(),
+            *generation,
+        )),
+        _ => Err(
+            "complete needs a managed Work alias (a pane `tend work up` started); file without complete"
+                .into(),
+        ),
+    }
+}
+
+/// File `review` and report its alias done as one tendd operation.
+async fn file_and_complete(
+    client: &tend::ipc::Client,
+    review: &tend::review::NewReview,
+    identity: &tend::work::WorkIdentity,
+    alias: &str,
+    generation: u64,
+) -> Result<Value, String> {
+    crate::review_cmd::require_filing(client, review)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    if !daemon_supports(client, tend::work_complete::CAPABILITY).await? {
+        return Err(format!(
+            "this tendd cannot file a record and complete in one operation ({}); call again without complete, then run `tend work done`",
+            tend::work_complete::CAPABILITY
+        ));
+    }
+    let (run, item) = client
+        .pipeline_done_with_record(identity, alias, generation, review)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "record": item,
+        "done": alias,
+        "generation": run.generation,
+        "next": format!("{alias} is reported done; tendd starts what waited on it. The person decides with `tend review accept|return {}`.", item.id),
     }))
 }
 

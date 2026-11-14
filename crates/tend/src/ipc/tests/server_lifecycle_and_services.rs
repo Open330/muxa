@@ -2932,3 +2932,159 @@ async fn a_fleet_review_decision_is_applied_exactly_or_reported_as_it_stands() {
     tx.send(()).unwrap();
     handle.await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one daemon round trip: set up, refuse twice, complete, retry
+async fn pipeline_done_with_a_record_files_and_completes_in_one_call() {
+    use crate::decision::{Decision, Evidence};
+    use crate::review::{ActorKind, NewReview, ReviewActor, ReviewTarget};
+    use crate::work::{WorkEdit, WorkIdentity};
+    let dir = tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let sock = dir.path().join("tend-done-record.sock");
+    let pipeline_runs = PipelineRunStore::in_memory();
+    let reviews = crate::review::ReviewStore::in_memory();
+    let server = Server::new(sock.clone(), Store::shared())
+        .with_pipeline_runs(pipeline_runs.clone())
+        .with_reviews(reviews.clone())
+        .with_work_store(Arc::new(tokio::sync::Mutex::new(
+            crate::dashboard::work_store::WorkStore::memory(),
+        )));
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+    assert!(client
+        .hello(Duration::from_secs(3))
+        .await
+        .unwrap()
+        .capabilities
+        .iter()
+        .any(|c| c == crate::work_complete::CAPABILITY));
+
+    let identity = WorkIdentity::new("ws", "WORK-9");
+    client
+        .work_edit(
+            &identity,
+            &WorkEdit {
+                title: Some("Ship it".into()),
+                cwd: Some(checkout.to_string_lossy().into_owned()),
+                checks: Some(vec![crate::work_verify::WorkCheck::new("test -f built")]),
+                ..WorkEdit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let run = client
+        .pipeline_register(&PipelineRunRegistration {
+            identity: identity.clone(),
+            pipeline: "solo".to_string(),
+            desired: vec![crate::pipeline::DesiredAgent {
+                alias: "impl".to_string(),
+                program: "codex".to_string(),
+                role: None,
+                task: None,
+                prompt: None,
+                options: Vec::new(),
+                direction: None,
+                after: Vec::new(),
+                purpose: crate::collaboration::LaunchPurpose::Primary,
+            }],
+            cwd: checkout.clone(),
+            window_id: None,
+            observed: Vec::new(),
+            invalidate: Vec::new(),
+        })
+        .await
+        .unwrap();
+    client
+        .pipeline_claim(&identity, run.generation)
+        .await
+        .unwrap();
+    let record = |generation: u64| NewReview {
+        target: ReviewTarget::Work {
+            workspace: "ws".into(),
+            work: "WORK-9".into(),
+            alias: Some("impl".into()),
+            pipeline_generation: Some(generation),
+        },
+        summary: "Built".into(),
+        anchor: None,
+        idempotency_key: Some("work-done:ipc-test".into()),
+        requested_by: ReviewActor {
+            kind: ActorKind::Agent,
+            label: None,
+        },
+        decision: Some(Decision {
+            evidence: vec![Evidence::Test {
+                command: "my own test".into(),
+                passed: Some(true),
+                tail: None,
+                verified: true,
+            }],
+            ..Decision::default()
+        }),
+    };
+    let alias_state = || async {
+        let run = pipeline_runs.list().await.remove(0);
+        let state = run.aliases["impl"].clone();
+        (state.status, state.completing.is_some())
+    };
+
+    // Another alias's or generation's record is refused outright.
+    let wrong = client
+        .pipeline_done_with_record(
+            &identity,
+            "impl",
+            run.generation,
+            &record(run.generation + 1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(wrong.contains("must target"), "{wrong}");
+
+    // A failing check: nothing filed, nothing completed, nothing pending.
+    let refused = client
+        .pipeline_done_with_record(&identity, "impl", run.generation, &record(run.generation))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("checks_failed"), "{refused}");
+    assert!(client
+        .work_record_show(&identity)
+        .await
+        .unwrap()
+        .reviews
+        .is_empty());
+    assert_eq!(alias_state().await, (PipelineAliasStatus::Running, false));
+
+    std::fs::write(checkout.join("built"), b"").unwrap();
+    let (done, item) = client
+        .pipeline_done_with_record(&identity, "impl", run.generation, &record(run.generation))
+        .await
+        .unwrap();
+    assert_eq!(done.aliases["impl"].status, PipelineAliasStatus::Done);
+    assert!(item.verification.as_ref().is_some_and(|v| v.passed));
+    // The agent's own "run by tend" claim is gone; tend's check is first.
+    let evidence = item.decision.clone().unwrap().evidence;
+    assert!(
+        matches!(&evidence[0], Evidence::Test { command, verified: true, .. } if command == "test -f built")
+    );
+    assert!(!evidence.iter().any(
+        |e| matches!(e, Evidence::Test { command, verified: true, .. } if command == "my own test")
+    ));
+    assert_eq!(alias_state().await, (PipelineAliasStatus::Done, false));
+
+    // A retry returns the same item.
+    let (_, again) = client
+        .pipeline_done_with_record(&identity, "impl", run.generation, &record(run.generation))
+        .await
+        .unwrap();
+    assert_eq!(again.id, item.id);
+
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}

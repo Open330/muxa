@@ -321,6 +321,9 @@ async fn run() -> Result<()> {
         .context("loading durable pipeline Runs")?;
     // One review store for IPC and the dashboard's decision queue.
     let reviews = build_reviews();
+    // A result filed with its completion that a crash interrupted: finish
+    // it before IPC or the reconciler can touch the alias.
+    recover_completions(&pipeline_runs, &reviews, owns_data_dir).await;
     // One Work store for IPC (the backlog) and the dashboard, so a save
     // from either never drops the other's records.
     let work_store = Arc::new(tokio::sync::Mutex::new(
@@ -1038,6 +1041,27 @@ async fn observe_pipeline_agent(
 /// rule at runtime should not have to restart the daemon to get one.
 /// The review queue. A store that cannot open is served as unavailable, so
 /// a broken review file never keeps tendd from starting.
+/// Finish the record-and-complete operations a crash interrupted
+/// (`work_done_record_v1`). Only the default daemon does this: one on an
+/// override socket or config may be sharing these stores with it.
+async fn recover_completions(
+    runs: &PipelineRunStore,
+    reviews: &tend::review::ReviewStore,
+    owns_data_dir: bool,
+) -> bool {
+    if !owns_data_dir {
+        return false;
+    }
+    for outcome in tend::work_complete::recover(runs, reviews).await {
+        if matches!(outcome, tend::work_complete::Recovered::Completed { .. }) {
+            tracing::info!(?outcome, "finished an interrupted completion");
+        } else {
+            tracing::warn!(?outcome, "interrupted completion not finished");
+        }
+    }
+    true
+}
+
 fn build_reviews() -> tend::review::ReviewStore {
     let Some(path) = tend::review::ReviewStore::default_path() else {
         tracing::warn!("no data directory; review items are unavailable");

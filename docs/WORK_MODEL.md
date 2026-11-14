@@ -113,8 +113,11 @@ than holding it.
   fix and report again. The person is not asked.
 
 Every result and every completion runs the checks afresh: a pass from an
-earlier call cannot show that what is completed now is what was checked, so
-`tend work done --summary` (file, then complete) runs them twice.
+earlier call cannot show that what is completed now is what was checked.
+`tend work done --summary` and `tend_file_result` with `complete: true` file
+the record and complete the alias as one tendd operation, so the checks run
+once, and a crash between the two halves is finished when tendd next starts:
+a filed result is never left with its alias still open.
 
 The filed record keeps tend's results apart from the agent's account
 (`verification` on the review item), and every surface shows them first:

@@ -184,7 +184,7 @@ impl ResultRecordArgs {
 /// A bounded idempotency key for a completion: `work-done:` and a digest
 /// of the JSON tuple, so no component can shift into another (names may
 /// contain `/`) and long Work names stay within the key limit.
-fn result_key(workspace: &str, work: &str, alias: &str, generation: u64) -> String {
+pub(crate) fn result_key(workspace: &str, work: &str, alias: &str, generation: u64) -> String {
     use sha2::Digest as _;
     let tuple = serde_json::to_string(&(workspace, work, alias, generation)).unwrap_or_default();
     let digest = sha2::Sha256::digest(tuple.as_bytes());
@@ -197,11 +197,17 @@ fn result_key(workspace: &str, work: &str, alias: &str, generation: u64) -> Stri
 
 /// File `review` after checking the daemon serves what it carries.
 pub(crate) async fn file(client: &Client, review: &NewReview) -> Result<ReviewItem> {
+    require_filing(client, review).await?;
+    Ok(client.review_create(review).await?)
+}
+
+/// Refuse before sending when the daemon cannot store `review` as given.
+pub(crate) async fn require_filing(client: &Client, review: &NewReview) -> Result<()> {
     require_capability(client).await?;
     if review.decision.is_some() {
         require_decision_capability(client).await?;
     }
-    Ok(client.review_create(review).await?)
+    Ok(())
 }
 
 /// Top of the git checkout holding the current directory, if any.
