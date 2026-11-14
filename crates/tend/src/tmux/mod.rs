@@ -84,11 +84,12 @@ pub fn tmux_command() -> Command {
     cmd
 }
 
-/// Whether an inherited `$TMUX` must be dropped from tmux invocations: only
-/// for a daemon restricted to its own tmux directory, and only when it has
-/// one.
-fn inherited_tmux_is_foreign(own_dir_only: bool, has_tmux_tmpdir: bool) -> bool {
-    own_dir_only && has_tmux_tmpdir
+/// Whether an inherited `$TMUX` must be dropped from tmux invocations: for
+/// any daemon restricted to its own tmux directory (with one or without).
+fn inherited_tmux_is_foreign(own_dir_only: bool, _has_tmux_tmpdir: bool) -> bool {
+    // Its own directory or none, the server an inherited `$TMUX` names is
+    // the user's.
+    own_dir_only
 }
 
 pub fn tmux_binary() -> &'static Path {
@@ -1950,7 +1951,9 @@ mod tests {
     #[test]
     fn a_private_daemon_drops_an_inherited_tmux_only_with_its_own_dir() {
         assert!(inherited_tmux_is_foreign(true, true));
-        assert!(!inherited_tmux_is_foreign(true, false));
+        // No tmux directory of its own: the inherited server is still the
+        // user's, so it is dropped too.
+        assert!(inherited_tmux_is_foreign(true, false));
         assert!(!inherited_tmux_is_foreign(false, true));
     }
 

@@ -466,6 +466,11 @@ pub fn endpoint_from_value(value: &str) -> Option<String> {
 /// Socket path advertised to the current rmux pane.
 #[must_use]
 pub fn endpoint_from_env() -> Option<String> {
+    // A daemon that is not the user's never follows an inherited `$RMUX`
+    // to the user's server (see `tmux::scanner::restrict_to_own_tmux_dir`).
+    if crate::tmux::scanner::own_tmux_dir_only() {
+        return None;
+    }
     endpoint_from_value(&std::env::var("RMUX").ok()?)
 }
 

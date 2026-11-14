@@ -151,9 +151,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherited `$TMUX` and pointed every newly spawned pane on the owner's
   server at a socket that went away with it. Only the daemon that owns the
   default data directory, with no XDG directory overridden to somewhere
-  non-standard, heals. Any other daemon also keeps to its own `TMUX_TMPDIR`
-  and drops an inherited `$TMUX`. `tend init` skips its live
-  `TEND_SOCKET` pin under the same condition.
+  non-standard, heals. The account's home comes from the user database, so
+  a redirected `HOME` does not count as the user's. Any other daemon watches
+  only its own `TMUX_TMPDIR` (no tmux server without one) and ignores an
+  inherited `$TMUX` or `$RMUX`. Under the same condition `tend init` neither
+  reloads the running tmux server's config nor pins `TEND_SOCKET` on it.
 
 - `docs/ACCOUNT_SWAP.md` now says where `[swap] relaunch = "respawn"`
   applies: the daemon's automation and `tend swap --local`. A `tend swap`

@@ -210,28 +210,38 @@ pub fn data_dir() -> Option<PathBuf> {
     xdg_dir("XDG_DATA_HOME", dirs::data_dir)
 }
 
-/// The XDG directory variables this process overrides to somewhere other
-/// than their conventional place, by name. A scratch or test daemon is
-/// started with these pointing at its own directories, which makes every
-/// `default_*` path here (socket, config, data) its own, so comparing a
-/// path with its default cannot tell it from the user's daemon. Setting a
-/// variable to its spec default (`$HOME/.config`, `/run/user/<uid>`, …) is
-/// not an override.
+/// The directory variables (`HOME` and the XDG ones tend reads) this
+/// process sets to somewhere other than the account's own, by name. A
+/// scratch or test daemon is started with these pointing at its own
+/// directories, which makes every `default_*` path here (socket, config,
+/// data) its own, so comparing a path with its default cannot tell it from
+/// the user's daemon. The reference is the account's home from the user
+/// database, not `$HOME`, which the scratch setup controls. A variable set
+/// to the spec default (`$HOME/.config`, `/run/user/<uid>`, …) or to
+/// another spelling of the same directory (a symlink) is not an override.
 #[must_use]
-pub fn xdg_dirs_overridden() -> Vec<&'static str> {
-    let home = dirs::home_dir();
-    XDG_DIRS
-        .iter()
-        .filter(|(key, _)| {
-            std::env::var_os(key).is_some_and(|value| {
-                !value.is_empty() && !is_conventional(key, Path::new(&value), home.as_deref())
+pub fn default_dirs_overridden() -> Vec<&'static str> {
+    let home = account_home();
+    let mut overridden = Vec::new();
+    if let (Some(env_home), Some(home)) = (std::env::var_os("HOME"), home.as_deref()) {
+        if !env_home.is_empty() && !same_dir(Path::new(&env_home), home) {
+            overridden.push("HOME");
+        }
+    }
+    overridden.extend(
+        XDG_DIRS
+            .iter()
+            .filter(|(key, _)| {
+                std::env::var_os(key).is_some_and(|value| {
+                    !value.is_empty() && !is_conventional(key, Path::new(&value), home.as_deref())
+                })
             })
-        })
-        .map(|(key, _)| *key)
-        .collect()
+            .map(|(key, _)| *key),
+    );
+    overridden
 }
 
-/// The XDG variables tend reads, with their spec default under `$HOME`
+/// The XDG variables tend reads, with their spec default under the home
 /// (`None`: the runtime dir, whose default is `/run/user/<uid>`).
 const XDG_DIRS: &[(&str, Option<&str>)] = &[
     ("XDG_RUNTIME_DIR", None),
@@ -240,15 +250,43 @@ const XDG_DIRS: &[(&str, Option<&str>)] = &[
     ("XDG_STATE_HOME", Some(".local/state")),
 ];
 
+/// The account's home from the user database (`getpwuid`), independent of
+/// `$HOME`.
+#[cfg(unix)]
+fn account_home() -> Option<PathBuf> {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|user| user.dir)
+}
+
+#[cfg(not(unix))]
+fn account_home() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+/// Two spellings of one directory: equal, or the same once resolved (when
+/// both exist).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let trim = |p: &Path| PathBuf::from(p.to_string_lossy().trim_end_matches('/'));
+    let (a, b) = (trim(a), trim(b));
+    a == b
+        || matches!(
+            (std::fs::canonicalize(&a), std::fs::canonicalize(&b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 fn is_conventional(key: &str, value: &Path, home: Option<&Path>) -> bool {
-    let value = value.to_string_lossy();
-    let value = Path::new(value.trim_end_matches('/'));
     match XDG_DIRS.iter().find(|(k, _)| *k == key) {
-        Some((_, Some(relative))) => home.is_some_and(|home| value == home.join(relative)),
+        Some((_, Some(relative))) => home.is_some_and(|home| same_dir(value, &home.join(relative))),
         Some((_, None)) => {
             #[cfg(unix)]
             {
-                value == Path::new(&format!("/run/user/{}", posix_uid()))
+                same_dir(
+                    value,
+                    Path::new(&format!("/run/user/{}", nix::unistd::getuid().as_raw())),
+                )
             }
             #[cfg(not(unix))]
             {
@@ -292,6 +330,37 @@ mod tests {
     }
 
     #[test]
+    fn another_spelling_of_the_home_is_not_an_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join(".config")).unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(same_dir(&link, &real));
+            assert!(is_conventional(
+                "XDG_CONFIG_HOME",
+                &real.join(".config"),
+                Some(&link)
+            ));
+        }
+        assert!(!same_dir(&real, dir.path()));
+        assert!(same_dir(
+            Path::new("/nonexistent/x/"),
+            Path::new("/nonexistent/x")
+        ));
+    }
+
+    #[test]
+    fn the_account_home_comes_from_the_user_database() {
+        // Whatever `$HOME` says in this test process, the reference is the
+        // account's own home, which exists.
+        #[cfg(unix)]
+        assert!(account_home().is_some_and(|home| home.is_absolute()));
+    }
+
+    #[test]
     fn only_a_non_conventional_xdg_dir_is_an_override() {
         let home = Path::new("/home/u");
         assert!(is_conventional(
@@ -326,7 +395,7 @@ mod tests {
         ));
         #[cfg(unix)]
         {
-            let run = format!("/run/user/{}", posix_uid());
+            let run = format!("/run/user/{}", nix::unistd::getuid().as_raw());
             assert!(is_conventional(
                 "XDG_RUNTIME_DIR",
                 Path::new(&run),

@@ -281,7 +281,7 @@ async fn run() -> Result<()> {
     // The user's daemon, as opposed to a scratch or test one. One started
     // with its own XDG directories owns *those* (its default socket and
     // config are its own), but not the user's tmux servers.
-    let xdg_overrides = paths::xdg_dirs_overridden();
+    let xdg_overrides = paths::default_dirs_overridden();
     let user_daemon = is_primary_daemon(owns_data_dir, &xdg_overrides);
     if !user_daemon {
         if owns_data_dir {
@@ -2293,7 +2293,7 @@ fn should_heal_tmux_socket_env(
 
 /// Whether this tendd is the user's own daemon: the one that owns the
 /// default data directory ([`owns_default_data_dir`]) *and* was not started
-/// with its own XDG directories ([`paths::xdg_dirs_overridden`]). Only it
+/// with its own XDG directories ([`paths::default_dirs_overridden`]). Only it
 /// may write tmux server-global state (the `TEND_SOCKET` heal) or watch the
 /// user's tmux servers. A scratch daemon whose `XDG_RUNTIME_DIR` points at
 /// its own directory has that directory's socket as its default, so the

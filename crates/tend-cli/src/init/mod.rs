@@ -104,7 +104,7 @@ fn pin_tend_socket_live(socket: &std::path::Path) {
     // Not from a scratch HOME/XDG setup, though: its socket is its own, and
     // the ambient server (an inherited `$TMUX`) is the user's, whose panes
     // would then point at a socket that goes away with the scratch daemon.
-    let overrides = tend::paths::xdg_dirs_overridden();
+    let overrides = tend::paths::default_dirs_overridden();
     let server_up = overrides.is_empty()
         && crate::mux_control::ambient_command()
             .arg("list-sessions")
