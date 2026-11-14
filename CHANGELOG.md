@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- `tend work done --summary` files its result record and completes the
-  alias as one tendd operation (`work_done_record_v1`), and runs the Work's
-  checks once instead of twice. A crash between the two halves is finished
-  when tendd next starts, so a filed result is never left with its alias
-  open. `tend_file_result` takes `complete: true` to do the same from MCP.
-
 ### Added
 
 - Results on other Fleet hosts can be accepted, sent back or withdrawn from
@@ -33,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence.
 
 ### Changed
+
+- `tend work done --summary` files its result record and completes the
+  alias as one tendd operation (`work_done_record_v1`), and runs the Work's
+  checks once instead of twice. A crash between the two halves is finished
+  when tendd next starts, so a filed result is never left with its alias
+  open. `tend_file_result` takes `complete: true` to do the same from MCP.
 
 - A `work up` or `agent start` that another Fleet host sends this one runs
   inside its tendd too, through the same code as a local request, instead
