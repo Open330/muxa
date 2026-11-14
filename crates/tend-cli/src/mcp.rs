@@ -6702,11 +6702,11 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("scripted.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tend::transport::Listener::bind(&socket).unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = seen.clone();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -8718,11 +8718,11 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("old-daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tend::transport::Listener::bind(&socket).unwrap();
         let kinds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let record = kinds.clone();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -8769,11 +8769,11 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("old-controller.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tend::transport::Listener::bind(&socket).unwrap();
         let kinds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let record = kinds.clone();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {

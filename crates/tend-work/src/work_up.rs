@@ -1532,9 +1532,9 @@ mod reconcile_tests {
     fn hello_daemon(capabilities: &'static [&'static str]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("tend.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tend::transport::Listener::bind(&socket).unwrap();
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
                 let mut line = String::new();
@@ -1612,10 +1612,10 @@ mod reconcile_tests {
         let runs = store.list().await;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("tend.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tend::transport::Listener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             for expected in ["list", "first", "second"] {
-                let (stream, _) = listener.accept().await.unwrap();
+                let stream = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
                 let mut line = String::new();
@@ -1685,12 +1685,12 @@ mod reconcile_tests {
             pane: Some("%999".into()),
         };
         let listener = runtime
-            .block_on(async { tokio::net::UnixListener::bind(&socket) })
+            .block_on(async { tend::transport::Listener::bind(&socket) })
             .unwrap();
         {
             let (cancel, seen) = (cancel.clone(), seen.clone());
             runtime.spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
+                while let Ok(stream) = listener.accept().await {
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
                     let mut line = String::new();

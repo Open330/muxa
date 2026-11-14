@@ -1148,6 +1148,7 @@ version = "0.1.0"
 
     /// A stand-in `tend` that accepts exactly the preflight invocation
     /// (`--config <p> config check --from <p>`) and then exits with `code`.
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     fn fake_tend(path: &Path, code: i32) {
         use std::os::unix::fs::PermissionsExt;
         fs::write(
@@ -1161,6 +1162,7 @@ version = "0.1.0"
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     #[test]
     fn config_check_reports_the_new_builds_refusal() {
         let dir = tempdir().unwrap();
@@ -1180,6 +1182,7 @@ version = "0.1.0"
         assert!(error.contains(&config.display().to_string()), "{error}");
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     #[test]
     fn config_check_is_skipped_without_a_config_file() {
         let dir = tempdir().unwrap();
@@ -1189,6 +1192,7 @@ version = "0.1.0"
         check_config_with(&bad, Some(&dir.path().join("absent.toml")), "HINT").unwrap();
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     fn release_fixture(new_tend_exit: i32) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let dir = tempdir().unwrap();
         let staged = dir.path().join("staged");
@@ -1204,6 +1208,7 @@ version = "0.1.0"
         (dir, staged, install, config)
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     #[test]
     fn release_install_keeps_the_old_binaries_when_the_config_is_refused() {
         let (_dir, staged, install, config) = release_fixture(1);
@@ -1225,6 +1230,7 @@ version = "0.1.0"
         assert!(!install.join("tendd.bak").exists());
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     #[test]
     fn release_install_replaces_once_the_config_is_accepted() {
         let (_dir, staged, install, config) = release_fixture(0);
@@ -1243,6 +1249,7 @@ version = "0.1.0"
     /// Drives `build_check_install` with a fake `cargo install` that drops a
     /// `tend` exiting `new_tend_exit` into the staging root, and returns the
     /// root of every install it was asked for (`None` = the live install).
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     fn source_install(new_tend_exit: i32) -> (Result<()>, Vec<Option<PathBuf>>, PathBuf) {
         let dir = tempdir().unwrap();
         let staging = dir.path().join("staging");
@@ -1260,6 +1267,7 @@ version = "0.1.0"
         (result, roots, staging)
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     #[test]
     fn source_install_never_touches_the_live_binaries_when_the_config_is_refused() {
         let (result, roots, staging) = source_install(1);
@@ -1276,6 +1284,7 @@ version = "0.1.0"
         assert!(!staging.exists(), "staging root is cleaned up");
     }
 
+    #[cfg(unix)] // runs a `#!/bin/sh` stand-in for tend
     #[test]
     fn source_install_stages_checks_then_installs() {
         let (result, roots, staging) = source_install(0);
@@ -1366,7 +1375,7 @@ version = "0.1.0"
     async fn serving_probe_requires_an_ipc_answer() {
         let dir = tempdir().unwrap();
         let socket = dir.path().join("bound-but-silent.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _listener = tend::transport::Listener::bind(&socket).unwrap();
 
         assert!(
             !wait_for_daemon_serving(&socket, Duration::from_millis(300)).await,

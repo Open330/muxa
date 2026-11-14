@@ -202,7 +202,8 @@ async fn reconcile_in_process(
     }
 }
 
-#[cfg(test)]
+// Every test here runs a `#!/bin/sh` worker script.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::Path;

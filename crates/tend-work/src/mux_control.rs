@@ -266,6 +266,7 @@ impl Control {
 mod tests {
     use super::*;
 
+    #[cfg(unix)] // drives a `#!/bin/sh` stand-in for rmux
     #[test]
     fn lifecycle_commands_use_one_rmux_server_and_keep_termination_guards() {
         use std::os::unix::fs::PermissionsExt;

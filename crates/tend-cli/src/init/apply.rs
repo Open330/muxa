@@ -787,6 +787,7 @@ mod tests {
         assert!(!dir.path().join("config.toml.lock").exists());
     }
 
+    #[cfg(unix)] // Unix file modes
     #[test]
     fn backup_inherits_original_mode() {
         use std::os::unix::fs::PermissionsExt;
