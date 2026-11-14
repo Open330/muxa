@@ -141,32 +141,16 @@ fn canonical(endpoint: &BackendEndpoint, pane: &str) -> String {
     }
 }
 fn endpoint(args: &Args) -> Result<BackendEndpoint> {
-    let host = match args.host {
-        Some(HostArg::Rmux) => HostKind::Rmux,
-        None if args
-            .pane
-            .as_deref()
-            .is_some_and(|pane| pane.starts_with("rmux:"))
-            || tend::backend::rmux::endpoint_from_env().is_some() =>
-        {
-            HostKind::Rmux
-        }
-        Some(HostArg::Tmux) | None => HostKind::Tmux,
-    };
-    let socket = args
-        .mux_socket
-        .clone()
-        .or_else(|| {
-            if host == HostKind::Rmux {
-                tend::backend::rmux::endpoint_from_env()
-            } else {
-                std::env::var("TMUX")
-                    .ok()
-                    .and_then(|value| value.split(',').next().map(str::to_string))
-            }
-        })
-        .context("sidebar needs a tmux/rmux server; specify --host and --mux-socket")?;
-    Ok(BackendEndpoint { host, socket })
+    crate::agent_move::resolve_endpoint(
+        args.host.map(|host| match host {
+            HostArg::Tmux => HostKind::Tmux,
+            HostArg::Rmux => HostKind::Rmux,
+        }),
+        args.pane.as_deref(),
+        args.mux_socket.as_deref(),
+        &crate::agent_move::AmbientMux::from_env(),
+    )
+    .context("sidebar needs a tmux/rmux server; specify --host and --mux-socket")
 }
 fn lock(endpoint: &BackendEndpoint) -> Result<File> {
     use std::hash::{Hash, Hasher};
@@ -245,7 +229,7 @@ pub async fn run(
     if matches!(args.action, Some(Action::Run)) {
         let pane = args
             .pane
-            .or_else(|| tend::default_backend().current_pane())
+            .or_else(|| tend::identity_backend().current_pane())
             .context("sidebar could not identify its own pane")?;
         let pane = canonical(&endpoint, &pane);
         return crate::watch::sidebar::run(client, config, endpoint, pane, launch).await;

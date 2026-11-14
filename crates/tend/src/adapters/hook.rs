@@ -113,7 +113,7 @@ impl HookPlace {
             None
         } else {
             host_pane_env()
-                .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()))
+                .or_else(|| resolve_pane_via_ancestry(crate::backend::identity_backend().as_ref()))
         };
         Self {
             pane,

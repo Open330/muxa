@@ -5041,6 +5041,15 @@ async fn send_prompt_with_local_cmux(
 }
 
 fn prompt_socket_from_env(pane: &str) -> Option<String> {
+    // Restricted to its own multiplexer (aimed at a daemon that is not the
+    // user's): an inherited endpoint is never a target to type into.
+    prompt_socket_if_allowed(pane, tend::tmux::scanner::ambient_mux_allowed())
+}
+
+fn prompt_socket_if_allowed(pane: &str, allowed: bool) -> Option<String> {
+    if !allowed {
+        return None;
+    }
     match tend::backend::pane_id_host_kind(pane) {
         Some(tend::HostKind::Rmux) => tend::backend::rmux::endpoint_from_env(),
         Some(tend::HostKind::Tmux) => {
@@ -5654,7 +5663,7 @@ impl SwapPlan {
 }
 
 fn own_pane() -> Option<String> {
-    tend::default_backend()
+    tend::identity_backend()
         .current_pane()
         .or_else(current_process_host_pane)
 }
@@ -9685,5 +9694,11 @@ mod tests {
         )
         .is_err());
         assert!(swap_plan(&json!({"idle_timeout": "1m"}), None, None).is_err());
+    }
+
+    #[test]
+    fn a_restricted_cli_never_fills_a_prompt_socket_from_its_own_tmux() {
+        assert_eq!(super::prompt_socket_if_allowed("%42", false), None);
+        assert_eq!(super::prompt_socket_if_allowed("rmux:%42", false), None);
     }
 }

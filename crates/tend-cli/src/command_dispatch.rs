@@ -27,6 +27,11 @@ pub(super) async fn main() -> Result<()> {
         return Ok(());
     }
     let cmd = args.cmd.unwrap_or(Cmd::Start);
+    // Before anything reads a multiplexer (popups, moves, the sidebar, any
+    // topology): a command aimed at a daemon that is not the user's never
+    // reads the user's tmux/rmux server.
+    let mut early_config =
+        keep_off_the_users_mux(&cmd, args.socket.as_deref(), args.config.as_deref());
     if let Cmd::Agent {
         action: AgentCmd::Move(move_args),
     } = &cmd
@@ -64,7 +69,12 @@ pub(super) async fn main() -> Result<()> {
     }
     let config_path = args.config.clone().or_else(paths::default_config_file);
     let skill_path = config_path.clone();
-    let cfg = match Config::load_or_default(config_path.as_deref()) {
+    // Loaded once: the ownership check above read this same file.
+    let loaded = match early_config.take() {
+        Some(cfg) => Ok(cfg),
+        None => Config::load_or_default(config_path.as_deref()),
+    };
+    let cfg = match loaded {
         Ok(cfg) => cfg,
         // A hook handler must not hard-fail on an unreadable config. agy
         // reads a non-zero hook exit as its verdict
@@ -347,4 +357,62 @@ pub(super) async fn main() -> Result<()> {
         let _ = invalidation_client.invalidate_agent_directory().await;
     }
     result
+}
+
+/// A CLI talking to a daemon that is not the user's (`--socket`,
+/// `--config` naming another socket, or its own HOME/XDG setup) reads panes
+/// only from that daemon's side: never the user's tmux/rmux server through
+/// its own `$TMUX`/`$RMUX`, which inside a real pane would merge the owner's
+/// panes into a scratch daemon's topology. Decided once, with the same
+/// socket and config the command will use. `tend hook` is left alone: it
+/// names its own pane from them.
+fn keep_off_the_users_mux(
+    cmd: &Cmd,
+    socket: Option<&std::path::Path>,
+    config: Option<&std::path::Path>,
+) -> Option<Config> {
+    let mut loaded = None;
+    let restrict = mux_restriction_needed(cmd, || {
+        let config_path = config
+            .map(std::path::Path::to_path_buf)
+            .or_else(paths::default_config_file);
+        loaded = Config::load_or_default(config_path.as_deref()).ok();
+        let cfg_socket = loaded.as_ref().and_then(|cfg| cfg.socket.clone());
+        let socket = socket
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| cfg_socket.clone())
+            .unwrap_or_else(paths::default_socket);
+        paths::talks_to_users_daemon(&socket, config, cfg_socket.as_deref())
+    });
+    if restrict {
+        tend::tmux::scanner::restrict_to_own_tmux_dir();
+    }
+    loaded
+}
+
+fn mux_restriction_needed(cmd: &Cmd, users_daemon: impl FnOnce() -> bool) -> bool {
+    !matches!(cmd, Cmd::Hook { .. }) && !users_daemon()
+}
+
+#[cfg(test)]
+mod mux_restriction_tests {
+    use super::*;
+
+    #[test]
+    fn a_cli_for_another_daemon_stays_off_the_users_mux_but_hooks_do_not() {
+        // `tend --socket <scratch> status` and the like.
+        assert!(mux_restriction_needed(&Cmd::Panes, || false));
+        // The user's own daemon: unchanged.
+        assert!(!mux_restriction_needed(&Cmd::Panes, || true));
+        // A hook names its own pane from `$TMUX`; it is never restricted,
+        // and the check is not even made.
+        let hook = Cmd::Hook {
+            which: crate::HookCmd::Claude {
+                event: "stop".into(),
+            },
+        };
+        assert!(!mux_restriction_needed(&hook, || panic!(
+            "not asked for a hook"
+        )));
+    }
 }

@@ -292,6 +292,15 @@ pub(crate) fn own_tmux_dir_only() -> bool {
     OWN_TMUX_DIR_ONLY.load(Ordering::Relaxed)
 }
 
+/// Whether this process may infer a multiplexer endpoint from its own
+/// environment (`$TMUX`, `$RMUX`, a default server): not once
+/// [`restrict_to_own_tmux_dir`] was called. An explicit endpoint
+/// (`--server-socket`, `--mux-socket`) is always allowed.
+#[must_use]
+pub fn ambient_mux_allowed() -> bool {
+    !own_tmux_dir_only()
+}
+
 fn socket_dirs(
     tmux_tmpdir: Option<&str>,
     own_dir_only: bool,

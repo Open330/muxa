@@ -27,7 +27,10 @@ pub fn own_tmux_pane() -> Option<String> {
 /// …), under the same rule as [`own_tmux_pane`]: `None` when the pane env was
 /// inherited from a shared Codex app-server.
 pub fn own_current_pane() -> Option<String> {
-    own_pane_from(tend::default_backend().current_pane(), pane_env_is_borrowed)
+    own_pane_from(
+        tend::identity_backend().current_pane(),
+        pane_env_is_borrowed,
+    )
 }
 
 pub fn own_pane_from(pane: Option<String>, borrowed: impl FnOnce() -> bool) -> Option<String> {
@@ -36,7 +39,7 @@ pub fn own_pane_from(pane: Option<String>, borrowed: impl FnOnce() -> bool) -> O
 }
 
 pub fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
-    let pane = tend::default_backend()
+    let pane = tend::identity_backend()
         .current_pane()
         .or_else(current_process_host_pane)
         .ok_or_else(|| {

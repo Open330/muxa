@@ -54,6 +54,15 @@ impl RmuxBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            endpoint: ambient_endpoint(),
+        }
+    }
+
+    /// The backend for naming this process's own pane: the `$RMUX` it runs
+    /// under, whether or not it may act on that server.
+    #[must_use]
+    pub fn for_identity() -> Self {
+        Self {
             endpoint: endpoint_from_env(),
         }
     }
@@ -466,12 +475,28 @@ pub fn endpoint_from_value(value: &str) -> Option<String> {
 /// Socket path advertised to the current rmux pane.
 #[must_use]
 pub fn endpoint_from_env() -> Option<String> {
-    // A daemon that is not the user's never follows an inherited `$RMUX`
-    // to the user's server (see `tmux::scanner::restrict_to_own_tmux_dir`).
-    if crate::tmux::scanner::own_tmux_dir_only() {
-        return None;
-    }
     endpoint_from_value(&std::env::var("RMUX").ok()?)
+}
+
+/// [`endpoint_from_env`] as a server to act on or observe: `None` for a
+/// process restricted to its own multiplexer (a daemon that is not the
+/// user's, or a CLI aimed at one), whose inherited `$RMUX` names the user's
+/// server. [`endpoint_from_env`] itself stays readable as identity (which
+/// host and pane this process runs in).
+#[must_use]
+pub fn ambient_endpoint() -> Option<String> {
+    ambient_endpoint_with(
+        crate::tmux::scanner::ambient_mux_allowed(),
+        endpoint_from_env,
+    )
+}
+
+fn ambient_endpoint_with(allowed: bool, env: impl FnOnce() -> Option<String>) -> Option<String> {
+    if allowed {
+        env()
+    } else {
+        None
+    }
 }
 
 /// Whether `socket` is an rmux server's control endpoint: a socket under an
@@ -559,6 +584,15 @@ fn parse_pane_observation(stdout: &str, endpoint: Option<&str>) -> PaneObservati
 fn rmux_command(endpoint: Option<&str>) -> Command {
     let mut command = Command::new(rmux_binary());
     command.env("LC_ALL", "en_US.UTF-8");
+    if endpoint.is_none_or(|endpoint| endpoint.trim().is_empty())
+        && !crate::tmux::scanner::ambient_mux_allowed()
+    {
+        // No endpoint and not allowed the user's servers: rmux's default
+        // server (or an inherited `$RMUX`) would be the user's. Point it
+        // nowhere instead.
+        fail_closed(&mut command);
+        return command;
+    }
     if let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) {
         // rmux 0.10 can let an inherited pane override an explicit grouped
         // window target in display-message, returning empty identity fields.
@@ -569,6 +603,20 @@ fn rmux_command(endpoint: Option<&str>) -> Command {
     }
     command
 }
+
+/// An rmux command that can reach no server: no inherited endpoint or pane,
+/// and an explicit socket that does not exist.
+fn fail_closed(command: &mut Command) {
+    command
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .arg("-S")
+        .arg(UNREACHABLE_SOCKET);
+}
+
+const UNREACHABLE_SOCKET: &str = "/nonexistent/tend-not-the-users-daemon/rmux";
 
 /// The pipe the server behind `endpoint` listens on now.
 ///
@@ -998,6 +1046,36 @@ mod tests {
                 "paste marker did not appear before timeout: {captured:?}"
             );
             std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn an_inherited_rmux_is_identity_but_not_a_server_to_use_when_restricted() {
+        let env = || Some("/tmp/rmux-501/default".to_owned());
+        assert_eq!(
+            ambient_endpoint_with(true, env).as_deref(),
+            Some("/tmp/rmux-501/default")
+        );
+        assert_eq!(ambient_endpoint_with(false, env), None);
+    }
+
+    #[test]
+    fn a_fail_closed_command_names_only_an_unreachable_socket() {
+        let mut command = Command::new("rmux");
+        fail_closed(&mut command);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-S", UNREACHABLE_SOCKET]);
+        assert!(!std::path::Path::new(UNREACHABLE_SOCKET).exists());
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE"] {
+            assert!(removed.iter().any(|k| k == key), "{key}");
         }
     }
 }

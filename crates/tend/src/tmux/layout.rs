@@ -43,7 +43,7 @@ use super::{command_output_with_timeout, TMUX_COMMAND_TIMEOUT};
 // These helpers describe the invoking terminal. Explicit tmux endpoint
 // queries below continue to use the native tmux transport.
 fn tmux_command() -> std::process::Command {
-    if let Some(socket) = crate::backend::rmux::endpoint_from_env() {
+    if let Some(socket) = crate::backend::rmux::ambient_endpoint() {
         crate::RmuxBackend::with_endpoint(socket).command(None)
     } else {
         super::tmux_command_scoped()
