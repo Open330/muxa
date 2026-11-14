@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Turn-boundary delivery for GitHub Copilot CLI. At the end of a turn,
+  `tend hook copilot` offers the session the requests the user authorized
+  for it, as Copilot's `agentStop` hook output `{"decision": "block",
+  "reason": …}`, and Copilot runs them as its next turn instead of having
+  them typed into the pane. The text tells the model to claim and reply
+  with the `tend` command in its shell, since Copilot has no tend MCP
+  server. Checked against Copilot CLI 1.0.110: a request offered this way
+  was claimed and answered.
+
 - The Decided tab on the web "Needs you" page covers every connected Fleet
   host, as the queue does. A new read-only Fleet operation
   (`fleet_decision_history_v1`) brings a host's past decisions, read there

@@ -34,9 +34,10 @@ missing or incomplete file when Copilot is installed.
 | `errorOccurred` | error |
 | `sessionEnd` | stopped |
 
-`tend hook copilot` prints nothing and always exits 0, whatever it receives:
+`tend hook copilot` always exits 0 and prints nothing on every hook but one:
 Copilot reads a `preToolUse` or `permissionRequest` hook's output as a
-decision, so watching can never deny a tool.
+decision, so watching can never deny a tool. The exception is `agentStop`,
+below.
 
 Notes from the 1.0.110 check:
 
@@ -73,3 +74,24 @@ tendd's keeps the hooks-only behaviour.
 
 On 1.0.110, Esc on a permission prompt settled the row within two seconds;
 the next prompt then worked as usual.
+
+## Turn-boundary delivery
+
+At the end of a turn, `tend hook copilot --event agent_stop` asks tendd for
+the requests the user authorized for this session (`tend msg send …
+--user-authorized`, or the MCP `user_authorized` flag), the same offers a
+Claude Code Stop hook gets. When there are any it prints `{"decision":
+"block", "reason": TEXT}`, and Copilot runs another turn with TEXT as its
+prompt, so nothing is typed into the pane. The offers are asked for before
+the stop is recorded, as at a Claude Code Stop. tend's offer budget bounds
+the repeats, and Copilot also ends the turn after 8 blocks in a row.
+
+Copilot has no tend MCP server, so TEXT starts by telling the model to use
+the `tend` command in its shell (`tend msg accept ID --json`, then `tend msg
+reply ID BODY`). Copilot asks before running a shell command unless you allow
+it (`--allow-tool 'shell(tend)'`).
+
+Checked on 1.0.110 against a scratch tendd: a request from a Claude session
+in the same window, queued while Copilot was idle, was offered at the end of
+Copilot's next turn. Copilot claimed it with `tend msg accept`, and the reply
+`PONG` reached the sender with `tend msg reply`.
