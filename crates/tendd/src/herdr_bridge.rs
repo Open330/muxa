@@ -956,12 +956,12 @@ mod no_unix_socket {
     pub(super) struct UnixStream(Infallible);
 
     impl UnixStream {
-        #[allow(clippy::unused_async)]
-        pub(super) async fn connect<P: AsRef<Path>>(_path: P) -> io::Result<Self> {
-            Err(io::Error::new(
+        /// Awaited like tokio's; always fails here.
+        pub(super) fn connect<P: AsRef<Path>>(_path: P) -> std::future::Ready<io::Result<Self>> {
+            std::future::ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "herdr is not available on this platform",
-            ))
+            )))
         }
 
         pub(super) fn into_split(self) -> (tokio::io::Empty, tokio::io::Sink) {

@@ -1232,6 +1232,7 @@ fn account_configs(
 /// script a `node` launcher runs. Codex app-servers count (they run attached
 /// threads' MCP with their own `CODEX_HOME`); helpers that share a Claude
 /// session's config (its background daemon) do not.
+#[cfg(any(unix, test))]
 fn agent_host(args: &str) -> Option<Host> {
     let mut words = args.split_whitespace();
     let mut program = words.next()?;
@@ -1253,6 +1254,7 @@ fn agent_host(args: &str) -> Option<Host> {
 /// The config a process with environment `environ` reads: its provider
 /// variable when absolute, else its own `HOME`'s default. `None` when that
 /// cannot be told (a relative home, no `HOME`).
+#[cfg(any(unix, test))]
 fn process_config(host: Host, environ: &[(String, String)]) -> Option<PathBuf> {
     let get = |key: &str| {
         environ

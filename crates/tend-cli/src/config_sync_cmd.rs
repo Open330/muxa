@@ -126,6 +126,7 @@ fn store_state(config: &Path, text: &str) -> Result<()> {
     result
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
