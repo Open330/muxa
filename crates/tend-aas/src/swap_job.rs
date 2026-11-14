@@ -1927,6 +1927,7 @@ fn prepare_file(path: &Path) -> Result<(), JobError> {
 
 /// Owner-only permissions on the database and its WAL and shared-memory
 /// files.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn secure_files(path: &Path) -> Result<(), JobError> {
     #[cfg(unix)]
     {
