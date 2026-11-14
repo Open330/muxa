@@ -669,6 +669,15 @@ pub fn relaunch_line(
             _ => (None, rest),
         };
         words.extend(frontend);
+        // `aas exec <account> -- …`: the `--` is aas's own; the agent's
+        // arguments (and Codex's overrides) start after it.
+        let args = match args.first().map(String::as_str) {
+            Some("--") => {
+                words.push("--".into());
+                &args[1..]
+            }
+            _ => args,
+        };
         words.extend(relaunch_args(args, kind, session_id));
     } else {
         if bare == BareMode::Skip {

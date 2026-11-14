@@ -2140,8 +2140,19 @@ fn relaunch_command_without_home(pane: &PaneShape) -> Option<String> {
 /// not plainly start Codex is left as it is (and, if it stops on a startup
 /// dialog, the restore reports it).
 fn codex_overrides_in_text(command: &str) -> String {
+    codex_overrides_in_text_for(command, tend::shell::Dialect::native())
+}
+
+/// The fragment is arguments, not a command: each word quoted for
+/// `dialect` and joined, never rendered as an invocation (PowerShell would
+/// put its call operator before a leading `-c`).
+fn codex_overrides_in_text_for(command: &str, dialect: tend::shell::Dialect) -> String {
     tend::codex_launch::with_startup_overrides_in_text(command, |words| {
-        tend::shell::Dialect::native().command_line(words)
+        words
+            .iter()
+            .map(|word| dialect.word(word))
+            .collect::<Vec<_>>()
+            .join(" ")
     })
 }
 
@@ -3594,5 +3605,18 @@ mod tests {
         );
         assert_eq!(split_cmdline(b"sleep\x00777\x00"), vec!["sleep", "777"]);
         assert!(split_cmdline(b"").is_empty());
+    }
+
+    #[test]
+    fn a_text_only_codex_line_gets_arguments_not_an_invocation_in_either_shell() {
+        let posix = codex_overrides_in_text_for("codex resume id", tend::shell::Dialect::Posix);
+        assert_eq!(
+            posix,
+            "codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume id"
+        );
+        let ps = codex_overrides_in_text_for("codex resume id", tend::shell::Dialect::PowerShell);
+        assert!(ps.starts_with("codex -c "), "{ps}");
+        assert!(!ps.contains('&'), "{ps}");
+        assert!(ps.ends_with(" resume id"), "{ps}");
     }
 }

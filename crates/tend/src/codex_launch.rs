@@ -32,13 +32,8 @@ fn key_of(assignment: &str) -> &str {
 }
 
 /// The config keys `args` (Codex's own arguments) already sets with
-/// `-c`/`--config`. A leading `--` (an `aas exec … --` wrapper) is skipped;
-/// a later one ends the options.
+/// `-c`/`--config`, up to Codex's `--`.
 fn keys_set(args: &[String]) -> Vec<String> {
-    let args = match args.first().map(String::as_str) {
-        Some("--") => &args[1..],
-        _ => args,
-    };
     let mut keys = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -74,19 +69,18 @@ pub fn startup_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// `args` (all of Codex's own arguments, after the program) with the
-/// overrides first: before every option, its value, a subcommand, `--` and
-/// a prompt, so none of them can swallow or shift. After a leading `--`
-/// (`aas exec <account> -- …`), where Codex's arguments begin. Idempotent.
+/// `args` (exactly Codex's own arguments, after the program) with the
+/// overrides first: before every option, its value, a subcommand, Codex's
+/// `--` and a prompt, so none of them can swallow or shift. A wrapper's
+/// own delimiter is the caller's to keep outside `args`. Idempotent.
 #[must_use]
 pub fn with_startup_overrides(args: &[String]) -> Vec<String> {
     let extra = startup_args(args);
     if extra.is_empty() {
         return args.to_vec();
     }
-    let at = usize::from(args.first().map(String::as_str) == Some("--"));
-    let mut out = args.to_vec();
-    out.splice(at..at, extra);
+    let mut out = extra;
+    out.extend(args.iter().cloned());
     out
 }
 
@@ -116,28 +110,56 @@ pub fn with_startup_overrides_in_line(words: &[String]) -> Vec<String> {
 /// (even one quoted, which is not read here) still wins.
 #[must_use]
 pub fn with_startup_overrides_in_text(line: &str, render: impl Fn(&[String]) -> String) -> String {
+    // No quoting, expansion, glob, redirection or operator: a word made only
+    // of these cannot hide a boundary or change what runs.
     let plain = |word: &str| {
         !word.chars().any(|c| {
             matches!(
                 c,
-                '\'' | '"' | '\\' | '`' | '$' | '#' | '*' | '?' | '[' | ';' | '&' | '|'
+                '\'' | '"'
+                    | '\\'
+                    | '`'
+                    | '$'
+                    | '#'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '!'
+                    | '~'
             )
         })
     };
-    let words: Vec<&str> = line.split_whitespace().take_while(|w| plain(w)).collect();
+    // Only spaces and tabs separate words here; any other whitespace (a
+    // newline, a Unicode space) leaves the line alone.
+    if line
+        .chars()
+        .any(|c| c.is_whitespace() && c != ' ' && c != '\t')
+    {
+        return line.to_owned();
+    }
+    let words: Vec<&str> = line
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .take_while(|word| plain(word))
+        .collect();
     let owned: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
     let Some(program) = codex_program_index(&owned) else {
         return line.to_owned();
     };
-    let mut after = program;
-    if owned.get(program + 1).map(String::as_str) == Some("--") {
-        after += 1;
-    }
-    let extra = startup_args(&owned[after + 1..]);
+    let extra = startup_args(&owned[program + 1..]);
     if extra.is_empty() {
         return line.to_owned();
     }
-    let anchor = words[after];
+    let anchor = words[program];
     // `words` borrow from `line`: the anchor's end is its own offset.
     let end = anchor.as_ptr() as usize - line.as_ptr() as usize + anchor.len();
     format!("{} {}{}", &line[..end], render(&extra), &line[end..])
@@ -157,8 +179,8 @@ fn base(word: &str) -> String {
     name
 }
 
-/// Where the word that starts Codex's own arguments sits: the Codex
-/// program, or the account (or frontend) word of an `aas` wrapper.
+/// The last word before Codex's own arguments: the Codex program, or the
+/// account (or frontend) word of an `aas` wrapper, or that wrapper's `--`.
 fn codex_program_index(words: &[String]) -> Option<usize> {
     let mut i = 0;
     if words.first().is_some_and(|w| base(w) == "env") {
@@ -186,13 +208,20 @@ fn codex_program_index(words: &[String]) -> Option<usize> {
             if !matches!(verb.as_str(), "e" | "exec") {
                 return None;
             }
-            if account.ends_with("@codex") {
-                Some(i + 2)
+            let at = if account.ends_with("@codex") {
+                i + 2
             } else if words.get(i + 3).is_some_and(|front| front == "codex") {
-                Some(i + 3)
+                i + 3
             } else {
-                None
-            }
+                return None;
+            };
+            // `aas exec <account> -- …`: that `--` is aas's; Codex's own
+            // arguments start after it.
+            Some(if words.get(at + 1).map(String::as_str) == Some("--") {
+                at + 1
+            } else {
+                at
+            })
         }
         _ => None,
     }
@@ -226,16 +255,15 @@ mod tests {
             with_startup_overrides(&s(&["--profile", "resume", "do it"])),
             with(&["--profile", "resume", "do it"])
         );
-        // Never after `--`, where they would be prompt text.
+        // Never after Codex's `--`, where they would be prompt text.
         assert_eq!(
             with_startup_overrides(&s(&["--yolo", "--", "do it"])),
             with(&["--yolo", "--", "do it"])
         );
-        assert_eq!(with_startup_overrides(&s(&["--", "resume"])), {
-            let mut v = s(&["--"]);
-            v.extend(with(&["resume"]));
-            v
-        });
+        assert_eq!(
+            with_startup_overrides(&s(&["--", "explain this"])),
+            with(&["--", "explain this"])
+        );
         let once = with_startup_overrides(&s(&["resume", "id"]));
         assert_eq!(with_startup_overrides(&once), once);
     }
@@ -302,6 +330,15 @@ mod tests {
         want.extend(with(&["resume", "id"]));
         assert_eq!(
             line(&["aas", "exec", "b@codex", "--", "resume", "id"]),
+            want
+        );
+        let mut want = s(&["codex"]);
+        want.extend(with(&["--", "explain this"]));
+        assert_eq!(line(&["codex", "--", "explain this"]), want);
+        let mut want = s(&["aas", "exec", "b@codex", "--"]);
+        want.extend(with(&["--", "explain this"]));
+        assert_eq!(
+            line(&["aas", "exec", "b@codex", "--", "--", "explain this"]),
             want
         );
         let mut want = s(&["node", "/n/bin/codex"]);
