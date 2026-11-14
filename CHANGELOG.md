@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Copilot CLI model call that is being retried no longer turns the row
   red: a recoverable `errorOccurred` (Copilot fires one per retry) is a
   warning. When the retries run out Copilot fires no hook and only logs
-  `session.error`; tendd's session-log read now settles that turn as an
+  `session.error` (`errorType: "query"`); tendd's session-log read now settles that turn as an
   error with Copilot's message, as it settles Esc. Both observed on Copilot
   CLI 1.0.110 with the model connection cut mid-answer.
 

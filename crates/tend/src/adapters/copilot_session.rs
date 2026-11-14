@@ -150,10 +150,18 @@ pub fn default_home() -> Option<PathBuf> {
 enum TurnEnd {
     /// `abort`: Esc on a permission prompt (or mid-turn).
     Cancelled { at: OffsetDateTime },
-    /// `session.error`: Copilot gave up, e.g. after its model-call retries
-    /// ran out (1.0.110 fires a recoverable `errorOccurred` per retry and
-    /// nothing at the end).
+    /// `session.error` with `errorType: "query"`: Copilot gave up on the
+    /// turn, e.g. after its model-call retries ran out (1.0.110 fires a
+    /// recoverable `errorOccurred` per retry and nothing at the end).
     Failed { at: OffsetDateTime, message: String },
+}
+
+/// A `session.error` that ends the turn. Only `errorType: "query"` (what a
+/// failed turn logged on 1.0.110) counts: an SDK extension's
+/// `session.log(…, {level: "error"})` writes `session.error` with
+/// `errorType: "notification"` in the middle of a working turn.
+fn is_turn_failure(record: &Value) -> bool {
+    record["type"] == "session.error" && record["data"]["errorType"] == "query"
 }
 
 /// The current turn's hookless ending: the latest of the turn's start
@@ -167,7 +175,7 @@ fn turn_end(records: &[Value]) -> Option<TurnEnd> {
         is_user_prompt(record)
             || record["type"] == "assistant.turn_start"
             || record["type"] == "abort"
-            || record["type"] == "session.error"
+            || is_turn_failure(record)
     })?;
     let at = || {
         OffsetDateTime::parse(
@@ -178,7 +186,7 @@ fn turn_end(records: &[Value]) -> Option<TurnEnd> {
     };
     match record["type"].as_str()? {
         "abort" => Some(TurnEnd::Cancelled { at: at()? }),
-        "session.error" => Some(TurnEnd::Failed {
+        "session.error" if is_turn_failure(record) => Some(TurnEnd::Failed {
             at: at()?,
             message: record["data"]["message"]
                 .as_str()
@@ -449,6 +457,23 @@ mod tests {
             message.starts_with("Execution failed: Failed to get response"),
             "{message}"
         );
+        // A diagnostic an extension logs is not a failure, during a turn or
+        // after a real end.
+        let diagnostic = serde_json::json!({"type": "session.error", "timestamp": "2026-11-14T16:55:30Z",
+            "data": {"errorType": "notification", "message": "extension diagnostic"}});
+        let mut after = records.clone();
+        after.push(diagnostic.clone());
+        assert!(matches!(turn_end(&after), Some(TurnEnd::Failed { .. })));
+        let mut working = records[..3].to_vec();
+        working.push(diagnostic.clone());
+        working.push(serde_json::json!({"type": "tool.execution_start", "timestamp": "2026-11-14T16:55:31Z", "data": {}}));
+        assert_eq!(turn_end(&working), None);
+        let mut cancelled = real_until("\"abort\"");
+        cancelled.push(diagnostic);
+        assert!(matches!(
+            turn_end(&cancelled),
+            Some(TurnEnd::Cancelled { .. })
+        ));
         // A later prompt starts a new turn: the old failure settles nothing.
         let mut later = records.clone();
         later.push(serde_json::json!({"type": "user.message", "timestamp": "2026-11-14T16:56:00Z", "data": {"content": "again"}}));
