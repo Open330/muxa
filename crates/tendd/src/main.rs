@@ -54,6 +54,7 @@ mod agent_start_in_process;
 mod fleet_manager;
 mod herdr_bridge;
 mod pipeline_reconciler;
+mod relay_in_process;
 mod screen_detect;
 mod snapshot_in_process;
 mod synthetic;

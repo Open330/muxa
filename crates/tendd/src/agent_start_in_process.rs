@@ -35,7 +35,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tend::agent_control::{
     AgentStartError, AgentStartRequest, AgentStartResult, InProcessAgentStart,
@@ -60,13 +59,50 @@ async fn run(
     if changes_own_env(&request.env, |key| std::env::var(key).ok()) {
         return None;
     }
-    let args = match tend_work::agent_launch::parse_start_argv(&request.arguments()) {
+    // The child failed here too, before running anything.
+    let endpoint = match tend::agent_control::tmux_socket_path(&request) {
+        Ok(path) => path.map(|path| tend::BackendEndpoint {
+            host: tend::HostKind::Tmux,
+            socket: path.display().to_string(),
+        }),
+        Err(error) => return Some(Err(error)),
+    };
+    // Past `changes_own_env`, the request's keys equal the daemon's own.
+    let result = launch_argv(&request.arguments(), socket, endpoint).await?;
+    Some(match result {
+        Ok(value) => {
+            serde_json::from_value::<AgentStartResult>(value).map_err(AgentStartError::InvalidJson)
+        }
+        Err(error) => Err(AgentStartError::Failed(
+            crate::work_up_in_process::last_line(&error),
+        )),
+    })
+}
+
+/// Run an `["agent", "start", …]` argv as the `tend` child would have, on
+/// `endpoint`'s server when given (the child's `TEND_TMUX_SOCKET`): its JSON
+/// envelope, or the error as the CLI's `main` printed it
+/// (`work_up_in_process::printed`).
+/// `None` declines before any effect. Dropping the call stops the launch:
+/// no further tmux command or native spawn starts, as the child was killed
+/// on drop.
+pub(crate) async fn launch_argv(
+    words: &[String],
+    socket: PathBuf,
+    endpoint: Option<tend::BackendEndpoint>,
+) -> Option<Result<serde_json::Value, String>> {
+    let args = match tend_work::agent_launch::parse_start_argv(words) {
         Ok(args) => args,
         Err(error) => {
             tracing::warn!(%error, "in-process agent start cannot read its arguments");
             return None;
         }
     };
+    // Only the JSON envelope can be handed back.
+    if !args.json {
+        tracing::info!("in-process agent start declined (no --json); running the tend CLI");
+        return None;
+    }
     let config_path = crate::work_up_in_process::cli_config_path(
         std::env::var_os("TEND_CONFIG"),
         tend::paths::default_config_file(),
@@ -78,29 +114,19 @@ async fn run(
             return None;
         }
     };
-    // The child failed here too, before running anything.
-    let endpoint = match tend::agent_control::tmux_socket_path(&request) {
-        Ok(path) => path.map(|path| tend::BackendEndpoint {
-            host: tend::HostKind::Tmux,
-            socket: path.display().to_string(),
-        }),
-        Err(error) => return Some(Err(error)),
-    };
     let env = native_env(
         std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
         &socket,
-        &request.env,
+        &BTreeMap::new(),
     );
-    // Dropping this call (the client hung up, tendd stopping) stops the
-    // launch: no further tmux command or native spawn starts, as the child
-    // was killed on drop.
-    let (scope, _cancel_on_drop) = launch_scope(&socket);
+    let (scope, _cancel_on_drop) =
+        crate::work_up_in_process::scope(&socket, tend::work_control::WORK_COMMAND_TIMEOUT);
     let work = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| AgentStartError::Failed(format!("agent start runtime: {error}")))?;
+            .map_err(|error| format!("agent start runtime: {error}"))?;
         tend_work::subprocess::with_scope(scope, || {
             tend_work::mux_control::with_endpoint(endpoint, || {
                 runtime.block_on(async move {
@@ -110,46 +136,15 @@ async fn run(
                             .await;
                     // As the CLI did after every `agent start`, success or not.
                     let _ = client.invalidate_agent_directory().await;
-                    let value = result.map_err(|error| {
-                        AgentStartError::Failed(crate::work_up_in_process::last_line(
-                            &crate::work_up_in_process::printed(&error),
-                        ))
-                    })?;
-                    serde_json::from_value::<AgentStartResult>(value)
-                        .map_err(AgentStartError::InvalidJson)
+                    result.map_err(|error| crate::work_up_in_process::printed(&error))
                 })
             })
         })
     });
     Some(match work.await {
         Ok(result) => result,
-        Err(error) => Err(AgentStartError::Failed(format!(
-            "agent start task: {error}"
-        ))),
+        Err(error) => Err(format!("agent start task: {error}")),
     })
-}
-
-/// Sets the scope's cancel flag when the call is dropped.
-struct CancelOnDrop(Arc<AtomicBool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-/// The child's limits for one launch: closed stdin, `TEND_SOCKET`, its 30 s
-/// deadline, and a cancel flag the returned guard sets on drop.
-fn launch_scope(socket: &Path) -> (tend_work::subprocess::Scope, CancelOnDrop) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    (
-        tend_work::subprocess::Scope {
-            socket: socket.to_path_buf(),
-            deadline: std::time::Instant::now() + tend::work_control::WORK_COMMAND_TIMEOUT,
-            cancel: Some(cancel.clone()),
-        },
-        CancelOnDrop(cancel),
-    )
 }
 
 /// Whether the request's environment (native placement) would change a
@@ -228,7 +223,10 @@ mod tests {
 
     #[test]
     fn dropping_the_launch_stops_what_it_would_start_next() {
-        let (scope, guard) = launch_scope(Path::new("/run/tendd.sock"));
+        let (scope, guard) = crate::work_up_in_process::scope(
+            Path::new("/run/tendd.sock"),
+            tend::work_control::WORK_COMMAND_TIMEOUT,
+        );
         let still = scope.clone();
         assert!(
             tend_work::subprocess::with_scope(scope, tend_work::subprocess::ensure_time_left)

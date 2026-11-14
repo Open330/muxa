@@ -24,7 +24,9 @@
 //! declines, and the caller runs the child instead. There is no outer
 //! timeout: the operation stays running, and counted, until the work really
 //! ends, which the subprocess deadline bounds.
-//! `TEND_WORK_UP_CHILD=1` forces the child.
+//! Dropping the call (tendd stopping) cancels the subprocess scope, as the
+//! child was killed on drop. The same code runs a `work up` another Fleet
+//! host sends (`relay_in_process`). `TEND_WORK_UP_CHILD=1` forces the child.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,17 +44,29 @@ async fn run(
     request: &WorkUpRequest,
     socket: PathBuf,
 ) -> Option<Result<serde_json::Value, WorkUpError>> {
-    let args = match tend_work::work_up::parse_up_argv(&request.arguments()) {
+    run_argv(&request.arguments(), socket)
+        .await
+        .map(|result| result.map_err(|error| WorkUpError::Failed(last_line(&error))))
+}
+
+/// Run a `["work", "up", …]` argv as the `tend` child would have: its JSON
+/// document, or the error as the CLI's `main` printed it ([`printed`]).
+/// `None` declines before any effect. Dropping the call stops it: no
+/// further git, tmux or `prepare` command starts, as the child was killed
+/// on drop, and an abandoned pass leaves its claims to recovery.
+pub(crate) async fn run_argv(
+    words: &[String],
+    socket: PathBuf,
+) -> Option<Result<serde_json::Value, String>> {
+    let args = match tend_work::work_up::parse_up_argv(words) {
         Ok(args) => args,
         Err(error) => {
             tracing::warn!(%error, "in-process work up cannot read its arguments");
             return None;
         }
     };
-    // A ticket lookup starts a headless agent through `tend::ask`, outside
-    // the subprocess scope below, so it would miss the socket the child
-    // pinned for its hooks. Leave those to the child.
-    if args.external.is_some() && !args.no_ticket {
+    if let Some(reason) = needs_the_cli(&args) {
+        tracing::info!(reason, "in-process work up declined; running the tend CLI");
         return None;
     }
     let config_path = cli_config_path(
@@ -66,32 +80,83 @@ async fn run(
             return None;
         }
     };
+    let (scope, _cancel_on_drop) = scope(&socket, tend::work_control::WORK_UP_TIMEOUT);
     let work = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| WorkUpError::Failed(format!("work up runtime: {error}")))?;
-        let scope = tend_work::subprocess::Scope {
-            socket: socket.clone(),
-            deadline: std::time::Instant::now() + tend::work_control::WORK_UP_TIMEOUT,
-            cancel: None,
-        };
+            .map_err(|error| format!("work up runtime: {error}"))?;
         tend_work::subprocess::with_scope(scope, || {
             runtime.block_on(async move {
                 let client = tend::ipc::Client::new(socket);
                 let result = tend_work::work_up::run_noninteractive(args, &config, &client).await;
                 // As the CLI did after every `work up`, success or not.
                 let _ = client.invalidate_agent_directory().await;
-                let result =
-                    result.map_err(|error| WorkUpError::Failed(last_line(&printed(&error))))?;
-                serde_json::to_value(result).map_err(WorkUpError::InvalidJson)
+                let result = result.map_err(|error| printed(&error))?;
+                serde_json::to_value(result).map_err(|error| error.to_string())
             })
         })
     });
     Some(match work.await {
         Ok(result) => result,
-        Err(error) => Err(WorkUpError::Failed(format!("work up task: {error}"))),
+        Err(error) => Err(format!("work up task: {error}")),
     })
+}
+
+/// Why `args` is left to the `tend` child, or `None` when
+/// `run_noninteractive` does exactly what the child would. A local request
+/// never trips these (`WorkUpRequest::arguments`); a Fleet argv can.
+fn needs_the_cli(args: &tend_work::work_up::UpArgs) -> Option<&'static str> {
+    if !args.json {
+        // Only the JSON document can be handed back.
+        return Some("no --json");
+    }
+    if !args.yes {
+        // The child, with no terminal, refused what it would have asked.
+        return Some("no --yes");
+    }
+    if !args.no_ticket {
+        // A ticket lookup, with `--external` or on the Work id itself,
+        // starts a headless agent through `tend::ask`, outside the
+        // subprocess scope, so it would miss the socket the child pinned
+        // for its hooks.
+        return Some("ticket lookup");
+    }
+    if !args.acceptance.is_empty() || !args.checks.is_empty() {
+        // The CLI's own wrapper binds verification before applying.
+        return Some("--accept/--check");
+    }
+    if args.show_prompts {
+        // Printed by the CLI's wrapper, before the document.
+        return Some("--show-prompts");
+    }
+    None
+}
+
+/// Sets a scope's cancel flag when the call that owns it is dropped.
+pub(crate) struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The child's limits for one in-process call: closed stdin, `TEND_SOCKET`,
+/// its deadline, and a cancel flag the returned guard sets on drop.
+pub(crate) fn scope(
+    socket: &std::path::Path,
+    budget: std::time::Duration,
+) -> (tend_work::subprocess::Scope, CancelOnDrop) {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (
+        tend_work::subprocess::Scope {
+            socket: socket.to_path_buf(),
+            deadline: std::time::Instant::now() + budget,
+            cancel: Some(cancel.clone()),
+        },
+        CancelOnDrop(cancel),
+    )
 }
 
 /// The config path the `tend` child chose: `--config` (never passed) or
@@ -124,7 +189,9 @@ pub(crate) fn printed(error: &anyhow::Error) -> String {
             } else {
                 text.push_str("    ");
             }
-            text.push_str(&cause.replace('\n', "\n      "));
+            // anyhow indents a cause's later lines under its first.
+            let indent = if numbered { "\n       " } else { "\n    " };
+            text.push_str(&cause.replace('\n', indent));
         }
     }
     text
@@ -157,6 +224,49 @@ mod tests {
     }
 
     #[test]
+    fn only_what_run_noninteractive_does_like_the_child_runs_in_process() {
+        let parse = |words: &[&str]| {
+            let words: Vec<String> = ["work", "up", "ENG-1"]
+                .iter()
+                .chain(words)
+                .map(|word| (*word).to_string())
+                .collect();
+            tend_work::work_up::parse_up_argv(&words).unwrap()
+        };
+        assert_eq!(
+            needs_the_cli(&parse(&["--json", "--yes", "--no-ticket"])),
+            None
+        );
+        for (words, reason) in [
+            (&["--yes", "--no-ticket"][..], "no --json"),
+            (&["--json", "--no-ticket"], "no --yes"),
+            (&["--json", "--yes"], "ticket lookup"),
+            (&["--json", "--yes", "--external=ENG-1"], "ticket lookup"),
+            (
+                &["--json", "--yes", "--no-ticket", "--accept=tests pass"],
+                "--accept/--check",
+            ),
+            (
+                &["--json", "--yes", "--no-ticket", "--check=cargo test"],
+                "--accept/--check",
+            ),
+            (
+                &["--json", "--yes", "--no-ticket", "--show-prompts"],
+                "--show-prompts",
+            ),
+        ] {
+            assert_eq!(needs_the_cli(&parse(words)), Some(reason), "{words:?}");
+        }
+        let local: tend::work_control::WorkUpRequest =
+            serde_json::from_value(serde_json::json!({"work": "ENG-1"})).unwrap();
+        assert_eq!(
+            needs_the_cli(&tend_work::work_up::parse_up_argv(&local.arguments()).unwrap()),
+            None,
+            "a local request runs in-process"
+        );
+    }
+
+    #[test]
     fn an_error_prints_as_anyhow_debug_without_a_backtrace() {
         let one = anyhow::anyhow!("bad cwd").context("no route");
         assert_eq!(printed(&one), "no route\n\nCaused by:\n    bad cwd");
@@ -168,6 +278,14 @@ mod tests {
             "no route\n\nCaused by:\n    0: bad cwd\n    1: gone"
         );
         assert_eq!(printed(&anyhow::anyhow!("plain")), "plain");
+        let multiline = anyhow::anyhow!("line one\nline two").context("outer");
+        assert_eq!(
+            printed(&multiline),
+            format!("{multiline:?}")
+                .split("\n\nStack backtrace:")
+                .next()
+                .unwrap()
+        );
     }
 
     #[test]

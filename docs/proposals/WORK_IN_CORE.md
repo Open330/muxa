@@ -1,7 +1,7 @@
 # Work in core: tendd stops running `tend` for Work logic
 
 Status: in progress. Step 1 (the move into `crates/tend-work`) is #502.
-`work up`, pipeline reconcile, `agent start` and snapshots run in-process (step 3); see "Done so far".
+`work up`, pipeline reconcile, `agent start`, snapshots and the Fleet `work up` / `agent start` run in-process (step 3); see "Done so far" and "Fallbacks and when they can go".
 
 ## Problem
 
@@ -182,7 +182,8 @@ pub struct WorkContext {
   - The answer has the child's shape, so `MuxSnapshotControl` is unchanged
     past `run`: the `--json` document as stdout (`reload::capture_json`
     takes what `print_json` would have printed), exit code 0 or 1, and
-    `Error: {error:?}` as stderr, which is what the CLI's `main` printed.
+    `Error: ` and the error chain as stderr, as the CLI's `main` printed
+    it (`printed`, without a backtrace).
   - The code reads no config and no request environment, so the daemon's
     own environment is what the child had, apart from `TEND_SOCKET`, which
     the client and subprocess scope carry.
@@ -197,3 +198,61 @@ pub struct WorkContext {
     agent's server saved and listed; a killed session planned and restored
     (its agent pane relaunched); the forced child failing without a CLI and
     succeeding with one.
+- Fleet commands (`fleet_manager::run_local_work_command`, the relay side
+  of a controller's `work_command`): `work up …` and `agent start …` run
+  in-process through the code their local requests use
+  (`relay_in_process.rs`; `work_up_in_process::run_argv`,
+  `agent_start_in_process::launch_argv`). The answer keeps the child's
+  shape (exit code, JSON on stdout, `Error: ` and the chain on stderr), so the
+  controller's parsing is unchanged. Over Fleet an `agent start` is always a
+  tmux launch on the host's default server, without `tmux_socket` or `env`.
+  Each honours its own forcing variable. The rest of the allowlist (`work
+  options|preset|pipeline|route|dispatch…|fleet-ask`, `swap`) still runs the
+  child, because that code is still in the CLI crate.
+  - A Fleet `work up` declines what only the CLI's wrapper does (see
+    below), and a frame with stdin runs the child.
+  - Proven on a scratch daemon with `[fleet] enabled`, through
+    `fleet_command` to `local` with `TEND_CLI` pointing nowhere: a relayed
+    `agent start` created and stamped its window; a relayed `work up
+    --no-ticket` answered exit 1 with the CLI's error line; one without
+    `--no-ticket` declined to the (missing) CLI; with both forcing variables
+    set, both failed for the missing CLI, and with the built `tend` the
+    forced child worked.
+
+## Fallbacks and when they can go
+
+Every call site listed under Problem now runs in tendd when it can. What
+still reaches the CLI child, and when it can be removed:
+
+| Fallback | Shipped in-process in | Remove the forcing variable in |
+| --- | --- | --- |
+| `TEND_RECONCILE_CHILD` (pipeline reconcile) | 0.10.17 | 0.10.18, if 0.10.17 hosts never set it |
+| `TEND_WORK_UP_CHILD` (`work up`: local in 0.10.17, Fleet in 0.10.18) | 0.10.17 / 0.10.18 | 0.10.19, after the Fleet path's first release |
+| `TEND_AGENT_START_CHILD` (`agent start`, local and Fleet) | 0.10.18 | 0.10.19 |
+| `TEND_SNAPSHOT_CHILD` (snapshots) | 0.10.18 | 0.10.19 |
+
+These variables are operator escape hatches, and nothing in tend sets
+them. Step 4's rule is one release with no use; check each host's service
+environment before removing one. `TEND_PIPELINE_CLI` is a test seam that
+names the program, not a fallback, and stays.
+
+Removing a forcing variable does not remove the child path itself. These
+cases decline to it by design, and each logs `in-process … declined`:
+- a `work up` whose argv asks for what only the CLI's wrapper does: a
+  ticket lookup (no `--no-ticket`, with or without `--external`), which
+  starts a headless agent outside the subprocess scope; `--accept` /
+  `--check`; `--show-prompts`; or no `--yes`. A local request never does
+  (`WorkUpRequest::arguments`), but a Fleet argv can;
+- an `agent start` for an rmux server, or a native one whose `env` changes
+  the daemon's values;
+- a Fleet frame that carries stdin, which the child handed to a route's
+  `prepare`;
+- any argv without `--json`, or one that does not parse.
+
+These never go in-process at all, because their code is still in the CLI
+crate: IPC `work_command` (`work options|preset|…`), the same subcommands
+over Fleet, `swap`, and the dashboard sharing routes.
+
+These go when `WorkContext` (step 2) passes the environment and endpoint
+explicitly and the remaining command code moves into `tend-work`. That
+needs a proposal of its own. It is not a release-count decision.

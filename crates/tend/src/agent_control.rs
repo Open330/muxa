@@ -400,8 +400,10 @@ pub fn install_in_process_agent_start(run: InProcessAgentStart) {
 }
 
 /// Whether `TEND_AGENT_START_CHILD` forces the `tend` child, the path every
-/// release before this one used.
-fn agent_start_child_forced() -> bool {
+/// release before this one used. Also read for an `agent start` that
+/// arrives over Fleet.
+#[must_use]
+pub fn agent_start_child_forced() -> bool {
     std::env::var_os("TEND_AGENT_START_CHILD")
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
