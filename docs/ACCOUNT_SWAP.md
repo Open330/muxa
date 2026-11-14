@@ -314,11 +314,26 @@ agent exits, so the pane still has a shell afterwards. The pane is kept open
 (`remain-on-exit`) until the relaunched agent is seen, so a failed start
 leaves its output. Only a shell that runs nothing but the agent is
 respawned: one with another job (a `sleep &`, a dev server) is typed into
-instead, since a respawn would end it. The old shell's history and
-unexported variables do not carry over. A pane that runs
-its agent directly is always respawned. Requests the daemon relays from
-elsewhere keep typing (`respawn` applies where a direct pane may be respawned:
-`tend swap` itself and the daemon's own automation).
+instead, since a respawn would end it. Nothing of the old shell carries
+over: the respawned login shell starts from tmux's environment and your
+profile, so a variable set or exported in the pane's shell (an activated
+venv, an `export FOO=…` typed before starting the agent) is missing from the
+relaunched agent, and from the shell left after it. A typed relaunch runs in
+that same shell and keeps them. A pane that runs its agent directly is always
+respawned.
+
+`respawn` applies to a pane with its shell only where a direct pane may be
+respawned: the daemon's own automation (`swap_account`) and `tend swap
+--local`. A `tend swap` that runs as a daemon job (the default), like any
+request the daemon relays, still types into a pane that has its shell; only
+the panes with no shell are handed back to `tend swap` and respawned.
+
+`type` stays the default. On a scratch daemon (2026-11-14, real Claude and
+Codex agents through `aas`, v0.10.17), both ways swapped every target:
+21 of 21 typed relaunches and 26 of 26 respawns, each with the resume
+verified, a launch id and the follow-up's hook receipt. Respawning also
+dropped a variable exported in the pane's shell, which typing keeps, so it
+is not the safer default.
 
 | Flag | Overrides |
 | ---- | --------- |
