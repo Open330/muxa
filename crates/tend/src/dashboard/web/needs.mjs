@@ -3,7 +3,7 @@
 // token kept by the main page, or the OIDC operator session cookie.
 // Everything an agent wrote is rendered with textContent, never as HTML.
 
-import { decidedCard, draftKey, hostSections, linkedItemOf, needsReturnPath } from "./needs-model.mjs";
+import { draftKey, historySections, hostSections, linkedItemOf, needsReturnPath } from "./needs-model.mjs";
 import { withPaneHash } from "./pane-drawer.mjs";
 
 const TOKEN_KEY = "tend.token";

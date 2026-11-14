@@ -167,11 +167,12 @@ async fn remote_section(
             )
             .await
         {
-            Ok(result) => {
-                let queue = result.decision_queue.map_or_else(
-                    || crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
-                    |queue| *queue,
-                );
+            Ok(crate::fleet::FleetCommandResult {
+                accepted: true,
+                decision_queue: Some(queue),
+                ..
+            }) => {
+                let queue = *queue;
                 json!({
                     "alias": host.alias, "local": false, "control": control,
                     "decides_reviews": reviews,
@@ -179,6 +180,12 @@ async fn remote_section(
                     "unavailable": queue.unavailable.clone(), "queue": queue,
                 })
             }
+            // A reply without the queue is not an empty queue.
+            Ok(_) => json!({
+                "alias": host.alias, "local": false, "control": control,
+                "covers": [], "unavailable": ["decision queue: the host's reply carried none"],
+                "queue": crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
+            }),
             Err(error) => json!({
                 "alias": host.alias, "local": false, "control": control,
                 "covers": [], "unavailable": [format!("decision queue: {error}")],
@@ -345,13 +352,17 @@ async fn remote_history(
         )
         .await
     {
-        Ok(result) => {
-            let history = result
-                .decision_history
-                .map_or_else(empty, |history| *history);
-            let unavailable = history.unavailable.clone();
-            section(history, unavailable)
-        }
+        // A reply without the history is not an empty history.
+        Ok(result) => match result.decision_history {
+            Some(history) if result.accepted => {
+                let unavailable = history.unavailable.clone();
+                section(*history, unavailable)
+            }
+            _ => section(
+                empty(),
+                vec!["decision history: the host's reply carried none".into()],
+            ),
+        },
         Err(error) => section(empty(), vec![format!("decision history: {error}")]),
     }
 }

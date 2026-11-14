@@ -3563,17 +3563,23 @@ mod tests {
         here.local = true;
         let mut mini = fleet_host("mini", "dev");
         mini.capabilities = vec![FLEET_DECISION_HISTORY_CAPABILITY.to_owned()];
+        // Says it sends the history, then replies without one.
+        let mut mute = fleet_host("mute", "dev");
+        mute.capabilities = vec![FLEET_DECISION_HISTORY_CAPABILITY.to_owned()];
         let old = fleet_host("old", "dev");
         let mut off = fleet_host("off", "dev");
         off.state = FleetHostState::Offline;
         off.capabilities = vec![FLEET_DECISION_HISTORY_CAPABILITY.to_owned()];
-        for host in [here, mini, old, off] {
+        for host in [here, mini, mute, old, off] {
             store.upsert_host(host).await;
         }
         let (runtime, mut commands) = FleetRuntime::new(store);
         tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
                 let result = match command.operation {
+                    FleetOperation::DecisionHistory { .. } if command.host == "mute" => {
+                        Ok(FleetCommandResult::accepted("decision history"))
+                    }
                     FleetOperation::DecisionHistory { limit } => {
                         assert_eq!(command.host, "mini", "only a host that sends it is asked");
                         let mut history =
@@ -3601,15 +3607,20 @@ mod tests {
         let body = body_json(response).await;
         let hosts = body["hosts"].as_array().unwrap();
         let names: Vec<&str> = hosts.iter().map(|h| h["alias"].as_str().unwrap()).collect();
-        assert_eq!(names, ["here", "mini", "off", "old"]);
+        assert_eq!(names, ["here", "mini", "mute", "off", "old"]);
         assert_eq!(hosts[0]["local"], true);
         assert_eq!(
             body["history"], hosts[0]["history"],
             "the older field stays this host's"
         );
         assert_eq!(hosts[1]["history"]["truncated"], true);
-        assert_eq!(hosts[2]["unavailable"], json!(["host is offline"]));
-        assert!(hosts[3]["unavailable"][0]
+        assert_eq!(
+            hosts[2]["unavailable"],
+            json!(["decision history: the host's reply carried none"]),
+            "a reply without the history is not an empty history"
+        );
+        assert_eq!(hosts[3]["unavailable"], json!(["host is offline"]));
+        assert!(hosts[4]["unavailable"][0]
             .as_str()
             .unwrap()
             .contains("upgrade"));
