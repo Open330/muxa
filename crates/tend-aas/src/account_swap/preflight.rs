@@ -221,7 +221,8 @@ fn program(stage: Stage, io: &dyn SwapIo, word: &str) -> Check {
     }
 }
 
-#[cfg(test)]
+// Every test here reads a real Unix filesystem or process table.
+#[cfg(all(test, unix))]
 mod tests {
     use super::super::io;
     use super::super::io::PathFacts;

@@ -193,9 +193,9 @@ async fn agent_directory_round_trip_shares_cache_across_clients_and_refreshes_on
 async fn filtered_expiry_downgrade_between_connections_never_becomes_broad_expiry() {
     let dir = tempdir().unwrap();
     let socket = dir.path().join("expiry-downgrade.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let listener = crate::transport::Listener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut first = BufReader::new(stream);
         for _ in 0..2 {
             let mut line = String::new();
@@ -206,7 +206,7 @@ async fn filtered_expiry_downgrade_between_connections_never_becomes_broad_expir
             );
             first.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_filtered_v2\"]}\n").await.unwrap();
         }
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut old = BufReader::new(stream);
         let mut line = String::new();
         old.read_line(&mut line).await.unwrap();
@@ -254,9 +254,9 @@ async fn filtered_expiry_refuses_legacy_daemon_before_any_mutation() {
     ] {
         let dir = tempdir().unwrap();
         let socket = dir.path().join("legacy-expiry.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = crate::transport::Listener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             let mut reader = BufReader::new(stream);
             for _ in 0..2 {
                 let mut line = String::new();
@@ -289,9 +289,9 @@ async fn filtered_expiry_refuses_legacy_daemon_before_any_mutation() {
 async fn bounded_fleet_claim_refuses_legacy_daemon_before_any_claim() {
     let dir = tempdir().unwrap();
     let socket = dir.path().join("legacy-claim.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let listener = crate::transport::Listener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         // Client::hello first negotiates, then requests the hello view on
@@ -539,7 +539,7 @@ async fn summary_queries_enforce_scope_and_account_for_the_complete_request_line
             "query":{"human_only":true,"search":"한글","search_bodies":true,"limit":1}
         })
     );
-    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let mut stream = crate::transport::Stream::connect(&socket).await.unwrap();
     stream.write_all(raw.as_bytes()).await.unwrap();
     let mut reader = tokio::io::BufReader::new(stream);
     let mut line = String::new();
@@ -2502,10 +2502,10 @@ async fn expiry_summary_falls_back_to_filtered_operation_and_preserves_errors() 
         for size_error in [false, true] {
             let dir = tempdir().unwrap();
             let socket = dir.path().join("fallback.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let listener = crate::transport::Listener::bind(&socket).unwrap();
             let server = tokio::spawn(async move {
                 loop {
-                    let (stream, _) = listener.accept().await.unwrap();
+                    let stream = listener.accept().await.unwrap();
                     let mut reader = BufReader::new(stream);
                     loop {
                         let mut line = String::new();
