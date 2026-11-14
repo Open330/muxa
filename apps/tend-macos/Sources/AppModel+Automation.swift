@@ -130,7 +130,7 @@ struct TendAutomationRuleDraft: Hashable, Sendable {
     /// The agent kinds the picker offers, as tendd stores them. Shorthand
     /// (`claude`, `agy`) is accepted on the wire but normalised
     /// to these, so the app writes the canonical spelling from the start.
-    static let agentKinds = ["claude_code", "codex", "opencode", "antigravity"]
+    static let agentKinds = ["claude_code", "codex", "opencode", "antigravity", "copilot"]
     /// `RateLimitScope`, for the rate-limit event's window filter.
     static let rateLimitScopes = ["five_hour", "seven_day", "unknown"]
     /// `local` is every pane this daemon governs; the rest narrow to one
@@ -540,7 +540,7 @@ struct TendAgentMark: Hashable, Sendable {
     /// The product's name. A proper noun, so it is not localized.
     let name: String
     /// The Ask engine that already owns this product's symbol, when there
-    /// is one; `antigravity` and `opencode` have no Ask engine yet.
+    /// is one; `antigravity`, `opencode` and `copilot` have no Ask engine yet.
     let engine: AskProviderEngine?
     /// The same product as `agentProgramTint` spells it.
     let program: String
@@ -571,6 +571,12 @@ struct TendAgentMark: Hashable, Sendable {
         TendAgentMark(
             wire: "opencode", name: "OpenCode",
             engine: nil, program: "opencode", ownSymbol: "terminal"
+        ),
+        // Watched only: tend does not launch Copilot, so it has no
+        // `TendAgentProgram` and no logo in this build.
+        TendAgentMark(
+            wire: "copilot", name: "Copilot CLI",
+            engine: nil, program: "copilot", ownSymbol: "chevron.left.forwardslash.chevron.right"
         ),
     ]
 

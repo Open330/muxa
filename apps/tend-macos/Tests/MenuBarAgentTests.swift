@@ -287,7 +287,7 @@ private func menuBarSnapshot(_ agents: [(String, String, String)], host: String 
 @Test func menuBarIdentityColorsPersistAndProviderSymbolsAreAvailable() {
     let a = TendMenuBarAgentAppearance(identity: "host:session-1", kind: "codex")
     #expect(a == TendMenuBarAgentAppearance(identity: "host:session-1", kind: "codex"))
-    let programs = ["codex", "claude_code", "antigravity", "opencode", "unknown"]
+    let programs = ["codex", "claude_code", "antigravity", "opencode", "copilot", "unknown"]
     let styles = programs.map { TendMenuBarAgentAppearance(identity: "host:session-1", kind: $0) }
     #expect(Set(styles.map(\.symbol)).count >= 4)
     for style in styles {

@@ -132,6 +132,8 @@ fn classify_agent(agent: &str) -> AgentKind {
         AgentKind::Antigravity
     } else if agent.contains("opencode") {
         AgentKind::Opencode
+    } else if agent.contains("copilot") {
+        AgentKind::Copilot
     } else {
         AgentKind::Unknown
     }
@@ -675,6 +677,7 @@ fn agent_slug(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "codex",
         AgentKind::Antigravity => "agy",
         AgentKind::Opencode => "opencode",
+        AgentKind::Copilot => "copilot",
         AgentKind::Task => "task",
         AgentKind::Unknown => "unknown",
     }
@@ -1112,7 +1115,7 @@ mod tests {
             ("gemini", AgentKind::Unknown),
             ("opencode", AgentKind::Opencode),
             ("cursor", AgentKind::Unknown),
-            ("copilot", AgentKind::Unknown),
+            ("copilot", AgentKind::Copilot),
         ];
         for (agent, expected) in cases {
             let ev = status_event(agent, agent, "working", "w1:p1");

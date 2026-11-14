@@ -153,6 +153,7 @@ pub fn pane_has_agent_process(pane_pid: u32) -> Option<bool> {
             AgentKind::Codex,
             AgentKind::Opencode,
             AgentKind::Antigravity,
+            AgentKind::Copilot,
         ]
         .iter()
         .any(|kind| is_agent_process(p, *kind))

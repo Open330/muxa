@@ -467,6 +467,7 @@ fn display_command(proc: &ProcessInfo, kind: WorkloadProcessKind) -> String {
                 AgentKind::Codex => "codex".to_string(),
                 AgentKind::Antigravity => "agy".to_string(),
                 AgentKind::Opencode => "opencode".to_string(),
+                AgentKind::Copilot => "copilot".to_string(),
                 AgentKind::Task | AgentKind::Unknown => command_name(&proc.comm).to_string(),
             };
         }

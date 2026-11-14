@@ -2397,6 +2397,9 @@ fn spawn_startup_discovery(
                 tracing::info!(
                     claude_code = report.claude_code,
                     codex = report.codex,
+                    antigravity = report.antigravity,
+                    opencode = report.opencode,
+                    copilot = report.copilot,
                     skipped_known = report.skipped_known,
                     failed = report.failed,
                     "startup discovery complete",
@@ -2445,6 +2448,9 @@ async fn run_discovery_all(
             Ok((_, Ok(report))) => {
                 total.claude_code += report.claude_code;
                 total.codex += report.codex;
+                total.antigravity += report.antigravity;
+                total.opencode += report.opencode;
+                total.copilot += report.copilot;
                 total.skipped_known += report.skipped_known;
                 total.failed += report.failed;
             }
@@ -2489,6 +2495,9 @@ fn spawn_periodic_discovery(
                     tracing::debug!(
                         claude_code = report.claude_code,
                         codex = report.codex,
+                        antigravity = report.antigravity,
+                        opencode = report.opencode,
+                        copilot = report.copilot,
                             skipped_known = report.skipped_known,
                         "periodic discovery pass",
                     );

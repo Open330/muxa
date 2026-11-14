@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent's own account follows, without tend's copy of those checks in its
   evidence.
 
+- GitHub Copilot CLI is a known agent kind, `copilot`. A pane running
+  `copilot` (the Homebrew binary, or npm's `node` loader) is listed as a
+  Copilot CLI agent, and the dashboard, `tend watch`, `tend timeline
+  --agent copilot`, automation rules, the herdr bridge and Tend for Mac name
+  it. tend watches Copilot; it does not launch it.
+
 ### Changed
 
 - `tend work done --summary` files its result record and completes the

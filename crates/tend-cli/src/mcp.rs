@@ -2734,6 +2734,16 @@ fn peer_worker_route(
             .and_then(|selected| selected.peer.as_ref())
             .filter(|peer| !peer.accepts_peer_work())
         {
+            // A watched-only provider has no worker of its own kind, and
+            // substituting another provider would change who answers.
+            if primary.agent_kind == AgentKind::Copilot {
+                return Err(format!(
+                    "{target} is a Copilot CLI session, which tend watches but does not launch, so \
+                     it has no worker to take this request. Pass context_bound=true (or \
+                     user_authorized=true when the user asked) to deliver to that session, or \
+                     target claude/codex."
+                ));
+            }
             let program = agent_program_for_kind(primary.agent_kind);
             selection = select_peer(room, program.label())?;
             if let Some(worker) = selection.as_mut() {
@@ -4030,8 +4040,9 @@ fn provider_rank(kind: AgentKind) -> u8 {
         AgentKind::ClaudeCode => 1,
         AgentKind::Antigravity => 2,
         AgentKind::Opencode => 3,
-        AgentKind::Task => 4,
-        AgentKind::Unknown => 5,
+        AgentKind::Copilot => 4,
+        AgentKind::Task => 5,
+        AgentKind::Unknown => 6,
     }
 }
 
@@ -4098,9 +4109,11 @@ fn peer_spawn_program(
     let fallback = match current.agent_kind {
         AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Codex,
         AgentKind::Codex => crate::agent_launch::AgentProgram::Claude,
-        AgentKind::Antigravity | AgentKind::Opencode | AgentKind::Task | AgentKind::Unknown => {
-            crate::agent_launch::AgentProgram::Codex
-        }
+        AgentKind::Antigravity
+        | AgentKind::Opencode
+        | AgentKind::Copilot
+        | AgentKind::Task
+        | AgentKind::Unknown => crate::agent_launch::AgentProgram::Codex,
     };
     if let Some(chosen) = requested.or(targeted) {
         return Ok(chosen);
@@ -4119,7 +4132,10 @@ fn peer_spawn_program(
 fn agent_program_for_kind(kind: AgentKind) -> crate::agent_launch::AgentProgram {
     match kind {
         AgentKind::ClaudeCode => crate::agent_launch::AgentProgram::Claude,
-        AgentKind::Codex | AgentKind::Task | AgentKind::Unknown => {
+        // tend does not launch Copilot (it only watches one): `provider_kind`
+        // never names it and `peer_worker_route` refuses a Copilot primary
+        // first, so this arm is unreachable.
+        AgentKind::Codex | AgentKind::Copilot | AgentKind::Task | AgentKind::Unknown => {
             crate::agent_launch::AgentProgram::Codex
         }
         AgentKind::Antigravity => crate::agent_launch::AgentProgram::Antigravity,
@@ -8119,6 +8135,28 @@ mod tests {
         assert!(request_id_array(&json!({}), "request_ids")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_copilot_primary_is_never_replaced_by_another_providers_worker() {
+        let caller = peer_participant(AgentKind::ClaudeCode, "%1", AgentState::Idle);
+        let mut primary = peer_participant(AgentKind::Copilot, "%2", AgentState::Idle);
+        primary.launch_purpose = tend::collaboration::LaunchPurpose::Primary;
+        let worker = peer_participant(AgentKind::Codex, "%3", AgentState::Idle);
+        // With and without a Codex worker available.
+        for peers in [vec![primary.clone(), worker], vec![primary]] {
+            let room = peer_room(caller.clone(), peers);
+            let refused = peer_worker_route(&room, "pane:%2", &json!({})).unwrap_err();
+            assert!(refused.contains("Copilot CLI"), "{refused}");
+            for exact in [
+                json!({"context_bound": true}),
+                json!({"user_authorized": true}),
+            ] {
+                let (selection, program) = peer_worker_route(&room, "pane:%2", &exact).unwrap();
+                assert_eq!(selection.unwrap().pane, "%2");
+                assert!(program.is_none());
+            }
+        }
     }
 
     #[test]

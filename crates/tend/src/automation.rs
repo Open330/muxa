@@ -447,10 +447,11 @@ pub fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
         "codex" => Ok(AgentKind::Codex),
         "opencode" => Ok(AgentKind::Opencode),
         "agy" | "antigravity" => Ok(AgentKind::Antigravity),
+        "copilot" => Ok(AgentKind::Copilot),
         "task" => Ok(AgentKind::Task),
         "unknown" => Ok(AgentKind::Unknown),
         other => Err(format!(
-            "unknown agent {other:?}; use claude, codex, opencode, agy, task, or unknown"
+            "unknown agent {other:?}; use claude, codex, opencode, agy, copilot, task, or unknown"
         )),
     }
 }

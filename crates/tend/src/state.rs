@@ -2659,7 +2659,10 @@ impl Store {
                 || agent.surface.is_some()
                 || !matches!(
                     agent.kind,
-                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Antigravity
+                    AgentKind::ClaudeCode
+                        | AgentKind::Codex
+                        | AgentKind::Antigravity
+                        | AgentKind::Copilot
                 )
                 || now - agent.last_activity_at < min_idle
             {

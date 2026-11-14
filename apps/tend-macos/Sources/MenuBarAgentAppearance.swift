@@ -16,6 +16,10 @@ struct TendMenuBarAgentAppearance: Equatable {
         if let program {
             symbol = TendGlyph.logo(for: program)
             provider = program.displayName
+        } else if let mark = TendAgentMark.known(for: kind) {
+            // A watched-only agent (Copilot CLI): its own symbol and name.
+            symbol = mark.symbol
+            provider = mark.name
         } else {
             symbol = "terminal"
             provider = kind.replacingOccurrences(of: "_", with: " ")

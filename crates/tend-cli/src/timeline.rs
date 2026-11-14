@@ -180,6 +180,7 @@ enum AgentKindArg {
     #[value(alias = "agy")]
     Antigravity,
     Opencode,
+    Copilot,
     Unknown,
 }
 
@@ -190,6 +191,7 @@ impl From<AgentKindArg> for AgentKind {
             AgentKindArg::Codex => Self::Codex,
             AgentKindArg::Antigravity => Self::Antigravity,
             AgentKindArg::Opencode => Self::Opencode,
+            AgentKindArg::Copilot => Self::Copilot,
             AgentKindArg::Unknown => Self::Unknown,
         }
     }
