@@ -208,7 +208,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
         else {
             continue;
         };
-        note_ready_pending(&mut ready_pending, &request, &recipient);
+        note_ready_pending(&mut ready_pending, &request, &recipient, &agents);
         let recipient = &recipient;
         if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
             continue;
@@ -263,7 +263,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
         }
     }
 
-    collaboration.set_ready_pending_recipients(ready_pending);
+    collaboration.note_ready_pending_recipients(ready_pending);
 
     wake_senders_of_ready_replies(
         collaboration,
@@ -292,16 +292,12 @@ fn note_ready_pending(
     ready: &mut std::collections::HashMap<String, tend::collaboration::wake_retry::ReadyRecipient>,
     request: &CollaborationRequest,
     recipient: &tend::collaboration::Participant,
+    agents: &[tend::state::Agent],
 ) {
     if tend::collaboration::is_pending_session(&request.to.agent_session_id) {
-        ready.insert(
-            request.id.clone(),
-            (
-                recipient.pane.clone(),
-                recipient.socket.clone(),
-                recipient.agent_session_id.clone(),
-            ),
-        );
+        if let Some(key) = tend::collaboration::ready_row_key(recipient, agents) {
+            ready.insert(request.id.clone(), key);
+        }
     }
 }
 

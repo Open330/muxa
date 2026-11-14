@@ -130,13 +130,41 @@ pub(super) fn wake_undelivered(
 pub type ReadyRecipient = (String, Option<String>, String);
 
 impl CollaborationStore {
-    /// Replace the ready recipients of pending-pane requests the waker
-    /// resolved on this pass (see [`ready_pending_agent`]).
-    pub fn set_ready_pending_recipients(&self, ready: HashMap<String, ReadyRecipient>) {
-        *self
-            .ready_pending_recipients
+    /// Remember the registry rows the waker found ready, by delivery's own
+    /// predicate, for requests still addressed to a launching pane (see
+    /// [`Self::ready_pending_agent`]). An entry stays, even while that row is
+    /// busy, until reconciliation drops it once the request is delivered,
+    /// re-addressed or finished: a validated recipient is never swapped for
+    /// whatever row later sits at the pane.
+    pub fn note_ready_pending_recipients(&self, ready: HashMap<String, ReadyRecipient>) {
+        self.ready_pending_recipients
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = ready;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(ready);
+    }
+
+    /// The row remembered for `request_id` (diagnostics and tests).
+    pub fn ready_pending_recipient(&self, request_id: &str) -> Option<ReadyRecipient> {
+        self.ready_pending_recipients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request_id)
+            .cloned()
+    }
+
+    /// Forget entries whose request no longer waits on a launching pane.
+    pub(super) fn prune_ready_pending(&self, requests: &HashMap<String, CollaborationRequest>) {
+        self.ready_pending_recipients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|id, _| {
+                requests.get(id).is_some_and(|request| {
+                    !request.status.is_terminal()
+                        && super::is_pending_session(&request.to.agent_session_id)
+                        && request.notified_at.is_none()
+                        && request.claimed_at.is_none()
+                })
+            });
     }
 
     /// The registry row the waker last found ready for a request still
@@ -789,11 +817,65 @@ mod tests {
         assert_eq!(reason_of(&store, &id).await, None, "a recent hook offer");
     }
     /// A task to a launching worker (`pending-pane:` address) whose pane is
-    /// ready and Idle, but every write to it is refused, is bounded too. Only
-    /// the recipient the waker resolved by delivery's own checks counts: a
-    /// row merely sitting at the pane id does not.
+    /// ready and Idle, but every write to it is refused, is bounded too. The
+    /// row is the one delivery validated, found by `ready_row_key` from the
+    /// delivery participant: here a synthetic pre-hook row, whose id differs
+    /// from the participant's. A row merely at the pane id does not count,
+    /// and once the validated recipient is busy the item clears.
     #[tokio::test]
     async fn a_pending_worker_ready_but_refusing_writes_is_reported_undelivered() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (mut launching, mut synthetic) = actor("%2", "peer").await;
+        launching.agent_session_id = "pending-pane:default:%2".into();
+        synthetic.session_id = format!("{}7:default:%2", crate::state::SYNTHETIC_SESSION_PREFIX);
+        let id = store
+            .create(
+                sender,
+                launching.clone(),
+                NewRequest {
+                    body: "implement".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        store
+            .requests
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .created_at -= WAKE_UNDELIVERED_AFTER + time::Duration::minutes(1);
+        let mut agents = [coordinator, synthetic];
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert_eq!(
+            reason_of(&store, &id).await,
+            None,
+            "without the waker's verdict a row at the pane id is not the recipient"
+        );
+        // The waker's pass: delivery found `launching` ready, writes refused.
+        let key = crate::collaboration::ready_row_key(&launching, &agents).unwrap();
+        assert_eq!(key.2, agents[1].session_id, "the synthetic row's own id");
+        store.note_ready_pending_recipients(HashMap::from([(id.clone(), key)]));
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert_eq!(
+            reason_of(&store, &id).await.as_deref(),
+            Some("wake_undelivered")
+        );
+        assert!(row(&store, &id).await.peer_interrupted());
+        // The recipient starts other work without claiming it: the item
+        // clears, as it does for an exact-session recipient.
+        agents[1].state = AgentState::Working;
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(!row(&store, &id).await.peer_interrupted());
+    }
+
+    /// Delivered without being re-addressed: the item clears and the
+    /// remembered recipient is forgotten.
+    #[tokio::test]
+    async fn a_pending_request_delivered_at_last_clears_and_is_forgotten() {
         let store = CollaborationStore::in_memory(CollaborationOptions::default());
         let (sender, coordinator) = actor("%1", "sender").await;
         let (mut launching, peer) = actor("%2", "peer").await;
@@ -801,7 +883,7 @@ mod tests {
         let id = store
             .create(
                 sender,
-                launching,
+                launching.clone(),
                 NewRequest {
                     body: "implement".into(),
                     ..NewRequest::default()
@@ -818,32 +900,16 @@ mod tests {
             .unwrap()
             .created_at -= WAKE_UNDELIVERED_AFTER + time::Duration::minutes(1);
         let agents = [coordinator, peer];
+        let key = crate::collaboration::ready_row_key(&launching, &agents).unwrap();
+        store.note_ready_pending_recipients(HashMap::from([(id.clone(), key)]));
         store.reconcile_peer_interruptions(&agents).await.unwrap();
-        assert_eq!(
-            reason_of(&store, &id).await,
-            None,
-            "without the waker's verdict a row at the pane id is not the recipient"
-        );
-        store.set_ready_pending_recipients(HashMap::from([(
-            id.clone(),
-            (
-                "%2".to_owned(),
-                Some("default".to_owned()),
-                "peer".to_owned(),
-            ),
-        )]));
-        store.reconcile_peer_interruptions(&agents).await.unwrap();
-        assert_eq!(
-            reason_of(&store, &id).await.as_deref(),
-            Some("wake_undelivered")
-        );
         assert!(row(&store, &id).await.peer_interrupted());
-        // Delivered at last: the item clears.
         store
             .mark_wake_notified(&id, OffsetDateTime::now_utc())
             .await
             .unwrap();
         store.reconcile_peer_interruptions(&agents).await.unwrap();
         assert!(!row(&store, &id).await.peer_interrupted());
+        assert!(store.ready_pending_recipients.lock().unwrap().is_empty());
     }
 }

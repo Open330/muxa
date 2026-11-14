@@ -2454,3 +2454,97 @@ fn adaptive_delivery_cost_matrix() {
         })).unwrap()).unwrap();
     }
 }
+
+/// Review of #550: a launching worker seen only by discovery (a synthetic,
+/// pre-hook row) whose pane refuses every write. The waker must hand
+/// reconciliation that row's own identity, not the delivery participant's
+/// `pending-pane:` id, or the undelivered-wake bound never matches it.
+#[tokio::test]
+async fn a_refused_wake_to_a_launching_pane_remembers_its_synthetic_row() {
+    struct Worker(std::process::Child);
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let worker = Worker(
+        std::process::Command::new("bash")
+            .args(["-c", "exec -a 'codex --no-daemon' sleep 30"])
+            .spawn()
+            .unwrap(),
+    );
+    let store = tend::Store::shared();
+    add_agent(&store, "%1", "sender", AgentKind::ClaudeCode).await;
+    let synthetic = format!("{}default:%2", tend::state::SYNTHETIC_SESSION_PREFIX);
+    add_agent(&store, "%2", &synthetic, AgentKind::Codex).await;
+    let mut launched = collaboration_pane("%2", "1");
+    launched.agent_role = Some("peer".into());
+    launched.agent_program = Some("codex".into());
+    launched.pane_pid = worker.0.id();
+    let panes = vec![collaboration_pane("%1", "0"), launched];
+    let agents = store.snapshot().await;
+    let participants = worker_participants(&agents, &panes);
+    let sender = participants
+        .iter()
+        .find(|participant| participant.pane == "%1")
+        .unwrap()
+        .clone();
+    let pending = tend::collaboration::resolve_pending_pane_target(
+        &sender,
+        "pane:%2",
+        &participants,
+        &agents,
+        &panes,
+        tend::config::CollaborationScope::Window,
+    )
+    .expect("a launched agent pane is addressable by pane id");
+    let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+    authorize_test_workers(&mailbox, &participants).await;
+    mailbox
+        .register_worker_launch(
+            uuid::Uuid::new_v4().to_string(),
+            panes[1].clone(),
+            AgentKind::Codex,
+        )
+        .await
+        .unwrap();
+    let request = mailbox
+        .create(
+            sender,
+            pending,
+            NewRequest {
+                body: "implement".into(),
+                ..NewRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let backend: tend::SharedBackend = Arc::new(RefusingWakeBackend {
+        panes,
+        attempts: attempts.clone(),
+        accepting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
+
+    assert!(
+        attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(pane, _)| pane == "%2"),
+        "delivery found the launching pane ready and tried it"
+    );
+    assert_eq!(
+        mailbox.pending_unnotified().await.len(),
+        1,
+        "still undelivered"
+    );
+    let (pane, socket, session) = mailbox
+        .ready_pending_recipient(&request.id)
+        .expect("the waker remembered the validated recipient");
+    assert_eq!(pane, "%2");
+    assert_eq!(socket.as_deref(), Some("default"));
+    assert_eq!(session, synthetic, "the registry row's own id");
+}

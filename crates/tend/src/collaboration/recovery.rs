@@ -284,6 +284,7 @@ impl CollaborationStore {
             .turn_continuation
             .load(std::sync::atomic::Ordering::SeqCst);
         let snapshot = self.requests.read().await;
+        self.prune_ready_pending(&snapshot);
         let mut missing = self.missing_recipients.lock().await;
         missing.retain(|id, _| snapshot.get(id).is_some_and(|r| !r.status.is_terminal()));
         let mut changed = Vec::new();
@@ -365,6 +366,10 @@ impl CollaborationStore {
                 }
             } else if parent.status.is_terminal()
                 || agent.is_some_and(|a| matches!(a.state, AgentState::Working | AgentState::Idle))
+                // The validated recipient of a still-pending address moved on.
+                || self
+                    .ready_pending_agent(&parent, agents)
+                    .is_some_and(|a| matches!(a.state, AgentState::Working | AgentState::Idle))
                 // Delivered at last, even to a still-pending address.
                 || (parent
                     .interruption

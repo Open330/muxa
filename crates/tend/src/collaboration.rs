@@ -5331,6 +5331,29 @@ pub(crate) fn unique_pane<'a>(
 /// The live agent row occupying a pane, real or synthetic. Discovery and
 /// screen detection share one synthetic key per pane, so at most one row is
 /// returned for a pane that has never registered a session.
+/// The registry row behind a ready delivery `recipient`, keyed by the row's
+/// own pane, socket and session id. A launching pane's participant carries a
+/// `pending-pane:` id (or stands for a synthetic, pre-hook row), so the row
+/// is the live one at that pane, as [`pending_recipient_ready`] picks it.
+pub fn ready_row_key(
+    recipient: &Participant,
+    agents: &[Agent],
+) -> Option<wake_retry::ReadyRecipient> {
+    let row = if is_pending_session(&recipient.agent_session_id) {
+        live_pane_row(&recipient.pane, recipient.socket.as_deref(), agents)
+    } else {
+        agents.iter().find(|agent| {
+            agent.session_id == recipient.agent_session_id
+                && agent.pane.as_deref() == Some(recipient.pane.as_str())
+        })
+    }?;
+    Some((
+        row.pane.clone()?,
+        row.tmux_socket.clone(),
+        row.session_id.clone(),
+    ))
+}
+
 fn live_pane_row<'a>(
     pane_id: &str,
     socket: Option<&str>,
