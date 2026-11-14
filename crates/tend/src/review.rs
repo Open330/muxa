@@ -729,6 +729,7 @@ fn prepare_file(path: &Path) -> Result<(), ReviewError> {
 }
 
 /// Owner-only permissions on existing WAL and shared-memory files.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn secure_sidecars(path: &Path) -> Result<(), ReviewError> {
     #[cfg(unix)]
     {

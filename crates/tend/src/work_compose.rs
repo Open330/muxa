@@ -453,9 +453,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(path: &std::path::Path) -> bool {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 #[cfg(test)]
