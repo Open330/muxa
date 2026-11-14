@@ -79,6 +79,15 @@ pub struct PipelineAliasState {
     pub updated_at: OffsetDateTime,
 }
 
+/// What [`PipelineRunStore::begin_completion`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Began {
+    /// Wrote this completion down.
+    Created,
+    /// The same completion was already written down; left as it was.
+    Existing,
+}
+
 /// A result record and the completion it belongs to. The record carries its
 /// idempotency key, so filing it again returns the item already filed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,12 +587,16 @@ impl PipelineRunStore {
     /// after the same checks [`Self::done`] makes. Persisted first, so a
     /// filed record is never left without its completion: whatever a crash
     /// interrupts, [`Self::pending_completions`] hands back at the next start.
+    ///
+    /// A completion already written down for this generation is never
+    /// replaced: its record may be filed already. The same record (same
+    /// key) reuses it ([`Began::Existing`]); another record is refused.
     pub async fn begin_completion(
         &self,
         identity: &WorkIdentity,
         alias: &str,
         pending: PendingCompletion,
-    ) -> Result<(), PipelineRunError> {
+    ) -> Result<Began, PipelineRunError> {
         let mut inner = self.inner.lock().await;
         let previous = inner
             .runs
@@ -592,18 +605,32 @@ impl PipelineRunStore {
             .ok_or_else(|| PipelineRunError::NotFound(identity.key()))?;
         let mut run = previous.clone();
         let state = completable(&mut run, identity, alias, pending.generation)?;
+        if let Some(existing) = state
+            .completing
+            .as_ref()
+            .filter(|existing| existing.generation == pending.generation)
+        {
+            if existing.record.idempotency_key == pending.record.idempotency_key {
+                return Ok(Began::Existing);
+            }
+            return Err(PipelineRunError::Invalid(format!(
+                "another result for {alias:?} in generation {} is still being completed",
+                pending.generation
+            )));
+        }
         state.completing = Some(Box::new(pending));
         persist_run(&mut inner, run, Some(previous)).await?;
-        Ok(())
+        Ok(Began::Created)
     }
 
-    /// Drop the pending completion of `alias` in `generation`, if it is
-    /// still the one recorded: its record could not be filed.
+    /// Drop the pending completion of `alias` in `generation` whose record
+    /// has idempotency key `key`, if it is still the one recorded.
     pub async fn abandon_completion(
         &self,
         identity: &WorkIdentity,
         alias: &str,
         generation: u64,
+        key: Option<&str>,
     ) -> Result<(), PipelineRunError> {
         let mut inner = self.inner.lock().await;
         let Some(previous) = inner.runs.get(identity).cloned() else {
@@ -613,11 +640,9 @@ impl PipelineRunStore {
         let Some(state) = run.aliases.get_mut(alias) else {
             return Ok(());
         };
-        if state
-            .completing
-            .as_ref()
-            .is_none_or(|pending| pending.generation != generation)
-        {
+        if state.completing.as_ref().is_none_or(|pending| {
+            pending.generation != generation || pending.record.idempotency_key.as_deref() != key
+        }) {
             return Ok(());
         }
         state.completing = None;

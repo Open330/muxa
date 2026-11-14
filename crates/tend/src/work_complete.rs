@@ -11,7 +11,7 @@
 //! filed, or files it if it never was. So a filed result is never left
 //! with its alias still open.
 
-use crate::pipeline_run::{PendingCompletion, PipelineRun, PipelineRunStore};
+use crate::pipeline_run::{Began, PendingCompletion, PipelineRun, PipelineRunStore};
 use crate::review::{NewReview, ReviewItem, ReviewStore, ReviewTarget};
 use crate::work::WorkIdentity;
 
@@ -72,7 +72,9 @@ pub async fn complete_with_record(
     pending: PendingCompletion,
 ) -> Result<(PipelineRun, ReviewItem), String> {
     let generation = pending.generation;
-    runs.begin_completion(identity, alias, pending.clone())
+    let key = pending.record.idempotency_key.clone();
+    let began = runs
+        .begin_completion(identity, alias, pending.clone())
         .await
         .map_err(|error| error.to_string())?;
     let item = match reviews
@@ -81,7 +83,13 @@ pub async fn complete_with_record(
     {
         Ok(item) => item,
         Err(error) => {
-            let _ = runs.abandon_completion(identity, alias, generation).await;
+            // Only what this call wrote down: an earlier one with the same
+            // record may already have filed it and must still roll forward.
+            if began == Began::Created {
+                let _ = runs
+                    .abandon_completion(identity, alias, generation, key.as_deref())
+                    .await;
+            }
             return Err(format!(
                 "filing the result record failed ({error}); {alias:?} is not reported done"
             ));
@@ -115,8 +123,11 @@ pub async fn recover(runs: &PipelineRunStore, reviews: &ReviewStore) -> Vec<Reco
     let mut outcomes = Vec::new();
     for (identity, alias, pending, current) in runs.pending_completions().await {
         let generation = pending.generation;
+        let key = pending.record.idempotency_key.clone();
         if !current {
-            let _ = runs.abandon_completion(&identity, &alias, generation).await;
+            let _ = runs
+                .abandon_completion(&identity, &alias, generation, key.as_deref())
+                .await;
             outcomes.push(Recovered::Stale { alias });
             continue;
         }
@@ -145,7 +156,9 @@ pub async fn recover(runs: &PipelineRunStore, reviews: &ReviewStore) -> Vec<Reco
                 });
             }
             Err(error) => {
-                let _ = runs.abandon_completion(&identity, &alias, generation).await;
+                let _ = runs
+                    .abandon_completion(&identity, &alias, generation, key.as_deref())
+                    .await;
                 outcomes.push(Recovered::Dropped {
                     alias,
                     reason: error.to_string(),
@@ -352,6 +365,85 @@ mod tests {
             "{outcomes:?}"
         );
         assert_eq!(status(&runs).await, (PipelineAliasStatus::Running, true));
+    }
+
+    #[tokio::test]
+    async fn a_failed_retry_keeps_an_earlier_completion_that_may_be_filed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.json");
+        let reviews_path = dir.path().join("reviews.sqlite");
+        let (runs, generation) = started(&path).await;
+        // Written down and filed, then the daemon died before `done`.
+        runs.begin_completion(&identity(), "impl", pending(generation))
+            .await
+            .unwrap();
+        let first = ReviewStore::open(&reviews_path)
+            .unwrap()
+            .create(record(generation))
+            .await
+            .unwrap();
+        drop(runs);
+        // Back up with the review store down: recovery keeps it, and a
+        // retry of the same record fails to file but must not drop it.
+        let runs = PipelineRunStore::load(Some(path.clone())).unwrap();
+        let down = ReviewStore::unavailable("test: down");
+        assert!(matches!(
+            &recover(&runs, &down).await[..],
+            [Recovered::Kept { .. }]
+        ));
+        assert!(
+            complete_with_record(&runs, &down, &identity(), "impl", pending(generation))
+                .await
+                .is_err()
+        );
+        assert_eq!(status(&runs).await, (PipelineAliasStatus::Running, true));
+        drop(runs);
+        // With the store back, the next start finishes it with that item.
+        let runs = PipelineRunStore::load(Some(path)).unwrap();
+        let reviews = ReviewStore::open(&reviews_path).unwrap();
+        assert_eq!(
+            recover(&runs, &reviews).await,
+            vec![Recovered::Completed {
+                alias: "impl".to_string(),
+                item: first.id
+            }]
+        );
+        assert_eq!(status(&runs).await, (PipelineAliasStatus::Done, false));
+    }
+
+    #[tokio::test]
+    async fn another_record_cannot_replace_a_completion_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runs, generation) = started(&dir.path().join("runs.json")).await;
+        runs.begin_completion(&identity(), "impl", pending(generation))
+            .await
+            .unwrap();
+        let mut other = pending(generation);
+        other.record.idempotency_key = Some("work-done:someone-else".to_string());
+        let error = runs
+            .begin_completion(&identity(), "impl", other.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("still being completed"),
+            "{error}"
+        );
+        // Nor can it abandon the one in progress.
+        runs.abandon_completion(
+            &identity(),
+            "impl",
+            generation,
+            other.record.idempotency_key.as_deref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status(&runs).await, (PipelineAliasStatus::Running, true));
+        assert_eq!(
+            runs.begin_completion(&identity(), "impl", pending(generation))
+                .await
+                .unwrap(),
+            Began::Existing
+        );
     }
 
     #[tokio::test]
