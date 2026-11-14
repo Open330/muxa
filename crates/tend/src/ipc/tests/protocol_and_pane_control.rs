@@ -1493,6 +1493,24 @@ async fn fleet_snapshot_selector_and_command_round_trip_over_ipc() {
         .await
         .expect("fleet command");
     assert_eq!(result.message.as_deref(), Some("refreshed"));
+    // A person's review decision is never taken over this socket: an agent
+    // could otherwise accept its own result on another host.
+    let refused = client
+        .fleet_execute(
+            "dev",
+            &FleetOperation::ReviewDispose {
+                dispose: crate::fleet::FleetReviewDispose {
+                    id: "rv_1".into(),
+                    disposition: crate::review::DispositionKind::Accepted,
+                    by: "web:someone".into(),
+                    option: None,
+                    note: None,
+                },
+            },
+        )
+        .await
+        .expect_err("refused before it reaches the host");
+    assert!(refused.to_string().contains("Needs you"), "{refused}");
 
     command_task.await.unwrap();
     drop(updates);

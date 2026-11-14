@@ -170,7 +170,8 @@ function actions(card) {
     note.placeholder = "Note (needed to send back)";
     const path = `/api/decisions/reviews/${encodeURIComponent(card.id)}`;
     const decide = (disposition, option, done) => {
-      const body = { disposition };
+      // A result on another Fleet host is decided there, over Fleet.
+      const body = card.remote ? { disposition, host: card.host } : { disposition };
       if (note.value.trim()) body.note = note.value;
       if (option) body.option = option;
       send(path, body, done);

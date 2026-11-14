@@ -503,6 +503,21 @@ async fn handle_request(
                 result: Box::new(FleetCommandResult::decision_queue(queue)),
             })
         }
+        RelayRequest::ReviewDispose {
+            request_id,
+            dispose,
+        } => {
+            // As this host's operator: the controller asking holds the
+            // operator's Fleet control and authenticated the person.
+            let outcome = client
+                .review_dispose_exactly(&dispose)
+                .await
+                .context("deciding the review item")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: Box::new(FleetCommandResult::review_dispose(outcome)),
+            })
+        }
         RelayRequest::ServerInventory { request_id } => {
             static SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
             let Ok(_permit) = SCAN.try_acquire() else {

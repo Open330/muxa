@@ -134,3 +134,22 @@ test("a notification's card survives sign-in", () => {
   assert.equal(needsReturnPath(""), "/needs");
   assert.equal(needsReturnPath("#pane=%251"), "/needs");
 });
+
+test("a remote result is decided here only where that host takes decisions over Fleet", () => {
+  const review = { kind: "review", id: "rv_1", summary: "x", target: { kind: "session", session_id: "s" }, requested_at: "2026-11-12T11:00:00Z" };
+  const [current, older, observe] = hostSections({
+    hosts: [
+      { alias: "mini", local: false, control: true, decides_reviews: true, queue: { items: [review] } },
+      { alias: "mbp", local: false, control: true, decides_reviews: false, queue: { items: [review] } },
+      { alias: "obs", local: false, control: false, decides_reviews: false, queue: { items: [review] } },
+    ],
+  }, now);
+  assert.equal(current.cards[0].actionable, true);
+  assert.deepEqual(current.notes, []);
+  assert.equal(older.cards[0].actionable, false);
+  assert.match(older.notes[0], /decide on that host/);
+  assert.equal(observe.cards[0].actionable, false);
+  assert.deepEqual(observe.notes, ["observe-only: answer on that host"]);
+  // The same id on two hosts keeps two drafts.
+  assert.notEqual(draftKey(current.cards[0]), draftKey(older.cards[0]));
+});
