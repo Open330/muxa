@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- tendd takes and restores workspace snapshots itself (the Mac app's
+  Snapshots, its automatic snapshot), instead of running `tend snapshot` /
+  `tend restore` as a child. The snapshot code moved into the `tend-work`
+  library with the rest of the Work code; the JSON documents, the time
+  budgets and a failed restore's partial report are unchanged, and dropping
+  the call (tendd stopping) stops the restore. `TEND_SNAPSHOT_CHILD=1`
+  brings the child back.
+
 - tendd starts agents itself for the Mac app's New Agent and the
   `agent_start` IPC request, instead of running `tend agent start` as a
   child. It reads the same config, pins the target's tmux server the way

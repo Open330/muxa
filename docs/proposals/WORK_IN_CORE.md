@@ -1,7 +1,7 @@
 # Work in core: tendd stops running `tend` for Work logic
 
 Status: in progress. Step 1 (the move into `crates/tend-work`) is #502.
-`work up`, pipeline reconcile and `agent start` run in-process (step 3); see "Done so far".
+`work up`, pipeline reconcile, `agent start` and snapshots run in-process (step 3); see "Done so far".
 
 ## Problem
 
@@ -173,4 +173,22 @@ pub struct WorkContext {
     native one with a changed `TERM`, before that case declined); an
     unknown server refused before anything ran; `health` answering in under
     10 ms during a launch; the forced child failing without a CLI and
+- Snapshots (`mux_snapshot_control`: list, save, the automatic snapshot,
+  plan, delete, restore) run `tend_work::reload` in tendd
+  (`crates/tendd/src/snapshot_in_process.rs`, hook
+  `mux_snapshot_control::install_in_process_snapshot`). `reload` moved from
+  the CLI into `tend-work`; `tend reload mcp` stays in the CLI.
+  - The answer has the child's shape, so `MuxSnapshotControl` is unchanged
+    past `run`: the `--json` document as stdout (`reload::capture_json`
+    takes what `print_json` would have printed), exit code 0 or 1, and
+    `Error: {error:?}` as stderr, which is what the CLI's `main` printed.
+  - The code reads no config and no request environment, so the daemon's
+    own environment is what the child had, apart from `TEND_SOCKET`, which
+    the client and subprocess scope carry.
+  - The scope's deadline is the child's budget (30 s, 60 s, 15 min).
+    Dropping the call cancels it, as `kill_on_drop` did to the child.
+  - `TEND_SNAPSHOT_CHILD=1` forces the child.
+  - Proven on a scratch daemon with `TEND_CLI` pointing nowhere: a tracked
+    agent's server saved and listed; a killed session planned and restored
+    (its agent pane relaunched); the forced child failing without a CLI and
     succeeding with one.

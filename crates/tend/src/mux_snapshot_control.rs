@@ -1,11 +1,12 @@
 //! Workspace snapshots for Tend.app and tendd's automatic snapshot.
 //!
-//! `tend snapshot` / `tend restore` (the CLI's `reload` module) are the only
-//! code that knows the snapshot format, the restore planner and the resume
-//! rules. Like [`crate::work_control`] for `work up`, the daemon does not grow
-//! a second implementation: it runs those commands with `--json` as bounded
-//! children and hands their documents through untouched, so a client decodes
-//! exactly what the CLI prints.
+//! `tend snapshot` / `tend restore` (`tend_work::reload`) are the only code
+//! that knows the snapshot format, the restore planner and the resume rules.
+//! The daemon does not grow a second implementation. It runs that code in
+//! process through the hook tendd installs ([`install_in_process_snapshot`]),
+//! or the commands with `--json` as bounded children when the hook is absent
+//! or declines. Either way it hands their documents through untouched, so a
+//! client decodes exactly what the CLI prints.
 //!
 //! A restore can take minutes — every pane waits for its shell to come up —
 //! so it runs as a tracked operation the client polls. Only one restore runs
@@ -110,6 +111,38 @@ impl Drop for SaveGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// `tend snapshot …` / `tend restore …` run inside the calling process
+/// instead of as a `tend` child. tendd installs one at startup, as it does
+/// for `work up`. It gets the argv the child would have run, the daemon
+/// socket and the child's time budget, and answers with what the child
+/// would have: an exit code, the `--json` document as stdout, and the error
+/// as the last line of stderr. `None` means it declined before doing
+/// anything, and the child runs.
+pub type InProcessSnapshot = Arc<
+    dyn Fn(
+            Vec<String>,
+            PathBuf,
+            Duration,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<WorkCommandOutput>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static IN_PROCESS_SNAPSHOT: std::sync::OnceLock<InProcessSnapshot> = std::sync::OnceLock::new();
+
+/// Set the in-process snapshot runner once, at daemon startup. Later calls
+/// are ignored.
+pub fn install_in_process_snapshot(run: InProcessSnapshot) {
+    let _ = IN_PROCESS_SNAPSHOT.set(run);
+}
+
+/// Whether `TEND_SNAPSHOT_CHILD` forces the `tend` child, the path every
+/// release before this one used.
+fn snapshot_child_forced() -> bool {
+    std::env::var_os("TEND_SNAPSHOT_CHILD").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// Ids name a directory directly under the snapshots root and nothing else —
@@ -339,6 +372,16 @@ impl MuxSnapshotControl {
         args: &[String],
         limits: WorkCommandLimits,
     ) -> Result<WorkCommandOutput, MuxSnapshotError> {
+        if let Some(run) = IN_PROCESS_SNAPSHOT
+            .get()
+            .filter(|_| !snapshot_child_forced())
+        {
+            if let Some(output) = run(args.to_vec(), self.socket_path.clone(), limits.timeout).await
+            {
+                return Ok(output);
+            }
+            tracing::info!("in-process snapshot command declined; running the tend CLI");
+        }
         Ok(work_control::execute_work_command(
             &self.binary,
             args,
