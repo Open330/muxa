@@ -701,6 +701,63 @@ pub const STARTUP_DIALOGS: &[Dialog] = &[
     },
 ];
 
+/// A startup dialog a freshly launched or restored agent is sitting on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupBlocker {
+    /// What it is, for a report (`skipped the Codex update prompt`, …).
+    pub label: &'static str,
+    /// The keys that answer it, when it needs no consent from the user and
+    /// tend can tell which row a key picks. Type them one by one with
+    /// [`type_keys`], once. `None`: never typed; report the pane as
+    /// waiting on this dialog instead.
+    pub keys: Option<Vec<&'static str>>,
+    /// What answering would agree to for the user.
+    pub consent: Consent,
+}
+
+/// Startup dialogs any caller may answer: dismissing them installs,
+/// trusts and resumes nothing.
+pub const SAFE_DISMISSALS: &[&str] = &["skipped the Codex update prompt"];
+
+/// The startup dialog `screen` shows, if any, so a restore or launch never
+/// leaves a pane silently stuck on one. Built on [`STARTUP_DIALOGS`]; a
+/// dialog tend must not answer (folder-settings trust, Codex's "Hooks need
+/// review", bypass acceptance without evidence) comes back without keys.
+/// Codex's update menu answers with Esc ("skip"), which installs nothing.
+#[must_use]
+pub fn startup_blocker(screen: &str) -> Option<StartupBlocker> {
+    if crate::worker_startup::codex_hook_review(screen) {
+        return Some(StartupBlocker {
+            label: "Codex hooks need review",
+            keys: None,
+            consent: Consent::Settings,
+        });
+    }
+    let Some(dialog) = pending_dialog(screen, STARTUP_DIALOGS, &[]) else {
+        // A question tend has no entry for: never typed into, but never
+        // left silent either.
+        return open_question(screen)
+            .filter(|_| dialog_is_active(screen))
+            .map(|_| StartupBlocker {
+                label: "an unrecognised startup dialog",
+                keys: None,
+                consent: Consent::None,
+            });
+    };
+    // Only a dismissal that agrees to nothing and starts no work: the update
+    // menu's Esc ("skip"). Folder trust, a paused goal's "Resume goal" and
+    // the rest need evidence only a swap or a worker start has, so a
+    // generic caller reports them instead.
+    let keys = (dialog.consent == Consent::None && SAFE_DISMISSALS.contains(&dialog.label))
+        .then(|| dialog.keys_on(screen))
+        .flatten();
+    Some(StartupBlocker {
+        label: dialog.label,
+        keys,
+        consent: dialog.consent,
+    })
+}
+
 /// What `/exit` may ask before Claude quits, and what a swap answers.
 pub const EXIT_DIALOGS: &[Dialog] = &[
     // Background shells or agents: keep them running past the exit.
@@ -797,6 +854,9 @@ pub const QUESTION_FOOTERS: &[&str] = &[
     "esc to cancel",
     "enter select",
     "enter continue",
+    // Older Codex releases' menus (the update menu and folder trust of
+    // 0.154): `Press enter to continue`.
+    "press enter to continue",
     "r to retry",
     // Codex's lock screen: `r retry   f fork   esc/⌃c/q exit`.
     "r retry",
@@ -1352,5 +1412,49 @@ mod tests {
             "✻ Cooked for 1m 2s · done 4:45 PM\n────\n❯ \n"
         ));
         assert!(!turn_running(RESUMED));
+    }
+
+    #[test]
+    fn a_startup_blocker_says_whether_tend_may_answer_it() {
+        let update = "  Update available · 0.161.0 → 0.167.2\n› 1. Update now (runs `npm i`)\n  \
+            2. Skip\n  3. Skip until next version\n  enter continue · esc skip\n";
+        let found = startup_blocker(update).expect("the update menu");
+        assert_eq!(found.label, "skipped the Codex update prompt");
+        assert_eq!(found.keys, Some(vec![ESC]));
+        assert_eq!(found.consent, Consent::None);
+        let settings = " This folder pre-approves 2 tool permissions in .claude/settings.json:\n \
+            ❯ Yes, I trust these settings\n   No, exit Claude Code\n Enter to confirm · Esc to cancel\n";
+        let found = startup_blocker(settings).expect("the settings dialog");
+        assert_eq!(found.keys, None, "never answered for the user");
+        assert_eq!(found.consent, Consent::Settings);
+        assert!(startup_blocker("› Ask Codex to do anything\n").is_none());
+        // Captured from the real Codex 0.154.0 on a scratch tmux server
+        // (2026-11-14): its footer is `Press enter to continue`, and Esc
+        // skips it without installing anything.
+        let real_0_154 = "  ✨ Update available! 0.154.0 -> 0.169.0\n  \
+            Release notes: https://github.com/openai/codex/releases/latest\n\
+            › 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  \
+            3. Skip until next version\n  Press enter to continue\n";
+        let found = startup_blocker(real_0_154).expect("the 0.154 update menu");
+        assert_eq!(found.keys, Some(vec![ESC]));
+        // The same release's folder trust has no entry here: reported, not typed.
+        let trust_0_154 = "> You are in /tmp/w\n  Do you trust the contents of this directory?\n\
+            › 1. Yes, continue\n  2. No, quit\n  Press enter to continue\n";
+        let found = startup_blocker(trust_0_154).expect("an open question");
+        assert_eq!(found.label, "an unrecognised startup dialog");
+        assert_eq!(found.keys, None);
+    }
+
+    #[test]
+    fn a_generic_caller_gets_keys_only_for_the_update_menu() {
+        let trust = "  Do you trust the contents of this directory?\n› 1. Trust and continue\n  2. Quit\n  \
+            Trust this folder · enter continue\n";
+        if let Some(found) = startup_blocker(trust) {
+            assert_eq!(found.keys, None, "{}", found.label);
+        }
+        let goal = "    Finish the docs.\n  › 1. Resume goal   Mark it active\n    2. Leave paused\n    enter select · esc back\n";
+        let found = startup_blocker(goal).expect("the goal menu");
+        assert_eq!(found.label, "resumed the paused goal");
+        assert_eq!(found.keys, None, "starting old work needs evidence");
     }
 }

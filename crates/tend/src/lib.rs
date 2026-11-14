@@ -53,6 +53,7 @@ pub mod backend;
 pub mod binary_upgrade;
 pub mod child_env;
 mod codex_binding;
+pub mod codex_launch;
 pub mod collaboration;
 pub mod collaboration_audit;
 pub mod config;

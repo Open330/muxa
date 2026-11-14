@@ -247,7 +247,14 @@ mod tests {
             };
             assert_eq!(
                 super::super::relaunch_command(&pane).unwrap(),
-                format!("{prefix} {program} {resume} thread-id")
+                if program == "codex" {
+                    format!(
+                        "{prefix} codex -c check_for_update_on_startup=false \
+                         -c 'tui.resume_cwd=\"session\"' resume thread-id"
+                    )
+                } else {
+                    format!("{prefix} {program} {resume} thread-id")
+                }
             );
         }
     }

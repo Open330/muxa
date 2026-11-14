@@ -631,23 +631,23 @@ fn resume_suffix(kind: AgentKind, session_id: &str) -> Vec<String> {
         // Codex's update check is off for this start, and it resumes in the
         // session's own directory (what the swap always answered), so those
         // dialogs are never shown rather than answered.
-        AgentKind::Codex => vec![
-            "-c".into(),
-            CODEX_NO_UPDATE_CHECK.into(),
-            "-c".into(),
-            CODEX_RESUME_IN_SESSION_DIR.into(),
-            "resume".into(),
-            session_id.into(),
-        ],
+        AgentKind::Codex => vec!["resume".into(), session_id.into()],
         _ => vec!["--resume".into(), session_id.into()],
     }
 }
 
-/// The Codex config override a swap relaunch starts with. Codex ignores a
-/// `-c` key it does not know, so an older release starts as before.
-const CODEX_NO_UPDATE_CHECK: &str = "check_for_update_on_startup=false";
-/// Resume in the session's directory without asking (`tui.resume_cwd`).
-const CODEX_RESUME_IN_SESSION_DIR: &str = "tui.resume_cwd=\"session\"";
+/// The agent's own arguments for a relaunch: what it ran with (less its old
+/// resume), then the resume of `session_id`. For Codex, with
+/// `tend::codex_launch`'s startup overrides over the whole list, so a
+/// setting the user passed for either key stays theirs.
+fn relaunch_args(args: &[String], kind: AgentKind, session_id: &str) -> Vec<String> {
+    let mut words = resume_free_args(args, kind);
+    words.extend(resume_suffix(kind, session_id));
+    if kind == AgentKind::Codex {
+        words = tend::codex_launch::with_startup_overrides(&words);
+    }
+    words
+}
 
 /// The line to type back into the pane: the same launch, on `account`,
 /// resuming `session_id`.
@@ -669,15 +669,27 @@ pub fn relaunch_line(
             _ => (None, rest),
         };
         words.extend(frontend);
-        words.extend(resume_free_args(args, kind));
+        // `aas exec <account> -- …`: the `--` is aas's own; the agent's
+        // arguments (and Codex's overrides) start after it.
+        let args = match args.first().map(String::as_str) {
+            Some("--") => {
+                words.push("--".into());
+                &args[1..]
+            }
+            _ => args,
+        };
+        words.extend(relaunch_args(args, kind, session_id));
     } else {
         if bare == BareMode::Skip {
             return Err("started without aas; use --bare wrap to move it onto an account".into());
         }
         words.extend(["aas".to_owned(), "e".to_owned(), account.to_owned()]);
-        words.extend(resume_free_args(line.tokens.get(1..).unwrap_or(&[]), kind));
+        words.extend(relaunch_args(
+            line.tokens.get(1..).unwrap_or(&[]),
+            kind,
+            session_id,
+        ));
     }
-    words.extend(resume_suffix(kind, session_id));
     // Typed into the pane's own shell: PowerShell under rmux on Windows.
     Ok(tend::shell::Dialect::native().command_line(&words))
 }
@@ -694,8 +706,7 @@ pub fn profile_relaunch_line(
 ) -> Result<String, String> {
     let (program, args) = agent_program_and_args(line, kind);
     let mut words = profile.launch_prefix(&program);
-    words.extend(resume_free_args(args, kind));
-    words.extend(resume_suffix(kind, session_id));
+    words.extend(relaunch_args(args, kind, session_id));
     let dialect = tend::shell::Dialect::native();
     if cfg!(windows) {
         return Err(
@@ -4201,6 +4212,28 @@ pub(crate) mod tests {
         assert_eq!(children.len(), 2, "{seen:?}");
     }
 
+    /// A setting the user passed for either key survives a relaunch, on
+    /// `aas` and on a configured account alike: nothing tend adds comes
+    /// after it.
+    #[test]
+    fn a_codex_relaunch_keeps_the_users_own_startup_settings() {
+        let user = LaunchLine::bare(
+            "codex -c check_for_update_on_startup=true -c tui.resume_cwd=current --yolo",
+        );
+        let aas = relaunch_line(&user, AgentKind::Codex, "019a", "b", BareMode::Wrap).unwrap();
+        let home = account("home", "CODEX_HOME", "/h");
+        let profile = profile_relaunch_line(&user, AgentKind::Codex, "019a", &home).unwrap();
+        for line in [aas, profile] {
+            assert!(
+                !line.contains("check_for_update_on_startup=false"),
+                "{line}"
+            );
+            assert!(!line.contains("session"), "{line}");
+            assert!(line.contains("check_for_update_on_startup=true"), "{line}");
+            assert!(line.ends_with("resume 019a"), "{line}");
+        }
+    }
+
     /// A Codex relaunch turns the update check off for its start, and the
     /// line still reads as resuming exactly that conversation.
     #[test]
@@ -4215,18 +4248,18 @@ pub(crate) mod tests {
         .unwrap();
         assert!(
             line.ends_with(
-                "-c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 019a"
+                "-c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo resume 019a"
             ),
             "{line}"
         );
         // The relaunched process's argv, as the shell hands it over.
         let argv: Vec<String> = [
             "codex",
+            "-c",
+            tend::codex_launch::STARTUP_OVERRIDES[0],
+            "-c",
+            tend::codex_launch::STARTUP_OVERRIDES[1],
             "--yolo",
-            "-c",
-            CODEX_NO_UPDATE_CHECK,
-            "-c",
-            CODEX_RESUME_IN_SESSION_DIR,
             "resume",
             "019a",
         ]
@@ -4237,7 +4270,10 @@ pub(crate) mod tests {
             argv_resumes(&argv, AgentKind::Codex, "019a"),
             ArgvResume::Exact
         );
-        assert_eq!(CODEX_RESUME_IN_SESSION_DIR, "tui.resume_cwd=\"session\"");
+        assert_eq!(
+            tend::codex_launch::STARTUP_OVERRIDES[1],
+            "tui.resume_cwd=\"session\""
+        );
         // Claude's line is unchanged.
         assert_eq!(resume_suffix(AgentKind::ClaudeCode, "S"), ["--resume", "S"]);
     }
@@ -4715,7 +4751,7 @@ pub(crate) mod tests {
         let line = LaunchLine::from_aas("aas exec a@codex -- --yolo resume old -m gpt-5").unwrap();
         assert_eq!(
             relaunch_line(&line, AgentKind::Codex, "sid", "b@codex", BareMode::Skip).unwrap(),
-            "aas exec b@codex -- --yolo -m gpt-5 -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume sid"
+            "aas exec b@codex -- -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo -m gpt-5 resume sid"
         );
     }
 
@@ -4984,7 +5020,7 @@ pub(crate) mod tests {
         let command = profile_relaunch_line(&line, AgentKind::Codex, "019a-new", &home).unwrap();
         assert_eq!(
             command,
-            "env CODEX_HOME=/h/.codex-home /opt/bin/codex --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 019a-new"
+            "env CODEX_HOME=/h/.codex-home /opt/bin/codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo resume 019a-new"
         );
     }
 

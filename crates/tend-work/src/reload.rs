@@ -2078,35 +2078,82 @@ fn relaunch_command_without_home(pane: &PaneShape) -> Option<String> {
     {
         return None;
     }
-    let resuming = pane.agent.as_ref().and_then(|agent| {
-        (!agent.session_id.is_empty() && !agent.session_id.starts_with("synthetic"))
-            .then_some(agent.kind.as_str())
-    });
-    let command = match pane.argv.as_deref() {
+    let session = pane
+        .agent
+        .as_ref()
+        .filter(|agent| !agent.session_id.is_empty() && !agent.session_id.starts_with("synthetic"));
+    let dialect = tend::shell::Dialect::native();
+    match pane.argv.as_deref() {
         Some(argv) if !argv.is_empty() => {
-            let argv = match resuming {
-                Some(kind) => without_session_id(&without_initial_prompt(argv, kind), kind),
+            let mut words = match session {
+                Some(agent) => without_session_id(
+                    &without_initial_prompt(argv, agent.kind.as_str()),
+                    agent.kind.as_str(),
+                ),
                 None => argv.to_vec(),
             };
-            tend::shell::Dialect::native().command_line(&argv)
+            match session.map(|agent| agent.kind.as_str()) {
+                Some("claude_code") if !words.iter().any(|w| w == "--resume") => {
+                    words.extend(["--resume".to_owned(), session?.session_id.clone()]);
+                }
+                Some("codex") if !words.iter().any(|w| w == "resume") => {
+                    words.extend(["resume".to_owned(), session?.session_id.clone()]);
+                }
+                _ => {}
+            }
+            // A restored Codex never comes up on its update menu or its
+            // directory question (`tend::codex_launch`).
+            let words = tend::codex_launch::with_startup_overrides_in_line(&words);
+            Some(dialect.command_line(&words))
         }
-        _ => pane.command.clone()?,
-    };
-    let Some(agent) = pane.agent.as_ref() else {
-        return Some(command);
-    };
-    if agent.session_id.is_empty() || agent.session_id.starts_with("synthetic") {
-        return Some(command);
+        _ => {
+            let command = pane.command.clone()?;
+            let Some(agent) = session else {
+                // A fresh (or synthetic) Codex start is still a Codex start.
+                let codex = pane.agent.as_ref().is_some_and(|a| a.kind == "codex");
+                return Some(if codex {
+                    codex_overrides_in_text(&command)
+                } else {
+                    command
+                });
+            };
+            Some(match agent.kind.as_str() {
+                "claude_code" if !command.contains("--resume") => {
+                    format!("{command} --resume {}", agent.session_id)
+                }
+                "codex" => {
+                    let command = if command.contains(" resume ") {
+                        command
+                    } else {
+                        format!("{command} resume {}", agent.session_id)
+                    };
+                    codex_overrides_in_text(&command)
+                }
+                _ => command,
+            })
+        }
     }
-    match agent.kind.as_str() {
-        "claude_code" if !command.contains("--resume") => {
-            Some(format!("{command} --resume {}", agent.session_id))
-        }
-        "codex" if !command.contains(" resume ") => {
-            Some(format!("{command} resume {}", agent.session_id))
-        }
-        _ => Some(command),
-    }
+}
+
+/// [`tend::codex_launch`]'s overrides for a Codex line known only as text
+/// (no captured argv). Never guesses inside shell syntax: a line that does
+/// not plainly start Codex is left as it is (and, if it stops on a startup
+/// dialog, the restore reports it).
+fn codex_overrides_in_text(command: &str) -> String {
+    codex_overrides_in_text_for(command, tend::shell::Dialect::native())
+}
+
+/// The fragment is arguments, not a command: each word quoted for
+/// `dialect` and joined, never rendered as an invocation (PowerShell would
+/// put its call operator before a leading `-c`).
+fn codex_overrides_in_text_for(command: &str, dialect: tend::shell::Dialect) -> String {
+    tend::codex_launch::with_startup_overrides_in_text(command, |words| {
+        words
+            .iter()
+            .map(|word| dialect.word(word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 /// Claude names a new conversation with `--session-id`, but refuses it next to
@@ -3303,7 +3350,13 @@ mod tests {
             session_id: "synthetic-7".into(),
             working: false,
         });
-        assert_eq!(relaunch_command(&codex).as_deref(), Some("codex --yolo"));
+        // No conversation to resume, but still a Codex start.
+        assert_eq!(
+            relaunch_command(&codex).as_deref(),
+            Some(
+                "codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo"
+            )
+        );
     }
 
     #[test]
@@ -3324,7 +3377,7 @@ mod tests {
         codex.agent.as_mut().unwrap().session_id = "01a13353-ba8c-70f3-a502-2a33f3521878".into();
         assert_eq!(
             relaunch_command(&codex).as_deref(),
-            Some("codex --yolo resume 01a13353-ba8c-70f3-a502-2a33f3521878")
+            Some("codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo resume 01a13353-ba8c-70f3-a502-2a33f3521878")
         );
     }
 
@@ -3392,7 +3445,7 @@ mod tests {
         );
         assert_eq!(
             relaunch_command(&codex).as_deref(),
-            Some("aas exec e-ed@codex -- --yolo resume 01a12f38")
+            Some("aas exec e-ed@codex -- -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo resume 01a12f38")
         );
         // Bare program, prompt last.
         let bare = shape(
@@ -3552,5 +3605,18 @@ mod tests {
         );
         assert_eq!(split_cmdline(b"sleep\x00777\x00"), vec!["sleep", "777"]);
         assert!(split_cmdline(b"").is_empty());
+    }
+
+    #[test]
+    fn a_text_only_codex_line_gets_arguments_not_an_invocation_in_either_shell() {
+        let posix = codex_overrides_in_text_for("codex resume id", tend::shell::Dialect::Posix);
+        assert_eq!(
+            posix,
+            "codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume id"
+        );
+        let ps = codex_overrides_in_text_for("codex resume id", tend::shell::Dialect::PowerShell);
+        assert!(ps.starts_with("codex -c "), "{ps}");
+        assert!(!ps.contains('&'), "{ps}");
+        assert!(ps.ends_with(" resume id"), "{ps}");
     }
 }

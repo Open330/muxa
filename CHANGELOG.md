@@ -124,6 +124,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error with Copilot's message, as it settles Esc. Both observed on Copilot
   CLI 1.0.110 with the model connection cut mid-answer.
 
+- Every Codex start tend composes now carries `-c
+  check_for_update_on_startup=false -c tui.resume_cwd="session"`, not only
+  the account swap's relaunch: snapshot restore and reload, `tend agent
+  start`, work up and pipeline launches, MCP and Fleet-relayed starts. A
+  restore of many Codex panes left every one of them on Codex's "Update
+  available" menu, whose default row installs the update. One builder,
+  `tend::codex_launch`, composes them all, and a test fails if a new launch
+  path skips it. A `-c`/`--config` the user already passes for either key
+  is kept.
+- `tend::agent_tui::startup_blocker` names the startup dialog a launched or
+  restored pane sits on. It returns the keys when the dialog needs no consent
+  (Codex's update menu: Esc, which installs nothing), and none for a dialog
+  tend must not answer or does not know, so that pane can be reported as
+  waiting. Older Codex releases' `Press enter to continue` menus are
+  recognised as open questions.
+
 - Claude's folder-trust prompt is no longer answered when its path wraps
   across rows, on any platform: a space dropped at the break could make
   another folder read as a trusted one. Such a prompt is left for a person.
