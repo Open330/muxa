@@ -227,6 +227,25 @@ impl SettleWatch {
     }
 }
 
+/// Whether the follow-up typed into a pane may be submitted, from one last
+/// capture of it: not when it cannot be read, shows a startup error, or
+/// shows a dialog. Fails closed; the text then stays unsent in the input.
+pub(super) fn may_submit(screen: Result<String, String>) -> Result<(), Ending> {
+    let screen = screen.map_err(|error| {
+        Ending::Failed(format!(
+            "was mid-turn; its screen could not be read before Enter ({error}), so the \
+             follow-up was typed but not submitted"
+        ))
+    })?;
+    if let Some(reason) = agent_tui::blocked_screen(&screen) {
+        return Err(Ending::Failed(reason.to_owned()));
+    }
+    if let Some(question) = held_screen(&screen) {
+        return Err(Ending::Waiting(waiting_note(&question)));
+    }
+    Ok(())
+}
+
 /// The note for a pane held at a dialog.
 pub(super) fn waiting_note(question: &str) -> String {
     let question = question.trim();
@@ -618,10 +637,9 @@ pub(super) fn continue_pane(
         return failed(error);
     }
     std::thread::sleep(CONTINUE_SUBMIT_GRACE);
-    // Enter answers a dialog: one drawn in the meantime gets none.
-    if let Some(question) = held_screen(&capture().unwrap_or_default()) {
-        return Err(Ending::Waiting(waiting_note(&question)));
-    }
+    // Enter answers whatever holds the screen now: it is read once more,
+    // and only a screen read and still the agent's gets it.
+    may_submit(capture())?;
     match mux_control::run(endpoint, &["send-keys", "-t", target, "Enter"]) {
         Ok(()) => Ok(true),
         Err(error) => failed(error),
@@ -757,6 +775,28 @@ mod tests {
             settle.observe(ms(2000), trust),
             Some(Settle::Stop(Ending::Waiting(_)))
         ));
+    }
+
+    #[test]
+    fn enter_goes_only_to_a_screen_read_and_still_the_agents() {
+        assert_eq!(
+            may_submit(Ok("› continue\n  ? for shortcuts".into())),
+            Ok(())
+        );
+        assert!(matches!(
+            may_submit(Err("server busy".into())),
+            Err(Ending::Failed(note)) if note.contains("not submitted")
+        ));
+        assert_eq!(
+            may_submit(Ok("Error: No conversation found with id abc\n$ ".into())),
+            Err(Ending::Failed(
+                "the agent could not find the conversation to resume".into()
+            ))
+        );
+        assert_eq!(
+            may_submit(Ok(CODEX_UPDATE.into())),
+            Err(Ending::Waiting(waiting_note("Update available")))
+        );
     }
 
     #[test]
