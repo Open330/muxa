@@ -15,6 +15,13 @@ use crate::pipeline_run::{Began, PendingCompletion, PipelineRun, PipelineRunStor
 use crate::review::{NewReview, ReviewItem, ReviewStore, ReviewTarget};
 use crate::work::WorkIdentity;
 
+/// One completion with a record at a time, from writing it down to marking
+/// the alias done. Without it, a same-key retry could adopt an intent while
+/// the call that created it, failing to file, drops it after the retry has
+/// filed, leaving a filed record nothing will complete. Completions are rare
+/// and short (the checks run before this is taken).
+static COMPLETING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Advertised by a daemon whose `pipeline_done` takes a `record`.
 pub const CAPABILITY: &str = "work_done_record_v1";
 
@@ -71,6 +78,7 @@ pub async fn complete_with_record(
     alias: &str,
     pending: PendingCompletion,
 ) -> Result<(PipelineRun, ReviewItem), String> {
+    let _serial = COMPLETING.lock().await;
     let generation = pending.generation;
     let key = pending.record.idempotency_key.clone();
     let began = runs
@@ -120,6 +128,7 @@ pub enum Recovered {
 /// Finish every completion a crash interrupted. Run once at startup, before
 /// anything else can complete or restart an alias.
 pub async fn recover(runs: &PipelineRunStore, reviews: &ReviewStore) -> Vec<Recovered> {
+    let _serial = COMPLETING.lock().await;
     let mut outcomes = Vec::new();
     for (identity, alias, pending, current) in runs.pending_completions().await {
         let generation = pending.generation;
@@ -409,6 +418,21 @@ mod tests {
             }]
         );
         assert_eq!(status(&runs).await, (PipelineAliasStatus::Done, false));
+    }
+
+    #[tokio::test]
+    async fn overlapping_calls_for_one_completion_run_one_after_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runs, generation) = started(&dir.path().join("runs.json")).await;
+        let reviews = ReviewStore::in_memory();
+        let id = identity();
+        let (a, b) = tokio::join!(
+            complete_with_record(&runs, &reviews, &id, "impl", pending(generation)),
+            complete_with_record(&runs, &reviews, &id, "impl", pending(generation)),
+        );
+        assert_eq!(a.unwrap().1.id, b.unwrap().1.id);
+        assert_eq!(status(&runs).await, (PipelineAliasStatus::Done, false));
+        assert_eq!(items(&reviews).await.len(), 1);
     }
 
     #[tokio::test]

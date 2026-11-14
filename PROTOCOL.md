@@ -895,7 +895,9 @@ the alias in the Run store), files the record, and marks the alias done. The
 response has both `pipeline_run` and `review_item`. A record that cannot be
 filed leaves the alias open and nothing newly written down; a completion
 already written down for the same record (same key) is reused and kept, and
-one for a different record is refused, never replaced. A crash after the
+one for a different record is refused, never replaced. tendd runs one such
+completion at a time (after the checks), so overlapping retries cannot drop
+each other's. A crash after the
 completion is written down is finished at the next start of the default
 daemon: filing again under the key returns the item already filed (or files
 it), then the alias completes; an alias restarted since drops it. So a filed
