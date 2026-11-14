@@ -283,7 +283,20 @@ mod tests {
         lock.lock().unwrap();
         assert!(prune_backups(dir.path(), 1).unwrap().is_empty());
         drop(lock);
-        assert_eq!(names(&prune_backups(dir.path(), 1).unwrap()), ["a", "b"]);
+        // `flock` belongs to the open file description, which a child forked
+        // by another test shares until it execs: std forks (rather than
+        // `posix_spawn`s) a command whose `PATH` it changed, and
+        // `accounts.rs` does that. For that moment the lock is still held
+        // and the pass rightly skips; the next one prunes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let removed = loop {
+            let removed = prune_backups(dir.path(), 1).unwrap();
+            if !removed.is_empty() || std::time::Instant::now() >= deadline {
+                break removed;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(names(&removed), ["a", "b"]);
     }
 
     #[test]
