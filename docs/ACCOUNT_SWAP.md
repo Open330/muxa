@@ -91,12 +91,27 @@ appears on the typed command line or in shell history; it is read again only
 to recognise the account. `[accounts]` is host-local: config sync never
 copies it.
 
-`auto` over configured accounts follows a fixed rule: a new agent starts on
-the first listed account, and a swap moves an agent to the first eligible
-listed account other than its own, skipping the one it was capped on. tend does not
-yet rank configured accounts by the usage it observes on other agents: it
-cannot yet tell deterministically which account a running agent's limit
-reports belong to. Ranking by observed usage is coming in a follow-up (#367).
+`auto` over configured accounts ranks them by the usage tend has observed:
+an account tend saw capped (until its reset), or with a quota window at 100%,
+is skipped; among the rest, the one with the most quota left goes first, and
+an account with no current reading counts as unused. Ties, and an empty
+record, keep config order. A new agent starts on the best-ranked account
+(the first listed one when all are capped), and a swap moves an agent to
+the best-ranked eligible account other than its own, skipping the one it
+was capped on.
+
+A reading is credited to an account only by its process: tendd looks at each
+Claude and Codex agent of a provider that lists accounts once a minute, finds
+its process in its pane, and credits a change in a quota window (or the turn
+to rate-limited) to the one account whose environment that process runs
+with. The first sight of a process is only a baseline, because a relaunched
+agent's row still shows the previous account's numbers until it reports its
+own; each window is credited only when its own value changes under that
+process. A process whose environment cannot be read (macOS hides it for
+some signed binaries) credits nothing. The record is
+`<data dir>/tend/account-usage.json`; deleting it returns ranking to config
+order. Hosts that list no `[[accounts]]` run no recorder: `aas` ranks its
+own accounts.
 Name an account (`--to <account>`, `account = "<name>"`) to choose one
 yourself.
 

@@ -1837,7 +1837,13 @@ fn profile_steps(
         .filter(|(p, _)| is_rate_limited(&p.agent))
         .filter_map(|(_, account)| account.as_deref())
         .collect();
-    let ranked = crate::account_provider::configured(provider, profiles, &capped);
+    let ranked = crate::account_provider::configured(
+        provider,
+        profiles,
+        &capped,
+        &crate::account_usage::load_default(),
+        time::OffsetDateTime::now_utc(),
+    );
     let choice = match &request.to {
         AccountChoice::Named(name) => {
             AccountChoice::Named(tend::accounts::bare_name(name, provider).to_owned())
@@ -4989,10 +4995,20 @@ mod tests {
             account("b", "K", "2"),
             account("c", "K", "3"),
         ];
-        let ranked = crate::account_provider::configured("claude", &profiles, &["b"]);
+        let ranked = crate::account_provider::configured(
+            "claude",
+            &profiles,
+            &["b"],
+            &crate::account_usage::Ledger::default(),
+            time::OffsetDateTime::now_utc(),
+        );
+        // The capped one goes last; the rest keep config order.
         assert_eq!(
-            ranked.iter().map(|c| c.eligible).collect::<Vec<_>>(),
-            [true, false, true]
+            ranked
+                .iter()
+                .map(|c| (c.name.as_str(), c.eligible))
+                .collect::<Vec<_>>(),
+            [("a", true), ("c", true), ("b", false)]
         );
         let moves = assign(&[Some("a".to_owned()), None], &ranked, &AccountChoice::Auto);
         assert_eq!(moves, vec![Ok("c".to_owned()), Ok("a".to_owned())]);

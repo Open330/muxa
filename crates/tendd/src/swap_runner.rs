@@ -70,6 +70,7 @@ pub(crate) async fn open_swap_service(
         ),
     );
     spawn_prompt_receipts(&store, Arc::clone(&receipts));
+    spawn_usage_recorder(&store, &backends, &accounts);
     let opened = tokio::task::spawn_blocking(move || {
         let path = paths::default_node_id_file().ok_or("no data directory for the node id")?;
         let node_id = tend::fleet::load_or_create_node_id(&path)
@@ -107,6 +108,75 @@ pub(crate) async fn open_swap_service(
             Err(format!("could not open the swap job store: {error}"))
         }
     }
+}
+
+/// How often the usage recorder looks at the agents.
+const USAGE_RECORD_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Credit configured accounts with the usage their agents report
+/// ([`tend_aas::account_usage`]), so launches and swaps can rank them. Not
+/// started when no provider lists `[[accounts]]`: `aas` ranks its own.
+fn spawn_usage_recorder(
+    store: &tend::SharedStore,
+    backends: &[tend::SharedBackend],
+    accounts: &tend::accounts::AccountsConfig,
+) {
+    if accounts.claude.is_empty() && accounts.codex.is_empty() {
+        return;
+    }
+    let Some(path) = tend_aas::account_usage::default_path() else {
+        tracing::warn!("no data directory: configured accounts are ranked in config order");
+        return;
+    };
+    let store = Arc::clone(store);
+    let backends = backends.to_vec();
+    let accounts = accounts.clone();
+    tokio::spawn(async move {
+        let recorder = Arc::new(std::sync::Mutex::new(
+            tend_aas::account_usage::Recorder::default(),
+        ));
+        let mut tick = tokio::time::interval(USAGE_RECORD_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let agents = store.snapshot().await;
+            let (recorder, backends, accounts, file) = (
+                Arc::clone(&recorder),
+                backends.clone(),
+                accounts.clone(),
+                path.clone(),
+            );
+            let pass = tokio::task::spawn_blocking(move || {
+                let now = time::OffsetDateTime::now_utc();
+                let mut ledger = tend_aas::account_usage::load(&file);
+                let mut recorder = recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let changed = tend_aas::account_usage::record_pass(
+                    &mut recorder,
+                    &mut ledger,
+                    &agents,
+                    &backends,
+                    &accounts,
+                    now,
+                );
+                if changed {
+                    ledger.prune(now);
+                    tend_aas::account_usage::save(&file, &ledger)
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            match pass {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, path = %path.display(), "could not save account usage");
+                }
+                Err(error) => tracing::warn!(%error, "account usage pass failed"),
+            }
+        }
+    });
 }
 
 /// One admitted swap operation, from its pane's guard to its job's end.

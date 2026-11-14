@@ -7,10 +7,11 @@
 //!
 //! 1. **Configured accounts**: `[[accounts.<provider>]]` in `config.toml`,
 //!    each the environment that selects it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
-//!    a token file). No external tool is involved. They are used in config
-//!    order, by a fixed rule ([`configured`]): tend does not yet rank them by
-//!    observed usage, since it cannot yet tell deterministically which
-//!    account a running agent's limit reports belong to.
+//!    a token file). No external tool is involved. They are ranked by the
+//!    usage tend has observed on each ([`configured`],
+//!    [`crate::account_usage`]): a reading counts for an account only when
+//!    the agent process that reported it runs with that account's
+//!    environment. With nothing observed, config order decides.
 //! 2. **`aas`**: when no accounts are configured and the `aas` binary is
 //!    installed (or `[swap].aas` names one), `aas candidates` ranks its own
 //!    accounts and `aas e <name>` starts the CLI.
@@ -69,34 +70,74 @@ pub fn no_accounts(provider: &str) -> String {
     )
 }
 
-/// `profiles` as candidates, in config order: each account in `capped` (the
-/// one an agent being swapped is capped on) is ineligible.
+/// `profiles` as candidates, ranked by what `usage` has seen of them at
+/// `now`. An account in `capped` (the one an agent being swapped is capped
+/// on) or one the ledger holds capped is ineligible. The eligible ones go
+/// first, the one with the most quota left first; an account with no
+/// current reading counts as unused, and ties keep config order, so an
+/// empty ledger ranks exactly in config order.
 #[must_use]
-pub fn configured(provider: &str, profiles: &[AccountProfile], capped: &[&str]) -> Vec<Candidate> {
-    profiles
+pub fn configured(
+    provider: &str,
+    profiles: &[AccountProfile],
+    capped: &[&str],
+    usage: &crate::account_usage::Ledger,
+    now: time::OffsetDateTime,
+) -> Vec<Candidate> {
+    let mut ranked: Vec<Candidate> = profiles
         .iter()
         .map(|profile| {
-            let is_capped = capped.contains(&profile.name.as_str());
+            let standing = usage.standing(provider, &profile.name, now);
+            let capped_here = capped.contains(&profile.name.as_str());
+            let reason = if capped_here {
+                "rate limited here".to_owned()
+            } else if let Some(until) = standing.capped_until {
+                format!(
+                    "capped until {}",
+                    until
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default()
+                )
+            } else if let Some(used) = standing.used_pct {
+                format!("configured; {used:.0}% used")
+            } else {
+                "configured".to_owned()
+            };
             Candidate {
                 name: profile.name.clone(),
                 provider: provider.to_owned(),
-                eligible: !is_capped,
+                eligible: !capped_here && standing.capped_until.is_none(),
                 active: false,
-                reason: if is_capped {
-                    "rate limited here".into()
-                } else {
-                    "configured".into()
-                },
-                remaining_pct: None,
+                reason,
+                remaining_pct: standing
+                    .used_pct
+                    .map(|used| f64::from((100.0 - used).clamp(0.0, 100.0))),
             }
         })
-        .collect()
+        .collect();
+    // Stable: equal keys keep config order.
+    ranked.sort_by(|a, b| {
+        b.eligible.cmp(&a.eligible).then_with(|| {
+            let left = |c: &Candidate| c.remaining_pct.unwrap_or(100.0);
+            left(b).total_cmp(&left(a))
+        })
+    });
+    ranked
 }
 
 /// Resolve the same backend as launches and swaps, preserving per-provider errors.
 pub fn candidates(provider: &str, accounts: &AccountsConfig, aas: &str) -> ProviderCandidates {
     let (source, result) = match backend(provider, accounts, aas) {
-        Backend::Accounts(profiles) => ("configured", Ok(configured(provider, &profiles, &[]))),
+        Backend::Accounts(profiles) => (
+            "configured",
+            Ok(configured(
+                provider,
+                &profiles,
+                &[],
+                &crate::account_usage::load_default(),
+                time::OffsetDateTime::now_utc(),
+            )),
+        ),
         Backend::Aas(program) => (
             "aas",
             crate::account_swap::query_candidates_within(
@@ -134,18 +175,81 @@ mod tests {
     #[test]
     fn configured_accounts_go_in_config_order_and_a_capped_one_is_ineligible() {
         let profiles = [profile("a"), profile("b"), profile("c")];
-        let candidates = configured("claude", &profiles, &["a"]);
+        let none = crate::account_usage::Ledger::default();
+        let now = time::OffsetDateTime::now_utc();
+        let candidates = configured("claude", &profiles, &["a"], &none, now);
         assert_eq!(
             candidates
                 .iter()
                 .map(|c| (c.name.as_str(), c.eligible))
                 .collect::<Vec<_>>(),
-            [("a", false), ("b", true), ("c", true)]
+            [("b", true), ("c", true), ("a", false)]
         );
-        assert_eq!(candidates[0].reason, "rate limited here");
-        assert!(configured("claude", &profiles, &[])
-            .iter()
-            .all(|c| c.eligible));
+        assert_eq!(candidates[2].reason, "rate limited here");
+        let all = configured("claude", &profiles, &[], &none, now);
+        assert!(all.iter().all(|c| c.eligible));
+        assert_eq!(
+            all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"],
+            "an empty ledger keeps config order"
+        );
+    }
+
+    #[test]
+    fn configured_accounts_rank_by_observed_usage_and_skip_held_caps() {
+        use crate::account_usage::{Ledger, Window, WindowReading};
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let hour = time::Duration::hours(1);
+        let reading = |used_pct| WindowReading {
+            used_pct,
+            resets_at: Some(now + hour),
+            observed_at: now - hour,
+        };
+        let mut ledger = Ledger::default();
+        ledger
+            .accounts
+            .entry("claude/a".into())
+            .or_default()
+            .windows
+            .insert(Window::FiveHour, reading(80.0));
+        ledger
+            .accounts
+            .entry("claude/b".into())
+            .or_default()
+            .capped_until = Some(now + hour);
+        ledger
+            .accounts
+            .entry("claude/c".into())
+            .or_default()
+            .windows
+            .insert(Window::SevenDay, reading(30.0));
+        // A reading for another provider's account of the same name.
+        ledger
+            .accounts
+            .entry("codex/d".into())
+            .or_default()
+            .capped_until = Some(now + hour);
+        let profiles = [profile("a"), profile("b"), profile("c"), profile("d")];
+        let ranked = configured("claude", &profiles, &[], &ledger, now);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|c| (c.name.as_str(), c.eligible))
+                .collect::<Vec<_>>(),
+            [("d", true), ("c", true), ("a", true), ("b", false)]
+        );
+        assert_eq!(ranked[1].remaining_pct, Some(70.0));
+        assert!(
+            ranked[3].reason.starts_with("capped until "),
+            "{}",
+            ranked[3].reason
+        );
+        // Once the cap and the readings lapse, config order is back.
+        let later = configured("claude", &profiles, &[], &ledger, now + hour * 2);
+        assert_eq!(
+            later.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
     }
 
     #[test]
