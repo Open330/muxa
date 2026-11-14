@@ -60,6 +60,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # `window_placement` drives a private tmux server; without tmux the test
       # skips itself and the regression it guards goes unwatched here.
       - run: sudo apt-get update && sudo apt-get install -y tmux
