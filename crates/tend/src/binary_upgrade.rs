@@ -234,11 +234,28 @@ mod tests {
 mod pinned_tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    /// Put a copy of `from` at `to` through a `cp` child, never through a
+    /// writable descriptor in this process. A child another test forks at
+    /// that moment inherits such a descriptor until it execs, and Linux
+    /// then refuses to exec the file (`ETXTBSY`), which `validate` reports
+    /// as "probe could not start". std forks rather than `posix_spawn`s a
+    /// command whose `PATH` it changed (`accounts.rs` does). Reproduced in a
+    /// Linux container: 70 of 2000 execs after `std::fs::copy` failed with
+    /// `ETXTBSY` while such commands ran, none after a `cp` child.
+    fn copy_by_child(from: &str, to: &std::path::Path) {
+        assert!(std::process::Command::new("/bin/cp")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap()
+            .success());
+    }
     #[tokio::test]
     async fn atomic_replacement_executes_validated_inode_and_in_place_writes_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("binary");
-        std::fs::copy("/bin/true", &binary).unwrap();
+        copy_by_child("/bin/true", &binary);
         let config = dir.path().join("config");
         std::fs::write(&config, "").unwrap();
         let check = UpgradeCheck::new(
@@ -247,7 +264,7 @@ mod pinned_tests {
         );
         let checked = check.validate().await.unwrap();
         let replacement = dir.path().join("next");
-        std::fs::copy("/bin/false", &replacement).unwrap();
+        copy_by_child("/bin/false", &replacement);
         std::fs::rename(&replacement, &binary).unwrap();
         assert!(!checked.unchanged());
         assert!(
@@ -261,7 +278,7 @@ mod pinned_tests {
             .status()
             .unwrap()
             .success());
-        std::fs::copy("/bin/true", &binary).unwrap();
+        copy_by_child("/bin/true", &binary);
         let checked = check.validate().await.unwrap();
         std::fs::write(&binary, "overwritten").unwrap();
         assert!(checked.execution_path().is_err());

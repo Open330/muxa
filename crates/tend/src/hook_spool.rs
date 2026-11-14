@@ -412,6 +412,25 @@ mod tests {
         assert!(!path.exists() && !rotated_path(&path).exists());
     }
 
+    /// `append`, retried while its lock budget runs out. A hook gives the
+    /// event up instead (by design, the wait is bounded); this test is about
+    /// rotation, so every appender must get in. The lock can read as held
+    /// past the budget under a parallel test run: eight writers queue on it,
+    /// and a child another test forks shares its open file description
+    /// until it execs (std forks rather than `posix_spawn`s a command whose
+    /// `PATH` it changed, as `accounts.rs` does).
+    fn append_retrying(path: &Path, entry: &SpoolEntry) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match append(path, entry) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline => {}
+                result => return result.unwrap(),
+            }
+        }
+    }
+
     #[test]
     fn concurrent_appenders_across_rotations_lose_no_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -426,7 +445,7 @@ mod tests {
                 let big = big.clone();
                 std::thread::spawn(move || {
                     for _ in 0..4 {
-                        append(&path, &big).unwrap();
+                        append_retrying(&path, &big);
                     }
                 })
             })
