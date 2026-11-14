@@ -274,10 +274,11 @@ pub(crate) fn default_socket_dirs() -> Vec<PathBuf> {
     )
 }
 
-/// Set by a daemon that is not the user's default one (its own `--socket`
-/// or `--config`): with `TMUX_TMPDIR` set it then watches only the tmux
-/// servers in that directory, never the user's `/tmp/tmux-<uid>` ones. A
-/// test or demo daemon otherwise discovered and tracked every real agent.
+/// Set by a daemon that is not the user's default one (its own `--socket`,
+/// `--config`, `HOME` or XDG directories): it watches only the tmux servers
+/// in its own `TMUX_TMPDIR`, or none without one, never the user's
+/// `/tmp/tmux-<uid>` ones, and ignores an inherited `$TMUX`/`$RMUX`. A test
+/// or demo daemon otherwise discovered and tracked every real agent.
 static OWN_TMUX_DIR_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Restrict this process's tmux server discovery to `$TMUX_TMPDIR` when it
@@ -302,6 +303,10 @@ fn socket_dirs(
         if own_dir_only {
             return dirs;
         }
+    } else if own_dir_only {
+        // Not the user's daemon and no tmux directory of its own: it watches
+        // no tmux server rather than fall back to the user's.
+        return dirs;
     }
     dirs.push(PathBuf::from(format!("/tmp/tmux-{uid}")));
     dirs.push(PathBuf::from(format!("/private/tmp/tmux-{uid}")));
@@ -1061,6 +1066,7 @@ mod tests {
         );
         // Without its own dir, the user's default dir is the only one tmux
         // itself would use, so there is nothing narrower to keep to.
-        assert_eq!(socket_dirs(None, true, 501).len(), 2);
+        // Not the user's daemon and no tmux directory: no server at all.
+        assert!(socket_dirs(None, true, 501).is_empty());
     }
 }

@@ -91,6 +91,40 @@ pub async fn run(args: Args, socket: PathBuf, config_path: Option<PathBuf>) -> R
     run_for_start(args, socket, config_path).await.map(|_| ())
 }
 
+/// Pin `TEND_SOCKET` on the running tmux server, unless this is a scratch setup.
+fn pin_tend_socket_live(socket: &std::path::Path) {
+    // Propagate TEND_SOCKET into the tmux server environment so that
+    // every pane — including the one that runs `tend status-line` in
+    // `status-right` — uses the same socket path after a daemon restart.
+    // We do this unconditionally (not gated on `report.tmux_sourced`) so
+    // that re-running `tend init` on an already-configured host still
+    // heals the runtime env if the tmux server was restarted since the
+    // last init. The conf-file persistence added by `tmux-env` handles
+    // fresh server boots; this live injection handles existing servers.
+    // Not from a scratch HOME/XDG setup, though: its socket is its own, and
+    // the ambient server (an inherited `$TMUX`) is the user's, whose panes
+    // would then point at a socket that goes away with the scratch daemon.
+    let overrides = tend::paths::default_dirs_overridden();
+    let server_up = overrides.is_empty()
+        && crate::mux_control::ambient_command()
+            .arg("list-sessions")
+            .output()
+            .is_ok_and(|o| o.status.success());
+    if !overrides.is_empty() {
+        tracing::info!(
+            ?overrides,
+            "HOME or XDG directories are not the account's own: leaving the tmux server's TEND_SOCKET alone"
+        );
+    }
+    if server_up {
+        if let Some(s) = socket.to_str() {
+            let _ = crate::mux_control::ambient_command()
+                .args(["set-environment", "-g", "TEND_SOCKET", s])
+                .status();
+        }
+    }
+}
+
 /// Whether setup completed (including an already configured installation).
 pub(crate) async fn run_for_start(
     args: Args,
@@ -186,25 +220,7 @@ pub(crate) async fn run_for_start(
     render_apply_steps(mode, &report);
     warn_codex_hook_trust(mode, &plan);
 
-    // Propagate TEND_SOCKET into the tmux server environment so that
-    // every pane — including the one that runs `tend status-line` in
-    // `status-right` — uses the same socket path after a daemon restart.
-    // We do this unconditionally (not gated on `report.tmux_sourced`) so
-    // that re-running `tend init` on an already-configured host still
-    // heals the runtime env if the tmux server was restarted since the
-    // last init. The conf-file persistence added by `tmux-env` handles
-    // fresh server boots; this live injection handles existing servers.
-    let server_up = crate::mux_control::ambient_command()
-        .arg("list-sessions")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if server_up {
-        if let Some(s) = socket.to_str() {
-            let _ = crate::mux_control::ambient_command()
-                .args(["set-environment", "-g", "TEND_SOCKET", s])
-                .status();
-        }
-    }
+    pin_tend_socket_live(&socket);
 
     let v = verify::run(&plan, socket).await?;
     let extra = summarize_verify(&v);

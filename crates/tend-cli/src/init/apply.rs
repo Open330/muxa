@@ -396,6 +396,22 @@ fn apply_source_tmux(path: &Path, dry_run: bool, report: &mut ApplyReport) -> Re
     if dry_run {
         return Ok(());
     }
+    // Sourcing runs every managed block on the ambient server, including
+    // `set-environment -g TEND_SOCKET` and global hooks and options. From a
+    // scratch HOME/XDG setup that server (an inherited `$TMUX`/`$RMUX`) is
+    // the user's: never apply a scratch config to it live. The file itself
+    // is written under the scratch home and is read by a server started
+    // there.
+    let overrides = tend::paths::default_dirs_overridden();
+    if !overrides.is_empty() {
+        report.warnings.push(format!(
+            "not reloading the running tmux server: {} point(s) at a separate setup ({}); \
+             its config applies to a server started with it",
+            overrides.len(),
+            overrides.join(", ")
+        ));
+        return Ok(());
+    }
     // list-sessions works without an attached-client context on both hosts.
     // rmux maps info to show-messages, which fails when several clients are
     // attached and would silently skip the reload.

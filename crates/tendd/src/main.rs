@@ -277,8 +277,21 @@ async fn run() -> Result<()> {
             config = ?args.config,
             "socket or config override: skipping data-directory retention and the hook-spool drain, which belong to the default daemon"
         );
+    }
+    // The user's daemon, as opposed to a scratch or test one. One started
+    // with its own XDG directories owns *those* (its default socket and
+    // config are its own), but not the user's tmux servers.
+    let xdg_overrides = paths::default_dirs_overridden();
+    let user_daemon = is_primary_daemon(owns_data_dir, &xdg_overrides);
+    if !user_daemon {
+        if owns_data_dir {
+            tracing::info!(
+                overrides = ?xdg_overrides,
+                "HOME or XDG directories are not the account's own: not the user's daemon, so the tmux server environment is left alone"
+            );
+        }
         // Nor does it watch the user's own tmux servers when it was given
-        // its own `TMUX_TMPDIR`.
+        // its own `TMUX_TMPDIR`, or follow an inherited `$TMUX` to them.
         tend::tmux::scanner::restrict_to_own_tmux_dir();
     }
     // A second daemon used to load the registry, start its snapshotter and
@@ -685,7 +698,14 @@ async fn run() -> Result<()> {
     // warm-restart scenarios without requiring the user to re-run
     // `tend init` after every daemon or tmux server restart.
     if listener_ready {
-        maybe_heal_tmux_socket_env(&socket, cfg.socket.as_deref());
+        if user_daemon {
+            maybe_heal_tmux_socket_env(&socket, cfg.socket.as_deref());
+        } else {
+            tracing::debug!(
+                socket = %socket.display(),
+                "not the user's daemon: skipping the tmux TEND_SOCKET heal"
+            );
+        }
         spawn_startup_discovery(&cfg, socket.clone(), backends.clone(), &shutdown_tx);
         spawn_periodic_discovery(&cfg, socket.clone(), inventory.clone(), &shutdown_tx);
     }
@@ -2269,6 +2289,19 @@ fn should_heal_tmux_socket_env(
     cfg_socket: Option<&Path>,
 ) -> bool {
     socket == default_socket || cfg_socket == Some(socket)
+}
+
+/// Whether this tendd is the user's own daemon: the one that owns the
+/// default data directory ([`owns_default_data_dir`]) *and* was not started
+/// with its own XDG directories ([`paths::default_dirs_overridden`]). Only it
+/// may write tmux server-global state (the `TEND_SOCKET` heal) or watch the
+/// user's tmux servers. A scratch daemon whose `XDG_RUNTIME_DIR` points at
+/// its own directory has that directory's socket as its default, so the
+/// socket comparison alone took it for the user's daemon; it then
+/// followed an inherited `$TMUX` and pointed the owner's server at a
+/// socket that died with it.
+fn is_primary_daemon(owns_data_dir: bool, xdg_overrides: &[&str]) -> bool {
+    owns_data_dir && xdg_overrides.is_empty()
 }
 
 /// Whether this tendd is the default daemon — on the canonical socket (see

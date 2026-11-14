@@ -67,6 +67,21 @@ fn heals_canonical_default_or_configured_socket() {
 }
 
 #[test]
+fn a_daemon_on_its_own_xdg_directories_is_never_the_users_daemon() {
+    // The service and `tend daemon start`: no override.
+    assert!(is_primary_daemon(true, &[]));
+    // A scratch daemon with its own XDG_RUNTIME_DIR: its socket *is* its
+    // default socket, so it owns its data directory, yet it must not heal
+    // the user's tmux server (the 2026-11-14 incident).
+    assert!(!is_primary_daemon(true, &["XDG_RUNTIME_DIR"]));
+    assert!(!is_primary_daemon(
+        true,
+        &["XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+    ));
+    assert!(!is_primary_daemon(false, &[]));
+}
+
+#[test]
 fn skips_ephemeral_override_socket() {
     // A dashboard demo / e2e daemon on a throwaway socket matching
     // neither the default nor the configured one must NOT clobber the
