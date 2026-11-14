@@ -252,8 +252,11 @@ impl WorktreeReceipt {
         }
         std::fs::rename(tmp, dir.join(format!("{}.json", self.id)))?;
         // The rename is durable only once the directory is synced: a change
-        // journal must be on disk before git runs.
-        std::fs::File::open(dir)?.sync_all()
+        // journal must be on disk before git runs. Windows cannot open a
+        // directory as a file (access denied); NTFS journals the rename.
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
     }
 }
 

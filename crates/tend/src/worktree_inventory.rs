@@ -916,6 +916,7 @@ fn size(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn a_child_that_overruns_the_scan_is_killed() {
         DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(200))));
@@ -929,6 +930,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn a_helper_holding_stderr_open_cannot_pass_for_a_quiet_run() {
         DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(300))));
@@ -948,6 +950,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // `sh -c` scripts
     #[test]
     fn output_past_the_cap_fails_instead_of_passing_as_complete() {
         let over = (MAX_OUTPUT + 1).to_string();
