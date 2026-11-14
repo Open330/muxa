@@ -46,8 +46,10 @@
 //! as its operator console. An older relay contributes the questions in its
 //! operator mailbox (only its newest messages, so a full read is marked
 //! possibly incomplete) and its waiting agents from the Fleet snapshot, but
-//! no review items. Review items on another host are shown, not decided
-//! here (there is no Fleet write for them). Every host section names what it
+//! no review items. A review item on another host is decided here only when
+//! that host is in control mode and its relay applies decisions exactly
+//! (`fleet_review_dispose_v1`, the section's `decides_reviews`); otherwise
+//! it is shown and decided on its own host. Every host section names what it
 //! covers and what could not be read, and a host that is not online is
 //! listed as such, so nothing is silently missing.
 //!
@@ -55,6 +57,14 @@
 //! and only after reading the request back from that host and checking it
 //! is addressed to the operator console: a Fleet reply to anything else
 //! would be sent as the agent in that pane. The history covers this host.
+//!
+//! A remote review decision names its host; the host's relay checks the
+//! option against its own copy of the item, records the person (`by`) and
+//! the composed note, and reports what its store holds after: the same
+//! decision again is a replay, anything else already recorded a conflict,
+//! and an answer about any other item id is refused. Only the dashboard
+//! sends it: the IPC `fleet_command` path refuses the operation, so an
+//! agent on this host cannot decide a result on another one.
 
 use axum::{
     extract::{Path, Query, State},
@@ -128,6 +138,7 @@ async fn remote_section(
 ) -> serde_json::Value {
     use crate::fleet::{FleetHostState, FleetOperation, HostAccessMode};
     let control = host.mode == HostAccessMode::Control;
+    let reviews = decides_reviews(&host);
     if !matches!(
         host.state,
         FleetHostState::Online | FleetHostState::Degraded
@@ -160,6 +171,7 @@ async fn remote_section(
                 );
                 json!({
                     "alias": host.alias, "local": false, "control": control,
+                    "decides_reviews": reviews,
                     "covers": ["questions", "waiting agents", "review items"],
                     "unavailable": queue.unavailable.clone(), "queue": queue,
                 })
@@ -244,6 +256,7 @@ pub(super) async fn queue_handler(
     let fleet_hosts = fleet_hosts(&state).await;
     let mut hosts = vec![json!({
         "alias": local_alias(&fleet_hosts), "local": true, "control": true,
+        "decides_reviews": true,
         "covers": ["questions", "waiting agents", "review items"],
         "unavailable": local.unavailable.clone(), "queue": local,
     })];
@@ -353,10 +366,14 @@ pub(super) struct ReviewDecision {
     /// The option chosen from the item's decision, recorded in the note.
     #[serde(default)]
     option: Option<String>,
+    /// The Fleet host the item is on; absent (or this host's alias) for
+    /// one filed here.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 /// `POST /api/decisions/reviews/{id}`: accept, return or withdraw a review
-/// item as the operator.
+/// item as the operator, here or on the Fleet host that holds it.
 pub(super) async fn review_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -364,34 +381,7 @@ pub(super) async fn review_handler(
     Json(decision): Json<ReviewDecision>,
 ) -> Response {
     let (by, account) = operator_identity(&state, &headers);
-    let item = match state.reviews.get(id.clone()).await {
-        Ok(item) => item,
-        Err(crate::review::ReviewError::NotFound(_)) => {
-            return error(StatusCode::NOT_FOUND, format!("no review item {id}"));
-        }
-        Err(other) => return error(StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
-    };
-    if let Some(option) = &decision.option {
-        let offered = item
-            .decision
-            .as_ref()
-            .is_some_and(|d| d.options.iter().any(|o| o == option));
-        if !offered {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "that option is not one this item offers",
-            );
-        }
-    }
-    let note = match (
-        decision.option.as_deref(),
-        decision.note.as_deref().map(str::trim),
-    ) {
-        (Some(option), Some(note)) if !note.is_empty() => Some(format!("chose: {option}\n{note}")),
-        (Some(option), _) => Some(format!("chose: {option}")),
-        (None, Some(note)) if !note.is_empty() => Some(note.to_owned()),
-        (None, _) => None,
-    };
+    let note = crate::review::decision_note(decision.option.as_deref(), decision.note.as_deref());
     if note
         .as_ref()
         .is_some_and(|note| note.len() > MAX_NOTE_BYTES)
@@ -401,44 +391,184 @@ pub(super) async fn review_handler(
             format!("note exceeds {MAX_NOTE_BYTES} bytes"),
         );
     }
-    let result = state
-        .reviews
-        .dispose_exact(
-            id.clone(),
-            decision.disposition,
-            crate::review::ReviewActor {
-                kind: crate::review::ActorKind::User,
-                label: Some(by.clone()),
-            },
-            note,
-        )
-        .await;
-    let (status, outcome) = match &result {
-        Ok((_, false)) => (StatusCode::OK, "recorded".to_owned()),
-        // The same decision again: nothing changed, and the audit says so.
-        Ok((_, true)) => (StatusCode::OK, "already recorded".to_owned()),
-        Err(crate::review::ReviewError::Conflict(message)) => {
-            (StatusCode::CONFLICT, message.clone())
-        }
-        Err(crate::review::ReviewError::Invalid(message)) => {
-            (StatusCode::BAD_REQUEST, message.clone())
-        }
-        Err(other) => (StatusCode::SERVICE_UNAVAILABLE, other.to_string()),
+    let hosts = fleet_hosts(&state).await;
+    let remote = decision
+        .host
+        .as_deref()
+        .filter(|alias| *alias != local_alias(&hosts) && *alias != "this host")
+        .map(str::to_owned);
+    let (status, outcome, item) = match &remote {
+        Some(alias) => review_remote(&state, &hosts, alias, &id, &decision, &by).await,
+        None => review_local(&state, &id, &decision, note, &by).await,
     };
     audit(
         state.decision_audit.as_ref(),
         json!({
             "at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
-            "by": by, "account": account, "action": "review", "id": id,
+            "by": by, "account": account, "action": "review", "host": remote, "id": id,
             "disposition": decision.disposition, "option": decision.option,
             "outcome": outcome, "status": status.as_u16(),
         }),
     )
     .await;
-    match result {
-        Ok((item, _)) => Json(json!({ "review": item })).into_response(),
-        Err(_) => error(status, outcome),
+    match item {
+        Some(item) if status == StatusCode::OK => {
+            Json(json!({ "review": item, "host": remote })).into_response()
+        }
+        _ => error(status, outcome),
     }
+}
+
+type ReviewResult = (StatusCode, String, Option<Box<crate::review::ReviewItem>>);
+
+/// A review item filed on this host, decided in its store.
+async fn review_local(
+    state: &AppState,
+    id: &str,
+    decision: &ReviewDecision,
+    note: Option<String>,
+    by: &str,
+) -> ReviewResult {
+    let item = match state.reviews.get(id.to_owned()).await {
+        Ok(item) => item,
+        Err(crate::review::ReviewError::NotFound(_)) => {
+            return (StatusCode::NOT_FOUND, format!("no review item {id}"), None);
+        }
+        Err(other) => return (StatusCode::SERVICE_UNAVAILABLE, other.to_string(), None),
+    };
+    if decision
+        .option
+        .as_ref()
+        .is_some_and(|option| !item.offers(option))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "that option is not one this item offers".into(),
+            None,
+        );
+    }
+    let result = state
+        .reviews
+        .dispose_exact(
+            id.to_owned(),
+            decision.disposition,
+            crate::review::ReviewActor {
+                kind: crate::review::ActorKind::User,
+                label: Some(by.to_owned()),
+            },
+            note,
+        )
+        .await;
+    match result {
+        Ok((item, false)) => (StatusCode::OK, "recorded".into(), Some(Box::new(item))),
+        // The same decision again: nothing changed, and the audit says so.
+        Ok((item, true)) => (
+            StatusCode::OK,
+            "already recorded".into(),
+            Some(Box::new(item)),
+        ),
+        Err(crate::review::ReviewError::Conflict(message)) => (StatusCode::CONFLICT, message, None),
+        Err(crate::review::ReviewError::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, message, None)
+        }
+        Err(other) => (StatusCode::SERVICE_UNAVAILABLE, other.to_string(), None),
+    }
+}
+
+/// A review item on another Fleet host, decided there over Fleet
+/// (`fleet_review_dispose_v1`): only on a control-mode host, the option
+/// checked and the note composed by that host's relay against its own copy
+/// of the item, with the same final, exact semantics as here.
+async fn review_remote(
+    state: &AppState,
+    hosts: &[crate::fleet::FleetHostSnapshot],
+    alias: &str,
+    id: &str,
+    decision: &ReviewDecision,
+    by: &str,
+) -> ReviewResult {
+    use crate::fleet::{FleetOperation, FleetReviewDispose, FleetReviewOutcome, HostAccessMode};
+    let Some(fleet) = &state.fleet else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Fleet is not enabled here".into(),
+            None,
+        );
+    };
+    let Some(host) = hosts.iter().find(|host| host.alias == alias && !host.local) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no Fleet host {alias}"),
+            None,
+        );
+    };
+    if host.mode != HostAccessMode::Control {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("{alias} is observe-only; decide it there, or set mode = \"control\""),
+            None,
+        );
+    }
+    if !decides_reviews(host) {
+        return (
+            StatusCode::CONFLICT,
+            format!("{alias} cannot decide review items over Fleet; upgrade tend there, or decide it on that host"),
+            None,
+        );
+    }
+    let operation = FleetOperation::ReviewDispose {
+        dispose: FleetReviewDispose {
+            id: id.to_owned(),
+            disposition: decision.disposition,
+            by: by.to_owned(),
+            option: decision.option.clone(),
+            note: decision.note.clone(),
+        },
+    };
+    let outcome = match fleet
+        .execute(alias.to_owned(), operation, FLEET_WRITE_TIMEOUT)
+        .await
+    {
+        Ok(result) => result.review_dispose,
+        Err(error) => return (StatusCode::BAD_GATEWAY, format!("{alias}: {error}"), None),
+    };
+    match outcome {
+        // The host must report the item it was asked about; anything else
+        // is not taken as this decision.
+        Some(FleetReviewOutcome::Recorded { item, .. }) if item.id != id => (
+            StatusCode::BAD_GATEWAY,
+            format!("{alias} answered for review {} instead of {id}", item.id),
+            None,
+        ),
+        Some(FleetReviewOutcome::Recorded { item, replay }) => (
+            StatusCode::OK,
+            if replay {
+                "already recorded"
+            } else {
+                "recorded"
+            }
+            .into(),
+            Some(item),
+        ),
+        Some(FleetReviewOutcome::NotFound { message }) => (StatusCode::NOT_FOUND, message, None),
+        Some(FleetReviewOutcome::Conflict { message }) => (StatusCode::CONFLICT, message, None),
+        Some(FleetReviewOutcome::Invalid { message }) => (StatusCode::BAD_REQUEST, message, None),
+        None => (
+            StatusCode::BAD_GATEWAY,
+            format!("{alias} did not say how the decision ended"),
+            None,
+        ),
+    }
+}
+
+/// A Fleet host whose review items can be decided from here: control mode
+/// and a relay that applies the decision exactly.
+fn decides_reviews(host: &crate::fleet::FleetHostSnapshot) -> bool {
+    host.mode == crate::fleet::HostAccessMode::Control
+        && host
+            .capabilities
+            .iter()
+            .any(|c| c == crate::fleet::FLEET_REVIEW_DISPOSE_CAPABILITY)
 }
 
 #[derive(Debug, Deserialize)]

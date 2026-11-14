@@ -18,9 +18,9 @@ use tend::fleet::{
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES,
     FLEET_DECISION_QUEUE_CAPABILITY, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
-    FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY, FLEET_SERVER_INVENTORY_CAPABILITY,
-    FLEET_WORKTREE_CHANGE_CAPABILITY, FLEET_WORKTREE_INVENTORY_CAPABILITY,
-    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_PROTOCOL_VERSION, FLEET_REVIEW_DISPOSE_CAPABILITY, FLEET_SEND_KEYS_CAPABILITY,
+    FLEET_SERVER_INVENTORY_CAPABILITY, FLEET_WORKTREE_CHANGE_CAPABILITY,
+    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use tend::tmux::SessionInfo;
 use tend::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -485,6 +485,14 @@ impl LocalTask {
                     .map(FleetCommandResult::decision_queue)
                     .map_err(|error| error.to_string())
             }
+            FleetOperation::ReviewDispose { dispose } => {
+                audit_operation(LOCAL_HOST_ALIAS, "review_dispose", 0);
+                self.client
+                    .review_dispose_exactly(&dispose)
+                    .await
+                    .map(FleetCommandResult::review_dispose)
+                    .map_err(|error| error.to_string())
+            }
             // Runs in its own task; see `spawn_worktree_inventory`.
             FleetOperation::WorktreeInventory
             | FleetOperation::WorktreeChange { .. }
@@ -721,6 +729,29 @@ fn decision_queue_refusal(
     }
     Some(format!(
         "host '{alias}' cannot send its decision queue; upgrade tend on that host"
+    ))
+}
+
+/// A review decision goes only to a relay that applies it exactly: an older
+/// relay has no such request and would answer with an error, never with a
+/// decision taken another way.
+fn review_dispose_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::ReviewDispose { .. }) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_REVIEW_DISPOSE_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot decide review items over Fleet; upgrade tend on that host"
     ))
 }
 
@@ -1552,17 +1583,7 @@ impl HostTask {
                         let _ = command.reply.send(Ok(FleetCommandResult::accepted("already connected")));
                         continue;
                     }
-                    if matches!(
-                        command.operation,
-                        FleetOperation::SendPrompt { .. }
-                            | FleetOperation::SendKeys { .. }
-                            | FleetOperation::WorktreeChange { .. }
-                            | FleetOperation::CollaborationSend { .. }
-                            | FleetOperation::CollaborationGet { .. }
-                            | FleetOperation::CollaborationClaim { .. }
-                            | FleetOperation::CollaborationReply { .. }
-                            | FleetOperation::CollaborationUpdate { .. }
-                    )
+                    if command.operation.is_control()
                         && self.config.mode != HostAccessMode::Control
                     {
                         let _ = command.reply.send(Err(format!(
@@ -1628,6 +1649,13 @@ impl HostTask {
                             })
                             .or_else(|| {
                                 decision_queue_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
+                            .or_else(|| {
+                                review_dispose_refusal(
                                     &self.alias,
                                     &connected.hello,
                                     &command.operation,
@@ -1749,6 +1777,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::DecisionQueue { request_id: id, limit }
+                        }
+                        FleetOperation::ReviewDispose { dispose } => {
+                            audit_operation(&self.alias, "review_dispose", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::ReviewDispose { request_id: id, dispose }
                         }
                         FleetOperation::ServerInventory => {
                             audit_operation(&self.alias, "server_inventory", 0);
@@ -2378,6 +2414,23 @@ mod tests {
         assert!(refusal.contains("upgrade tend"), "{refusal}");
         assert!(decision_queue_refusal("remote", &current, &queue).is_none());
         assert!(decision_queue_refusal("remote", &older, &servers).is_none());
+        // A review decision goes only to a relay that applies it exactly,
+        // and only to a control-mode host.
+        let dispose = FleetOperation::ReviewDispose {
+            dispose: tend::fleet::FleetReviewDispose {
+                id: "rv_1".into(),
+                disposition: tend::review::DispositionKind::Accepted,
+                by: "web:token".into(),
+                option: None,
+                note: None,
+            },
+        };
+        let refusal = review_dispose_refusal("remote", &older, &dispose).unwrap();
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(review_dispose_refusal("remote", &current, &dispose).is_none());
+        assert!(review_dispose_refusal("remote", &older, &queue).is_none());
+        assert!(dispose.is_control());
+        assert!(!queue.is_control());
     }
 
     #[test]

@@ -376,8 +376,16 @@ may be missing. A host that is not online is listed with its state.
 A question on a **control-mode** Fleet host can be answered from the page:
 tend reads the request back from that host and answers only if it is
 addressed to the operator console (otherwise a Fleet reply would be sent as
-the agent in that pane). Observe-only hosts' questions, and review items on
-other hosts, are shown but decided on their own host. The **Decided** tab
+the agent in that pane). A review item on a control-mode Fleet host whose
+tend applies decisions over Fleet (`fleet_review_dispose_v1`; the section's
+`decides_reviews`) can be decided from the page too: that host's relay
+checks the option against its own copy of the item, records the decision as
+you (`web:<email>`) with the same note as here, and reports what its store
+then holds; an answer about any other item is refused. Observe-only hosts'
+items, and review items on an older host, are shown but decided on their
+own host. Only this route sends that Fleet operation: `fleet_command` over
+IPC and `POST /api/fleet/{host}/command` refuse it, so nothing else can name
+a person as having decided. The **Decided** tab
 covers this host.
 
 Each card can be decided from the page, through the same daemon paths as
@@ -391,7 +399,8 @@ the Mac app:
 - a result to review: an option button, **Looks good**, **Send back** (needs
   a note) or **Withdraw** — `POST /api/decisions/reviews/{id}` with
   `{"disposition": "accepted" | "returned" | "withdrawn", "note": "…",
-  "option": "…"}`; a chosen option is recorded in the note. Dispositions are
+  "option": "…", "host": "…"}` (`host` only for an item on another Fleet
+  host); a chosen option is recorded in the note. Dispositions are
   final.
 
 Both are control routes: the token, or an operator session with the CSRF

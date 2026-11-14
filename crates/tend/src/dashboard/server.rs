@@ -1160,6 +1160,15 @@ async fn fleet_command_handler(
         )
             .into_response();
     };
+    // A review decision carries the person who took it: only the audited
+    // `/api/decisions/reviews/{id}` route, which names them itself, sends one.
+    if matches!(request.operation, FleetOperation::ReviewDispose { .. }) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "decide review items through /api/decisions/reviews/{id}" })),
+        )
+            .into_response();
+    }
     match fleet
         .execute(host, request.operation, Duration::from_secs(20))
         .await
@@ -3544,6 +3553,249 @@ mod tests {
             *replies.lock().unwrap(),
             vec![("mini".to_owned(), question.id.clone(), "yes".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fake Fleet covers every outcome and the audit
+    async fn remote_review_items_are_decided_on_their_host_through_the_audited_path() {
+        use crate::fleet::{
+            FleetCommandResult, FleetReviewDispose, FleetReviewOutcome, HostAccessMode,
+            FLEET_DECISION_QUEUE_CAPABILITY, FLEET_REVIEW_DISPOSE_CAPABILITY,
+        };
+        let item = |id: &str| -> Box<crate::review::ReviewItem> {
+            Box::new(
+                serde_json::from_value(json!({
+                    "id": id, "target": {"kind": "session", "provider": "claude", "session_id": "s"},
+                    "generation": 1, "summary": "done", "requested_at": "2026-11-14T00:00:00Z",
+                    "requested_by": {"kind": "agent", "label": "impl"},
+                }))
+                .unwrap(),
+            )
+        };
+        let store = Arc::new(crate::fleet::FleetStore::new());
+        let mut here = fleet_host("here", "dev");
+        here.local = true;
+        let both = vec![
+            FLEET_DECISION_QUEUE_CAPABILITY.to_owned(),
+            FLEET_REVIEW_DISPOSE_CAPABILITY.to_owned(),
+        ];
+        let mut ctl = fleet_host("ctl", "dev");
+        ctl.mode = HostAccessMode::Control;
+        ctl.capabilities.clone_from(&both);
+        // Control mode, but a relay that cannot apply a decision exactly.
+        let mut old = fleet_host("old", "dev");
+        old.mode = HostAccessMode::Control;
+        old.capabilities = vec![FLEET_DECISION_QUEUE_CAPABILITY.to_owned()];
+        // A current relay on an observe-only host.
+        let mut obs = fleet_host("obs", "dev");
+        obs.capabilities = both;
+        for host in [here, ctl, old, obs] {
+            store.upsert_host(host).await;
+        }
+        let (runtime, mut commands) = FleetRuntime::new(store);
+        let sent = Arc::new(std::sync::Mutex::new(
+            Vec::<(String, FleetReviewDispose)>::new(),
+        ));
+        let seen = sent.clone();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let result = match command.operation {
+                    FleetOperation::DecisionQueue { limit } => {
+                        Ok(FleetCommandResult::decision_queue(
+                            crate::decision_queue::assemble_queue(&[], &[], Vec::new(), limit),
+                        ))
+                    }
+                    FleetOperation::ReviewDispose { dispose } => {
+                        seen.lock()
+                            .unwrap()
+                            .push((command.host.clone(), dispose.clone()));
+                        Ok(FleetCommandResult::review_dispose(
+                            match dispose.id.as_str() {
+                                "rv_ok" => FleetReviewOutcome::Recorded {
+                                    item: item("rv_ok"),
+                                    replay: false,
+                                },
+                                "rv_again" => FleetReviewOutcome::Recorded {
+                                    item: item("rv_again"),
+                                    replay: true,
+                                },
+                                // A host answering about another item.
+                                "rv_swap" => FleetReviewOutcome::Recorded {
+                                    item: item("rv_other"),
+                                    replay: false,
+                                },
+                                "rv_done" => FleetReviewOutcome::Conflict {
+                                    message: "review rv_done is already returned".into(),
+                                },
+                                "rv_bad" => FleetReviewOutcome::Invalid {
+                                    message: "that option is not one this item offers".into(),
+                                },
+                                _ => FleetReviewOutcome::NotFound {
+                                    message: format!("no review item {}", dispose.id),
+                                },
+                            },
+                        ))
+                    }
+                    other => Err(format!("unexpected {other:?}")),
+                };
+                let _ = command.reply.send(result);
+            }
+        });
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_path = audit_dir.path().join("decisions.jsonl");
+        let app = router(
+            state_with_token("s3cret")
+                .with_fleet(Some(runtime))
+                .with_decision_audit(Some(audit_path.clone())),
+        );
+        let call = |uri: String, body: Value| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-tend-operator", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                app.oneshot(request).await.unwrap()
+            }
+        };
+        let decide = |host: &str, id: &str, extra: Value| {
+            let mut body = json!({ "disposition": "accepted", "host": host });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            call(format!("/api/decisions/reviews/{id}"), body)
+        };
+
+        // Which sections can be decided here.
+        let queue = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/decisions")
+                        .header(header::AUTHORIZATION, "Bearer s3cret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let flag = |alias: &str| {
+            queue["hosts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["alias"] == alias)
+                .unwrap()["decides_reviews"]
+                .clone()
+        };
+        assert_eq!(flag("here"), true);
+        assert_eq!(flag("ctl"), true);
+        assert_eq!(flag("old"), false);
+        assert_eq!(flag("obs"), false);
+
+        // Refused before anything is sent.
+        assert_eq!(
+            decide("obs", "rv_ok", json!({})).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            decide("old", "rv_ok", json!({})).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            decide("nowhere", "rv_ok", json!({})).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(sent.lock().unwrap().is_empty());
+
+        // Decided on its host, as the authenticated operator, with the
+        // person's own option and note for that host to check and compose.
+        let response = decide(
+            "ctl",
+            "rv_ok",
+            json!({ "option": "ship", "note": " looks fine " }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["review"]["id"], "rv_ok");
+        assert_eq!(body["host"], "ctl");
+        assert_eq!(
+            sent.lock().unwrap()[0],
+            (
+                "ctl".to_owned(),
+                FleetReviewDispose {
+                    id: "rv_ok".into(),
+                    disposition: crate::review::DispositionKind::Accepted,
+                    by: "web:token".into(),
+                    option: Some("ship".into()),
+                    note: Some(" looks fine ".into()),
+                }
+            )
+        );
+        assert_eq!(
+            decide("ctl", "rv_again", json!({})).await.status(),
+            StatusCode::OK
+        );
+        // An answer about another item is not taken as this decision.
+        assert_eq!(
+            decide("ctl", "rv_swap", json!({})).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            decide("ctl", "rv_done", json!({})).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            decide("ctl", "rv_bad", json!({ "option": "x" }))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            decide("ctl", "rv_gone", json!({})).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Every attempt is audited with its host and how it ended.
+        let lines: Vec<Value> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let outcomes: Vec<(String, String, u64)> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["host"].as_str().unwrap_or_default().to_owned(),
+                    line["outcome"].as_str().unwrap().to_owned(),
+                    line["status"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 9, "{outcomes:?}");
+        assert_eq!(outcomes[3], ("ctl".into(), "recorded".into(), 200));
+        assert_eq!(outcomes[4], ("ctl".into(), "already recorded".into(), 200));
+        assert_eq!(outcomes[5].2, 502);
+        assert!(lines
+            .iter()
+            .all(|line| line["by"] == "web:token" && line["action"] == "review"));
+
+        // The raw Fleet command route cannot send one: it would name
+        // whoever it liked as the person and skip the audit.
+        let raw = call(
+            "/api/fleet/ctl/command".into(),
+            json!({ "operation": { "kind": "review_dispose", "dispose": {
+                "id": "rv_ok", "disposition": "accepted", "by": "web:someone-else" } } }),
+        )
+        .await;
+        assert_eq!(raw.status(), StatusCode::FORBIDDEN);
+        assert_eq!(sent.lock().unwrap().len(), 6);
     }
 
     #[tokio::test]

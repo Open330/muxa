@@ -98,6 +98,9 @@ pub const FLEET_SERVER_INVENTORY_CAPABILITY: &str = "server_inventory_v1";
 /// Relay capability: the relay answers [`RelayRequest::DecisionQueue`] with
 /// its host's whole decision queue, read as the operator console.
 pub const FLEET_DECISION_QUEUE_CAPABILITY: &str = "fleet_decision_queue_v1";
+/// Relay capability: the relay applies [`RelayRequest::ReviewDispose`] to
+/// one of its host's review items, exactly or not at all.
+pub const FLEET_REVIEW_DISPOSE_CAPABILITY: &str = "fleet_review_dispose_v1";
 /// The relay (and, in a daemon's own hello, the controller) carries
 /// `SendPrompt.force` end to end and enforces it through the destination
 /// daemon's guarded `send_prompt`. Distinct from the local
@@ -127,6 +130,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     FLEET_WORKTREE_CHANGE_CAPABILITY,
     FLEET_SERVER_INVENTORY_CAPABILITY,
     FLEET_DECISION_QUEUE_CAPABILITY,
+    FLEET_REVIEW_DISPOSE_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -593,6 +597,11 @@ pub enum RelayRequest {
         request_id: String,
         limit: usize,
     },
+    /// Decide one of the relay host's review items as the operator.
+    ReviewDispose {
+        request_id: String,
+        dispose: FleetReviewDispose,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -671,6 +680,7 @@ impl RelayRequest {
             | Self::WorktreeChange { request_id, .. }
             | Self::ServerInventory { request_id }
             | Self::DecisionQueue { request_id, .. }
+            | Self::ReviewDispose { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -820,6 +830,12 @@ pub enum FleetOperation {
     DecisionQueue {
         limit: usize,
     },
+    /// `fleet_review_dispose_v1`: accept, return or withdraw one of the
+    /// host's review items as the operator. A control action; the outcome
+    /// is in `review_dispose`.
+    ReviewDispose {
+        dispose: FleetReviewDispose,
+    },
     CollaborationSend {
         pane: PaneKey,
         request: Box<NewRequest>,
@@ -862,7 +878,59 @@ pub enum FleetOperation {
     },
 }
 
+/// One review decision sent to the host that holds the item. The relay
+/// checks the option against the item there, records
+/// [`crate::review::decision_note`] as the note and `by` as the operator
+/// actor's label, and reports exactly what the host's store holds after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetReviewDispose {
+    pub id: String,
+    pub disposition: crate::review::DispositionKind,
+    /// Who decided, as the controller authenticated them (`web:<email>`).
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// How a [`FleetOperation::ReviewDispose`] ended on the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum FleetReviewOutcome {
+    /// The item now holds this decision; `replay` when it already did.
+    Recorded {
+        item: Box<crate::review::ReviewItem>,
+        replay: bool,
+    },
+    /// The host holds no item with that id.
+    NotFound { message: String },
+    /// The item was already decided another way.
+    Conflict { message: String },
+    /// Refused as asked: an option the item does not offer, a note too long.
+    Invalid { message: String },
+}
+
 impl FleetOperation {
+    /// Whether the operation acts on the host rather than reading it: only
+    /// a control-mode host takes it.
+    #[must_use]
+    pub fn is_control(&self) -> bool {
+        matches!(
+            self,
+            Self::SendPrompt { .. }
+                | Self::SendKeys { .. }
+                | Self::WorktreeChange { .. }
+                | Self::ReviewDispose { .. }
+                | Self::CollaborationSend { .. }
+                | Self::CollaborationGet { .. }
+                | Self::CollaborationClaim { .. }
+                | Self::CollaborationReply { .. }
+                | Self::CollaborationUpdate { .. }
+        )
+    }
+
     pub fn requires_task_contract(&self) -> bool {
         match self {
             Self::CollaborationSend { request, .. } => {
@@ -925,6 +993,9 @@ pub struct FleetCommandResult {
     /// The host's decision queue, for `decision_queue`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_queue: Option<Box<crate::decision_queue::PendingQueue>>,
+    /// How a `review_dispose` ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_dispose: Option<FleetReviewOutcome>,
 }
 
 impl FleetCommandResult {
@@ -932,6 +1003,7 @@ impl FleetCommandResult {
     pub fn accepted(message: impl Into<String>) -> Self {
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: Some(message.into()),
             capture: None,
@@ -973,6 +1045,14 @@ impl FleetCommandResult {
     }
 
     #[must_use]
+    pub fn review_dispose(outcome: FleetReviewOutcome) -> Self {
+        Self {
+            review_dispose: Some(outcome),
+            ..Self::accepted("review dispose")
+        }
+    }
+
+    #[must_use]
     pub fn servers(inventory: crate::listener_inventory::ListenerInventory) -> Self {
         Self {
             servers: Some(inventory),
@@ -993,6 +1073,7 @@ impl FleetCommandResult {
     pub fn capture(capture: Option<String>) -> Self {
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture,
@@ -1021,6 +1102,7 @@ impl FleetCommandResult {
         let capture = raw_capture.map(sanitize_capture_text);
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture,
@@ -1047,6 +1129,7 @@ impl FleetCommandResult {
     pub fn sent(outcome: SendPromptOutcome) -> Self {
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1073,6 +1156,7 @@ impl FleetCommandResult {
     pub fn window_capture(capture: FleetWindowCapture) -> Self {
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1099,6 +1183,7 @@ impl FleetCommandResult {
     pub fn collaboration_request(request: CollaborationRequest) -> Self {
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1145,6 +1230,7 @@ impl FleetCommandResult {
         sent.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture: None,
@@ -1172,6 +1258,7 @@ impl FleetCommandResult {
     pub fn command(output: WorkCommandOutput) -> Self {
         Self {
             decision_queue: None,
+            review_dispose: None,
             accepted: true,
             message: None,
             capture: None,

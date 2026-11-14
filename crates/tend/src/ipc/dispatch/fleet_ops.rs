@@ -37,6 +37,13 @@ pub(super) async fn handle(
                 FleetOperation::CollaborationSend { request, .. } => {
                     request.validate_fleet_contract().err()
                 }
+                // A person's decision on a result, taken only through the
+                // dashboard's operator-authenticated, audited path: over
+                // this socket an agent could accept its own work elsewhere.
+                FleetOperation::ReviewDispose { .. } => Some(
+                    "review decisions over Fleet are taken from the dashboard's Needs you page"
+                        .into(),
+                ),
                 _ => None,
             };
             if let Some(error) = invalid {

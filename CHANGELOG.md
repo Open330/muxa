@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Results on other Fleet hosts can be accepted, sent back or withdrawn from
+  the controller's "Needs you" page. The decision goes to the host that holds
+  the item (a new Fleet operation, `fleet_review_dispose_v1`, control-mode
+  hosts only). That host checks the option against its own copy, records the
+  operator as the decider, and reports what it then holds. A repeat is a
+  no-op and a different decision is a 409, as for local items, and every
+  attempt is in the decision audit with its host. Only the audited web route
+  can send this operation.
+
 ### Removed
 
 - The swap's answer to Codex's "Working directory · resume" menu. A swap

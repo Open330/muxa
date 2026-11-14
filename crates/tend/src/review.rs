@@ -191,7 +191,8 @@ pub enum DispositionKind {
 }
 
 impl DispositionKind {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Returned => "returned",
@@ -245,6 +246,37 @@ impl ReviewItem {
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.disposition.is_none()
+    }
+
+    /// Whether `option` is one of the options the claimer offered.
+    #[must_use]
+    pub fn offers(&self, option: &str) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.options.iter().any(|offered| offered == option))
+    }
+
+    /// Whether this item is already decided exactly this way: the same
+    /// disposition and note. Dispositions are final, so an item that
+    /// matches stays matching.
+    #[must_use]
+    pub fn decided_as(&self, kind: DispositionKind, note: Option<&str>) -> bool {
+        self.disposition
+            .as_ref()
+            .is_some_and(|existing| existing.kind == kind && existing.note.as_deref() == note)
+    }
+}
+
+/// The note a person's decision records: the chosen option first
+/// (`chose: X`), then their own words. Shared by the dashboard and the
+/// Fleet relay, so a decision taken on either host is recorded the same way.
+#[must_use]
+pub fn decision_note(option: Option<&str>, note: Option<&str>) -> Option<String> {
+    match (option, note.map(str::trim)) {
+        (Some(option), Some(note)) if !note.is_empty() => Some(format!("chose: {option}\n{note}")),
+        (Some(option), _) => Some(format!("chose: {option}")),
+        (None, Some(note)) if !note.is_empty() => Some(note.to_owned()),
+        (None, _) => None,
     }
 }
 

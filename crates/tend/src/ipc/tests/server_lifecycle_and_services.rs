@@ -2846,3 +2846,89 @@ async fn a_result_on_a_work_with_checks_is_filed_only_once_tend_has_run_them() {
     tx.send(()).unwrap();
     handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_fleet_review_decision_is_applied_exactly_or_reported_as_it_stands() {
+    use crate::fleet::{FleetReviewDispose, FleetReviewOutcome as Outcome};
+    use crate::review::{ActorKind, DispositionKind, NewReview, ReviewActor, ReviewTarget};
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("tend-fleet-review.sock");
+    let reviews = crate::review::ReviewStore::open(&dir.path().join("reviews.sqlite3")).unwrap();
+    let server = Server::new(sock.clone(), Store::shared()).with_reviews(reviews);
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+    let new = |key: &str| NewReview {
+        target: ReviewTarget::Session {
+            provider: Some("claude".into()),
+            session_id: format!("s-{key}"),
+        },
+        summary: "check it".into(),
+        anchor: None,
+        idempotency_key: Some(key.into()),
+        requested_by: ReviewActor {
+            kind: ActorKind::Agent,
+            label: Some("impl".into()),
+        },
+        decision: Some(crate::decision::Decision {
+            options: vec!["ship".into(), "hold".into()],
+            ..crate::decision::Decision::default()
+        }),
+    };
+    let item = client.review_create(&new("one")).await.unwrap();
+    let dispose = |disposition, option: Option<&str>, note: Option<&str>| FleetReviewDispose {
+        id: item.id.clone(),
+        disposition,
+        by: "web:op@example.com".into(),
+        option: option.map(str::to_owned),
+        note: note.map(str::to_owned),
+    };
+
+    // An option the item does not offer changes nothing.
+    let refused = client
+        .review_dispose_exactly(&dispose(DispositionKind::Accepted, Some("rewrite"), None))
+        .await
+        .unwrap();
+    assert!(matches!(refused, Outcome::Invalid { .. }), "{refused:?}");
+    assert!(client.review_get(&item.id).await.unwrap().is_open());
+
+    // Recorded as the operator, with the option and note composed here.
+    let accept = dispose(DispositionKind::Accepted, Some("ship"), Some(" fine "));
+    let Outcome::Recorded {
+        item: decided,
+        replay,
+    } = client.review_dispose_exactly(&accept).await.unwrap()
+    else {
+        panic!("not recorded");
+    };
+    assert!(!replay);
+    let disposition = decided.disposition.unwrap();
+    assert_eq!(disposition.note.as_deref(), Some("chose: ship\nfine"));
+    assert_eq!(disposition.by.kind, ActorKind::User);
+    assert_eq!(disposition.by.label.as_deref(), Some("web:op@example.com"));
+
+    // The same decision again is a replay; any other is a conflict, the
+    // same kind with another note included.
+    assert!(matches!(
+        client.review_dispose_exactly(&accept).await.unwrap(),
+        Outcome::Recorded { replay: true, .. }
+    ));
+    for other in [
+        dispose(DispositionKind::Accepted, Some("hold"), None),
+        dispose(DispositionKind::Returned, None, Some("redo")),
+    ] {
+        let outcome = client.review_dispose_exactly(&other).await.unwrap();
+        assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+    }
+    let missing = FleetReviewDispose {
+        id: "rv_nope".into(),
+        ..accept
+    };
+    assert!(matches!(
+        client.review_dispose_exactly(&missing).await.unwrap(),
+        Outcome::NotFound { .. }
+    ));
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}

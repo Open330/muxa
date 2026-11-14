@@ -150,7 +150,8 @@ export function decidedCard(item, now = Date.now()) {
 
 /// The per-host queue as sections of cards. Each card knows its host;
 /// cards from another host carry `remote` (no local pane link) and can be
-/// acted on only where the host allows it (`control`). An older response
+/// acted on only where the host allows it (`control`; for review items also
+/// `decides_reviews`). An older response
 /// with a single top-level `queue` reads as one local section.
 export function hostSections(data, now = Date.now()) {
   const hosts = Array.isArray(data?.hosts)
@@ -165,13 +166,21 @@ export function hostSections(data, now = Date.now()) {
         ...card,
         host: host.alias,
         remote,
-        actionable: !remote || (host.control && card.kind === "ask"),
+        // A remote review item only where that host applies decisions
+        // exactly over Fleet (`decides_reviews`).
+        actionable:
+          !remote ||
+          (host.control && card.kind === "ask") ||
+          (host.control && host.decides_reviews === true && card.kind === "review"),
         pane: remote ? null : card.pane,
       }));
     const notes = [];
     if (host.queue?.truncated) notes.push("more than shown");
     for (const source of host.unavailable || []) notes.push(`unavailable: ${source}`);
     if (remote && !host.control) notes.push("observe-only: answer on that host");
+    else if (remote && host.decides_reviews !== true && cards.some((card) => card.kind === "review")) {
+      notes.push("results: decide on that host (its tend cannot take decisions over Fleet)");
+    }
     return {
       alias: host.alias,
       local: !remote,
