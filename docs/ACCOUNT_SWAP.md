@@ -647,5 +647,5 @@ like every guarded delivery, so its hook comes back as tend's receipt.
   account that never ran it. If the pane's shell is no longer in the thread's
   directory, Codex would ask which directory to use; a swap relaunch sets
   `tui.resume_cwd="session"`, so it resumes in the session's directory
-  without asking (an older relaunch line still gets the question, answered
-  the same way).
+  without asking. A relaunch line without it (one from before v0.10.17)
+  gets the question, and the swap stops there without typing.
