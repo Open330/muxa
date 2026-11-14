@@ -116,27 +116,52 @@ pub(super) enum AgentScreen {
     Blocked(&'static str),
     /// None of these before the deadline.
     Unseen,
+    /// A dialog that held, which [`agent_tui::startup_blocker`] dismisses
+    /// safely (Esc on Codex's update menu, which installs nothing): type
+    /// these keys, once, and keep watching.
+    Answer {
+        label: &'static str,
+        keys: Vec<&'static str>,
+    },
 }
 
 /// The decision behind [`wait_for_agent`], fed one capture at a time.
 #[derive(Debug, Default)]
 pub(super) struct AgentWatch {
-    dialog_since: Option<(Duration, String)>,
+    dialog_since: Option<Duration>,
+    /// Dialogs already dismissed here; each gets its keys once.
+    answered: Vec<&'static str>,
 }
 
 impl AgentWatch {
+    /// What the pane shows now. A dialog must hold for [`DIALOG_HOLD`]
+    /// first. [`agent_tui::startup_blocker`] decides it: one it gives keys
+    /// for is answered once, and is waited on if it is still there after
+    /// that; any other is waited on and never typed into.
     pub fn observe(&mut self, elapsed: Duration, screen: &str) -> Option<AgentScreen> {
         if let Some(reason) = agent_tui::blocked_screen(screen) {
             return Some(AgentScreen::Blocked(reason));
         }
-        if let Some(question) = startup_dialog(screen) {
-            let (since, _) = self
-                .dialog_since
-                .get_or_insert_with(|| (elapsed, question.clone()));
-            if elapsed.saturating_sub(*since) >= DIALOG_HOLD {
-                return Some(AgentScreen::Dialog(question));
+        if let Some(blocker) = agent_tui::startup_blocker(screen) {
+            let since = *self.dialog_since.get_or_insert(elapsed);
+            if elapsed.saturating_sub(since) < DIALOG_HOLD {
+                return None;
             }
-            return None;
+            match blocker.keys {
+                Some(keys) if !self.answered.contains(&blocker.label) => {
+                    self.answered.push(blocker.label);
+                    // The next sighting must hold again before it counts.
+                    self.dialog_since = None;
+                    return Some(AgentScreen::Answer {
+                        label: blocker.label,
+                        keys,
+                    });
+                }
+                _ => {
+                    let name = startup_dialog(screen).unwrap_or_else(|| blocker.label.to_owned());
+                    return Some(AgentScreen::Dialog(name));
+                }
+            }
         }
         self.dialog_since = None;
         agent_tui::agent_prompt_visible(screen).then_some(AgentScreen::Ready)
@@ -455,10 +480,12 @@ fn watch_pane(
     let up = if claude {
         pass_trust_prompt(endpoint, &target, &pane.path, report)
     } else if is_agent(pane, command) {
-        match wait_for_agent(endpoint, &target) {
+        match wait_for_agent(endpoint, &target, report) {
             AgentScreen::Ready | AgentScreen::Unseen => Ok(()),
             AgentScreen::Dialog(question) => Err(Ending::Waiting(waiting_note(&question))),
             AgentScreen::Blocked(reason) => Err(Ending::Failed(reason.to_owned())),
+            // `wait_for_agent` answers these itself and watches on.
+            AgentScreen::Answer { label, .. } => Err(Ending::Waiting(waiting_note(label))),
         }
     } else {
         Ok(())
@@ -567,13 +594,29 @@ fn pass_trust_prompt(
 
 /// Watch a relaunched agent's screen until it shows its prompt, a startup
 /// dialog or a startup error.
-fn wait_for_agent(endpoint: &BackendEndpoint, target: &str) -> AgentScreen {
+fn wait_for_agent(
+    endpoint: &BackendEndpoint,
+    target: &str,
+    report: &Mutex<RestoreReport>,
+) -> AgentScreen {
     let started = Instant::now();
     let mut watch = AgentWatch::default();
     while started.elapsed() < AGENT_READY_TIMEOUT && !crate::subprocess::abandoned() {
         if let Ok(screen) = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target]) {
-            if let Some(seen) = watch.observe(started.elapsed(), &screen) {
-                return seen;
+            match watch.observe(started.elapsed(), &screen) {
+                Some(AgentScreen::Answer { label, keys }) => {
+                    let typed = agent_tui::type_keys(
+                        &agent_tui::RealClock,
+                        |key| mux_control::run(endpoint, &["send-keys", "-t", target, key]).is_ok(),
+                        &keys,
+                    );
+                    if !typed {
+                        return AgentScreen::Dialog(label.to_owned());
+                    }
+                    say(report, &format!("  {target}: {label}"));
+                }
+                Some(seen) => return seen,
+                None => {}
             }
         }
         std::thread::sleep(POLL);
@@ -713,17 +756,17 @@ mod tests {
     }
 
     #[test]
-    fn a_dialog_that_holds_is_waited_on_and_one_that_passes_is_not() {
+    fn a_dialog_that_holds_is_acted_on_and_one_that_passes_is_not() {
         // Codex's update prompt as 0.164.0 drew it.
         let dialog = "  Update available · 0.164.0 → 0.166.0\n› 1. Update now (runs `npm i`)\n  \
             2. Skip\n  3. Skip until next version\n  enter continue · esc skip\n";
         let mut watch = AgentWatch::default();
         assert_eq!(watch.observe(ms(0), dialog), None);
         assert_eq!(watch.observe(ms(500), dialog), None);
-        assert_eq!(
+        assert!(matches!(
             watch.observe(ms(1600), dialog),
-            Some(AgentScreen::Dialog("Update available".to_owned()))
-        );
+            Some(AgentScreen::Answer { .. })
+        ));
         // A dialog drawn for a moment during startup, then the prompt.
         let mut watch = AgentWatch::default();
         assert_eq!(watch.observe(ms(0), dialog), None);
@@ -797,6 +840,56 @@ mod tests {
             may_submit(Ok(CODEX_UPDATE.into())),
             Err(Ending::Waiting(waiting_note("Update available")))
         );
+    }
+
+    /// Codex 0.154.0's update menu as captured on a scratch tmux server
+    /// (`agent_tui::startup_blocker`'s fixture, #549).
+    const REAL_UPDATE_0_154: &str = "  ✨ Update available! 0.154.0 -> 0.169.0\n  \
+        Release notes: https://github.com/openai/codex/releases/latest\n\
+        › 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  \
+        3. Skip until next version\n  Press enter to continue\n";
+
+    #[test]
+    fn the_update_menu_gets_esc_once_and_is_waited_on_if_it_stays() {
+        let mut watch = AgentWatch::default();
+        assert_eq!(watch.observe(ms(0), REAL_UPDATE_0_154), None);
+        assert_eq!(
+            watch.observe(ms(1600), REAL_UPDATE_0_154),
+            Some(AgentScreen::Answer {
+                label: "skipped the Codex update prompt",
+                keys: vec![agent_tui::ESC],
+            })
+        );
+        // Esc took it away: the prompt follows.
+        assert_eq!(
+            watch.observe(ms(2000), "› Ask Codex to do anything\n  ? for shortcuts"),
+            Some(AgentScreen::Ready)
+        );
+        // Still there after its one Esc: waited on, never typed into again.
+        let mut watch = AgentWatch::default();
+        watch.observe(ms(0), REAL_UPDATE_0_154);
+        assert!(matches!(
+            watch.observe(ms(1600), REAL_UPDATE_0_154),
+            Some(AgentScreen::Answer { .. })
+        ));
+        assert_eq!(watch.observe(ms(1800), REAL_UPDATE_0_154), None);
+        assert!(matches!(
+            watch.observe(ms(3400), REAL_UPDATE_0_154),
+            Some(AgentScreen::Dialog(_))
+        ));
+    }
+
+    #[test]
+    fn a_dialog_tend_must_not_answer_is_only_waited_on() {
+        // The same release's folder trust: no entry, so no keys.
+        let trust = "> You are in /tmp/w\n  Do you trust the contents of this directory?\n\
+            › 1. Yes, continue\n  2. No, quit\n  Press enter to continue\n";
+        let mut watch = AgentWatch::default();
+        assert_eq!(watch.observe(ms(0), trust), None);
+        assert!(matches!(
+            watch.observe(ms(1600), trust),
+            Some(AgentScreen::Dialog(_))
+        ));
     }
 
     #[test]

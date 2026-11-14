@@ -85,7 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or stuck pane no longer holds up the rest, and tend's marks are read and
   written in a few batched tmux calls per window instead of one per option
   (12.3s down to 0.6s on that snapshot). An agent stopped on a startup
-  dialog is reported as waiting on it instead of passing for restored.
+  dialog is reported as waiting on it instead of passing for restored;
+  Codex's update menu, which `agent_tui::startup_blocker` dismisses safely,
+  gets one Esc (skip, nothing installed) and the restore carries on.
 
 - `tend work done --summary` files its result record and completes the
   alias as one tendd operation (`work_done_record_v1`), and runs the Work's
