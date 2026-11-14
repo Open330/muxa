@@ -1120,6 +1120,14 @@ enum HookCmd {
         #[arg(long)]
         event: String,
     },
+    /// GitHub Copilot CLI hook handler. Reads hook JSON on stdin.
+    ///
+    /// Writes nothing to stdout and always exits 0: Copilot reads a
+    /// `preToolUse` / `permissionRequest` hook's stdout as a decision.
+    Copilot {
+        #[arg(long)]
+        event: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

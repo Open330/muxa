@@ -110,6 +110,7 @@ pub fn render_detection(mode: Mode, d: &Detection) {
         "Antigravity CLI (agy)",
         d.antigravity_home.as_ref(),
     ));
+    lines.push(check_path("Copilot CLI", d.copilot_home.as_ref()));
     lines.push(format!(
         "{} systemctl --user",
         if d.systemd_user_available {

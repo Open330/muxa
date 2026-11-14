@@ -368,7 +368,7 @@ fn manages_daemon(components: &[Component]) -> bool {
         .any(|c| matches!(c, Component::TenddSystemd | Component::TenddLaunchd))
 }
 
-/// Drop agent-hook components (Claude/Codex/agy/opencode) whose
+/// Drop agent-hook components (Claude/Codex/agy/opencode/Copilot) whose
 /// config file/dir is absent, per `Detection::agent_config_present`.
 /// Non-agent components pass through untouched. Used only on the
 /// preset path — `--component` opt-ins bypass this so an explicit
@@ -412,6 +412,7 @@ mod tests {
                 | Component::CodexHooks
                 | Component::AntigravityHooks
                 | Component::OpencodeHooks
+                | Component::CopilotHooks
         )
     }
 

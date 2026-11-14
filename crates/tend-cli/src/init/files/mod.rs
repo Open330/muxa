@@ -10,6 +10,7 @@ pub mod ask;
 pub mod claude;
 pub mod codex;
 pub mod collaboration;
+pub mod copilot;
 pub mod dashboard;
 pub mod gemini;
 pub mod launchd;

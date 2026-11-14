@@ -131,6 +131,7 @@ pub fn build(
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
             Component::AntigravityHooks => plan_antigravity(direction, *c, &mut actions)?,
             Component::OpencodeHooks => plan_opencode(direction, *c, &mut actions)?,
+            Component::CopilotHooks => plan_copilot(direction, *c, &mut actions)?,
             Component::TenddSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
             Component::TenddLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
             Component::TenddShellrc => plan_shellrc(direction, *c, &mut actions)?,
@@ -541,6 +542,7 @@ fn plan_retired_gemini(comps: &[Component], actions: &mut Vec<Action>) -> Result
                 | Component::CodexHooks
                 | Component::AntigravityHooks
                 | Component::OpencodeHooks
+                | Component::CopilotHooks
                 | Component::RetiredGeminiHooks
         )
     });
@@ -584,6 +586,22 @@ fn plan_antigravity(direction: Direction, c: Component, actions: &mut Vec<Action
         Direction::Uninstall => {
             files::antigravity::remove(&original).context("scrubbing agy hooks.json")?
         }
+    };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+/// tend owns `$COPILOT_HOME/hooks/tend.json` outright: install writes it,
+/// uninstall deletes it.
+fn plan_copilot(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::copilot::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => files::copilot::upsert(&original),
+        Direction::Uninstall => files::copilot::remove(&original),
     };
     push_edit_or_delete(direction, c, path, before, after, outcome, actions);
     Ok(())

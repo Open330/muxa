@@ -9,7 +9,7 @@ This page keeps the detailed install and wiring notes out of the README.
 - Linux or macOS; Windows natively through rmux (see [WINDOWS.md](WINDOWS.md))
   or inside WSL2
 - One supported agent CLI: Claude Code, OpenAI Codex, the Google Antigravity
-  CLI (`agy`), or opencode
+  CLI (`agy`), opencode, or GitHub Copilot CLI
 
 ## Try Before Installing
 
@@ -230,6 +230,7 @@ hook commands without overwriting existing user hooks.
 | OpenAI Codex | Prefer `tend init` for compatible hooks. The daemon also reads local session-rollout logs every two seconds; hook support alone is not required for lifecycle recovery. |
 | Google Antigravity CLI | Add the `tend` block from `crates/tend/src/adapters/antigravity.rs` to `~/.gemini/config/hooks.json`. Note this is agy's own `hooks.json`, **not** `~/.gemini/settings.json`. |
 | opencode | Use `tend init --component opencode-hooks`; the plugin body lives in `crates/tend-cli/src/init/files/opencode.rs`. See [OPENCODE.md](OPENCODE.md). |
+| GitHub Copilot CLI | Use `tend init --component copilot-hooks`, which writes `~/.copilot/hooks/tend.json`. See [COPILOT.md](COPILOT.md). |
 
 ## Verify
 
