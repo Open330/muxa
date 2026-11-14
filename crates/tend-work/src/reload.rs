@@ -492,6 +492,9 @@ async fn auto_snapshot(client: &Client, keep: usize) -> Result<SaveOutcome> {
     // least one is what keeps it: `keep_auto = 0` would otherwise delete it
     // and report an id that no longer exists.
     for entry in store::prunable(&store::entries(&root), keep.max(1)) {
+        if crate::subprocess::abandoned() {
+            break;
+        }
         if std::fs::remove_dir_all(&entry.dir).is_ok() {
             pruned.push(entry.id.clone());
         }
@@ -1240,17 +1243,24 @@ fn apply(
     follow_up: Option<&str>,
     report: &mut RestoreReport,
 ) -> Result<()> {
+    // A call that ran out of time or was dropped (tendd's scope) stops at
+    // the next phase and fails, as the child it replaces was killed; the
+    // report so far is still printed.
     let fresh = rebuild_shape(endpoint, snapshot, report)?;
+    crate::subprocess::ensure_time_left()?;
     // Before any agent relaunches, so its first hook already finds the pane
     // it lands in marked with its role and Work.
     restore_marks(endpoint, snapshot, &fresh, Some(daemon), report);
+    crate::subprocess::ensure_time_left()?;
     if layout_only {
         return Ok(());
     }
     let relaunched = replay_commands(endpoint, snapshot, report);
+    crate::subprocess::ensure_time_left()?;
     if let Some(text) = follow_up {
         continue_interrupted(endpoint, snapshot, &relaunched, text, report);
     }
+    crate::subprocess::ensure_time_left()?;
     Ok(())
 }
 
@@ -1595,7 +1605,7 @@ fn screen_settled(endpoint: &BackendEndpoint, target: &str, claude: bool) -> boo
     let started = Instant::now();
     let mut last = String::new();
     let mut quiet_since = Instant::now();
-    while started.elapsed() < CONTINUE_READY_TIMEOUT {
+    while started.elapsed() < CONTINUE_READY_TIMEOUT && !crate::subprocess::abandoned() {
         let screen = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
             .unwrap_or_default();
         if launch::may_be_trust_prompt(&screen) {
@@ -1985,10 +1995,10 @@ fn answer_trust_prompts(
     let mut watch = launch::TrustWatch::new(targets);
     let mut answered = BTreeSet::new();
     let started = Instant::now();
-    'poll: while !watch.is_settled() {
+    'poll: while !watch.is_settled() && !crate::subprocess::abandoned() {
         let pending: Vec<String> = watch.pending().cloned().collect();
         for target in pending {
-            if started.elapsed() >= launch::TRUST_TIMEOUT {
+            if started.elapsed() >= launch::TRUST_TIMEOUT || crate::subprocess::abandoned() {
                 break 'poll;
             }
             let Ok(screen) = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", &target])
@@ -2268,6 +2278,10 @@ fn wait_for_shell(endpoint: &BackendEndpoint, target: &str) -> bool {
     let mut watch = launch::ShellWatch::default();
     let tty = pane_tty(endpoint, target);
     while started.elapsed() < SHELL_READY_TIMEOUT {
+        if crate::subprocess::abandoned() {
+            // Nothing is typed into a pane of an abandoned restore.
+            return false;
+        }
         let command = foreground(endpoint, target);
         let shell = command.as_deref().is_some_and(|c| is_shell(c.trim()));
         let prompt_drawn = shell && prompt_drawn(endpoint, target);
@@ -2365,7 +2379,10 @@ fn terminal_line_editing(tty: &str) -> Option<bool> {
 fn confirm_launches(endpoint: &BackendEndpoint, targets: Vec<String>) -> BTreeSet<String> {
     let started = Instant::now();
     let mut watch = launch::LaunchWatch::new(targets);
-    while !watch.is_settled() && started.elapsed() < launch::CONFIRM_TIMEOUT {
+    while !watch.is_settled()
+        && started.elapsed() < launch::CONFIRM_TIMEOUT
+        && !crate::subprocess::abandoned()
+    {
         let pending: Vec<String> = watch.pending().cloned().collect();
         for target in pending {
             let command = foreground(endpoint, &target);
@@ -2612,6 +2629,8 @@ fn newest_snapshot() -> Result<PathBuf> {
 }
 
 fn write_snapshot(snapshot: &Snapshot, dir: &Path) -> Result<PathBuf> {
+    // Storage effects stop with an abandoned call, as the child did.
+    crate::subprocess::ensure_time_left()?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("snapshot.json");
     std::fs::write(&path, serde_json::to_vec_pretty(snapshot)?)
@@ -2728,6 +2747,63 @@ fn is_daemon_autostart(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    fn cancelled_scope() -> crate::subprocess::Scope {
+        crate::subprocess::Scope {
+            socket: "/run/tendd.sock".into(),
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+        }
+    }
+
+    #[test]
+    fn an_abandoned_restore_stops_waiting_on_panes_at_once() {
+        let endpoint = endpoint_for("tmux", "/nonexistent/tend-test/default".into()).unwrap();
+        let started = Instant::now();
+        let (settled, shell) = crate::subprocess::with_scope(cancelled_scope(), || {
+            (
+                screen_settled(&endpoint, "work:0.0", false),
+                wait_for_shell(&endpoint, "work:0.0"),
+            )
+        });
+        assert!(
+            !settled && !shell,
+            "nothing may be typed into an abandoned restore"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        let confirmed = crate::subprocess::with_scope(cancelled_scope(), || {
+            confirm_launches(&endpoint, vec!["work:0.0".into()])
+        });
+        assert_eq!(confirmed, BTreeSet::from(["work:0.0".to_string()]));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_abandoned_call_writes_and_deletes_no_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("1000");
+        write_snapshot(&snapshot_of(Vec::new()), &kept).unwrap();
+        let fresh = root.path().join("2000");
+        crate::subprocess::with_scope(cancelled_scope(), || {
+            assert!(write_snapshot(&snapshot_of(Vec::new()), &fresh).is_err());
+            assert!(store::delete(root.path(), "1000").is_err());
+        });
+        assert!(!fresh.exists(), "an abandoned call wrote a snapshot");
+        assert!(
+            kept.join("snapshot.json").is_file(),
+            "an abandoned call deleted one"
+        );
+    }
 
     #[test]
     fn a_captured_json_document_is_returned_not_printed() {

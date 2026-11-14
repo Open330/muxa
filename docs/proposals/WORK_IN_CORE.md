@@ -186,7 +186,11 @@ pub struct WorkContext {
     own environment is what the child had, apart from `TEND_SOCKET`, which
     the client and subprocess scope carry.
   - The scope's deadline is the child's budget (30 s, 60 s, 15 min).
-    Dropping the call cancels it, as `kill_on_drop` did to the child.
+    Dropping the call cancels it, as `kill_on_drop` did to the child. Past
+    either, the restore's per-pane waits (shell ready, screen settled, trust
+    prompts, launch confirmation) stop at once, each phase boundary fails
+    the restore (its report so far is kept), and no snapshot is written,
+    pruned or deleted.
   - `TEND_SNAPSHOT_CHILD=1` forces the child.
   - Proven on a scratch daemon with `TEND_CLI` pointing nowhere: a tracked
     agent's server saved and listed; a killed session planned and restored

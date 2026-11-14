@@ -72,6 +72,9 @@ async fn run(args: &[String], socket: PathBuf, budget: Duration) -> Option<WorkC
         let (result, document) = tend_work::subprocess::with_scope(scope, || {
             tend_work::reload::capture_json(|| {
                 runtime.block_on(async {
+                    // Queued behind other blocking work after the caller
+                    // gave up: start nothing.
+                    tend_work::subprocess::ensure_time_left()?;
                     let result = request.run(&socket).await;
                     if restore {
                         // As the CLI did after every `restore`, success or not.
