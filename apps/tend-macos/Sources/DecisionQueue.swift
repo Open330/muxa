@@ -35,8 +35,33 @@ struct TendDecision: Decodable, Hashable, Sendable {
         options = (try? values.decodeIfPresent([String].self, forKey: .options)) ?? []
         recommendation = try values.decodeIfPresent(String.self, forKey: .recommendation)
         // One entry of a kind this app does not know never hides the rest.
-        evidence = ((try? values.decodeIfPresent([TendLenient<TendEvidence>].self, forKey: .evidence)) ?? [])
-            .compactMap(\.value)
+        let raw = (try? values.decodeIfPresent([TendLenient<Provenanced>].self, forKey: .evidence)) ?? []
+        var evidence: [TendEvidence] = []
+        var ranByTend = Set<Int>()
+        for entry in raw.compactMap(\.value) {
+            if entry.verified { ranByTend.insert(evidence.count) }
+            evidence.append(entry.evidence)
+        }
+        self.evidence = evidence
+        self.ranByTend = ranByTend
+    }
+
+    /// Indexes into `evidence` of the entries tendd marked `verified`: its
+    /// own copies of the checks it ran, never an agent's claim (tendd clears
+    /// that flag on everything a client sends).
+    var ranByTend: Set<Int> = []
+
+    /// One evidence entry and whether tendd ran it.
+    private struct Provenanced: Decodable, Sendable {
+        let evidence: TendEvidence
+        let verified: Bool
+
+        private enum CodingKeys: String, CodingKey { case verified }
+
+        init(from decoder: Decoder) throws {
+            evidence = try TendEvidence(from: decoder)
+            verified = (try? decoder.container(keyedBy: CodingKeys.self).decodeIfPresent(Bool.self, forKey: .verified)) ?? false
+        }
     }
 
     var isEmpty: Bool {
@@ -325,15 +350,14 @@ struct TendVerification: Decodable, Hashable, Sendable {
 extension TendReviewItem {
     /// The typed evidence, then the free-form anchor when it reads as
     /// evidence and is not already listed (as `tend review show` does).
-    /// tendd also copies its checks into the evidence for clients that read
-    /// only the decision; with the checks shown on their own, those copies
-    /// are left out.
+    /// tendd also copies its checks into the evidence (marked `verified`)
+    /// for clients that read only the decision; with the checks shown on
+    /// their own, those copies are left out. An agent's own entry stays,
+    /// even for the same command.
     var allEvidence: [TendEvidence] {
-        let ran = verification.map { Set($0.checks.map(\.command)) } ?? []
-        var evidence = (decision?.evidence ?? []).filter { evidence in
-            if case .test(let command, _, _) = evidence, ran.contains(command) { return false }
-            return true
-        }
+        let all = decision?.evidence ?? []
+        let skip = verification?.checks.isEmpty == false ? (decision?.ranByTend ?? []) : []
+        var evidence = all.enumerated().filter { !skip.contains($0.offset) }.map(\.element)
         if let anchor = anchor.flatMap(TendEvidence.fromAnchor), !evidence.contains(anchor) {
             evidence.append(anchor)
         }

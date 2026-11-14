@@ -152,6 +152,7 @@ test("a remote result is decided here only where that host takes decisions over 
   assert.deepEqual(observe.notes, ["observe-only: answer on that host"]);
   // The same id on two hosts keeps two drafts.
   assert.notEqual(draftKey(current.cards[0]), draftKey(older.cards[0]));
+});
 
 test("tend's own checks come first and are not repeated as evidence", () => {
   const verification = {

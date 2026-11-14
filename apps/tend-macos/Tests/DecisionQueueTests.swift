@@ -336,6 +336,32 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
         #expect(decision.evidence == [.test(command: "make lint", passed: true, tail: nil)])
     }
 
+    @Test func anAgentsOwnClaimAboutTheSameCommandStays() throws {
+        let json = """
+        {"kind":"review","id":"rv_8","target":{"kind":"work","workspace":"tend","work":"ENG-2"},
+         "generation":1,"summary":"Done","requested_by":{"kind":"agent","label":"impl"},
+         "verification":{"passed":true,"checks":[{"command":"cargo test","passed":true,"tail":""}]},
+         "decision":{"evidence":[
+           {"kind":"test","command":"cargo test","passed":true,"verified":true},
+           {"kind":"test","command":"cargo test","passed":false,"tail":"agent saw a failure"}]}}
+        """
+        let item = try JSONDecoder().decode(TendReviewItem.self, from: Data(json.utf8))
+        #expect(item.allEvidence == [.test(command: "cargo test", passed: false, tail: "agent saw a failure")])
+    }
+
+    @Test func aMalformedVerificationLeavesTheItemVisible() throws {
+        let json = """
+        {"kind":"review","id":"rv_7","target":{"kind":"session","provider":"claude","session_id":"s"},
+         "generation":1,"summary":"Done","requested_by":{"kind":"agent"},
+         "verification":"future-or-malformed-record",
+         "decision":{"evidence":[{"kind":"test","command":"x","passed":true,"verified":true}]}}
+        """
+        let item = try JSONDecoder().decode(TendReviewItem.self, from: Data(json.utf8))
+        #expect(item.verification == nil)
+        // Without checks to show, tend's copy stays in the evidence.
+        #expect(item.allEvidence == [.test(command: "x", passed: true, tail: nil)])
+    }
+
     @Test func aFailedCheckSaysHowItEnded() throws {
         let json = """
         {"passed":true,"checks":[{"command":"a","passed":false,"exit_code":2,"tail":"boom"},

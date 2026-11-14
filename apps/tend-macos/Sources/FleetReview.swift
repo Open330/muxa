@@ -275,6 +275,23 @@ struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
         case idempotencyKey = "idempotency_key"
     }
 
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        target = try values.decode(Target.self, forKey: .target)
+        generation = try values.decode(UInt64.self, forKey: .generation)
+        summary = try values.decode(String.self, forKey: .summary)
+        anchor = try values.decodeIfPresent(String.self, forKey: .anchor)
+        requestedAt = try values.decodeIfPresent(String.self, forKey: .requestedAt)
+        requestedBy = try values.decode(Actor.self, forKey: .requestedBy)
+        decision = try values.decodeIfPresent(TendDecision.self, forKey: .decision)
+        disposition = try values.decodeIfPresent(Disposition.self, forKey: .disposition)
+        idempotencyKey = try values.decodeIfPresent(String.self, forKey: .idempotencyKey)
+        // A verification record this app cannot read leaves the item
+        // visible, without its checks.
+        verification = (try? values.decodeIfPresent(TendLenient<TendVerification>.self, forKey: .verification))?.value
+    }
+
     /// Who asked, as they declared it (not verified).
     var askedBy: String {
         let who = requestedBy.label ?? (requestedBy.kind == "agent" ? String(localized: "an agent") : String(localized: "a person"))
