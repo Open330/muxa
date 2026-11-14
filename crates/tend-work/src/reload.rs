@@ -2109,7 +2109,13 @@ fn relaunch_command_without_home(pane: &PaneShape) -> Option<String> {
         _ => {
             let command = pane.command.clone()?;
             let Some(agent) = session else {
-                return Some(command);
+                // A fresh (or synthetic) Codex start is still a Codex start.
+                let codex = pane.agent.as_ref().is_some_and(|a| a.kind == "codex");
+                return Some(if codex {
+                    codex_overrides_in_text(&command)
+                } else {
+                    command
+                });
             };
             Some(match agent.kind.as_str() {
                 "claude_code" if !command.contains("--resume") => {
@@ -2130,25 +2136,13 @@ fn relaunch_command_without_home(pane: &PaneShape) -> Option<String> {
 }
 
 /// [`tend::codex_launch`]'s overrides for a Codex line known only as text
-/// (no captured argv): spliced in before its ` resume `, skipping any key
-/// the line already names.
+/// (no captured argv). Never guesses inside shell syntax: a line that does
+/// not plainly start Codex is left as it is (and, if it stops on a startup
+/// dialog, the restore reports it).
 fn codex_overrides_in_text(command: &str) -> String {
-    let pairs: Vec<String> = tend::codex_launch::STARTUP_OVERRIDES
-        .iter()
-        .filter(|assignment| {
-            let key = assignment.split('=').next().unwrap_or_default();
-            !command.contains(key)
-        })
-        .flat_map(|assignment| ["-c".to_owned(), (*assignment).to_owned()])
-        .collect();
-    if pairs.is_empty() {
-        return command.to_owned();
-    }
-    let fragment = tend::shell::Dialect::native().command_line(&pairs);
-    match command.find(" resume ") {
-        Some(at) => format!("{} {fragment}{}", &command[..at], &command[at..]),
-        None => format!("{command} {fragment}"),
-    }
+    tend::codex_launch::with_startup_overrides_in_text(command, |words| {
+        tend::shell::Dialect::native().command_line(words)
+    })
 }
 
 /// Claude names a new conversation with `--session-id`, but refuses it next to
@@ -3345,7 +3339,13 @@ mod tests {
             session_id: "synthetic-7".into(),
             working: false,
         });
-        assert_eq!(relaunch_command(&codex).as_deref(), Some("codex --yolo"));
+        // No conversation to resume, but still a Codex start.
+        assert_eq!(
+            relaunch_command(&codex).as_deref(),
+            Some(
+                "codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo"
+            )
+        );
     }
 
     #[test]
@@ -3366,7 +3366,7 @@ mod tests {
         codex.agent.as_mut().unwrap().session_id = "01a13353-ba8c-70f3-a502-2a33f3521878".into();
         assert_eq!(
             relaunch_command(&codex).as_deref(),
-            Some("codex --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 01a13353-ba8c-70f3-a502-2a33f3521878")
+            Some("codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo resume 01a13353-ba8c-70f3-a502-2a33f3521878")
         );
     }
 
@@ -3434,7 +3434,7 @@ mod tests {
         );
         assert_eq!(
             relaunch_command(&codex).as_deref(),
-            Some("aas exec e-ed@codex -- --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' resume 01a12f38")
+            Some("aas exec e-ed@codex -- -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo resume 01a12f38")
         );
         // Bare program, prompt last.
         let bare = shape(

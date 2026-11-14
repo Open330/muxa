@@ -31,8 +31,14 @@ fn key_of(assignment: &str) -> &str {
         .trim()
 }
 
-/// The config keys `args` already sets with `-c`/`--config`.
+/// The config keys `args` (Codex's own arguments) already sets with
+/// `-c`/`--config`. A leading `--` (an `aas exec … --` wrapper) is skipped;
+/// a later one ends the options.
 fn keys_set(args: &[String]) -> Vec<String> {
+    let args = match args.first().map(String::as_str) {
+        Some("--") => &args[1..],
+        _ => args,
+    };
     let mut keys = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -68,32 +74,28 @@ pub fn startup_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// `args` (a Codex argument list, after the program) with the overrides
-/// added: before a `resume` subcommand when there is one, else before a
-/// trailing positional prompt (`prompt_at`, its index) or `--`, else at the
-/// end. Idempotent.
+/// `args` (all of Codex's own arguments, after the program) with the
+/// overrides first: before every option, its value, a subcommand, `--` and
+/// a prompt, so none of them can swallow or shift. After a leading `--`
+/// (`aas exec <account> -- …`), where Codex's arguments begin. Idempotent.
 #[must_use]
-pub fn with_startup_overrides(args: &[String], prompt_at: Option<usize>) -> Vec<String> {
+pub fn with_startup_overrides(args: &[String]) -> Vec<String> {
     let extra = startup_args(args);
     if extra.is_empty() {
         return args.to_vec();
     }
-    let at = args
-        .iter()
-        .position(|arg| arg == "resume")
-        .or(prompt_at)
-        .or_else(|| args.iter().position(|arg| arg == "--"))
-        .unwrap_or(args.len())
-        .min(args.len());
+    let at = usize::from(args.first().map(String::as_str) == Some("--"));
     let mut out = args.to_vec();
     out.splice(at..at, extra);
     out
 }
 
-/// The same for a whole command line already rendered as words: the
-/// Codex program (`codex`, a path ending in `/codex`, or an `aas e …@codex`
-/// wrapper) is found, and the overrides go into its arguments. Words that
-/// are not a Codex launch come back unchanged.
+/// The same for a whole command line already split into words, when that
+/// line starts Codex: `codex …` (any path, `.exe`/`.cmd`), behind `env
+/// K=V …`, through an interpreter (`node …/bin/codex …`), or as `aas
+/// e|exec <account>@codex [--] …` / `aas e <account> codex …`. Only the
+/// program position counts: a later word that happens to be `codex` is an
+/// argument. Any other line comes back unchanged.
 #[must_use]
 pub fn with_startup_overrides_in_line(words: &[String]) -> Vec<String> {
     let Some(program) = codex_program_index(words) else {
@@ -101,37 +103,99 @@ pub fn with_startup_overrides_in_line(words: &[String]) -> Vec<String> {
     };
     let (head, tail) = words.split_at(program + 1);
     let mut out = head.to_vec();
-    out.extend(with_startup_overrides(tail, None));
+    out.extend(with_startup_overrides(tail));
     out
 }
 
-/// Where the Codex program (or the account wrapper that starts it) sits in
-/// `words`, so its own arguments follow it.
-fn codex_program_index(words: &[String]) -> Option<usize> {
-    let base = |word: &str| word.rsplit(['/', '\\']).next().unwrap_or(word).to_owned();
-    for (i, word) in words.iter().enumerate() {
-        let name = base(word);
-        let name = name.strip_suffix(".exe").unwrap_or(&name);
-        if name == "codex" || name == "codex.cmd" {
-            return Some(i);
-        }
-        // `aas e <account>@codex …` / `aas exec <account>@codex -- …`.
-        if name == "aas" {
-            let rest = &words[i + 1..];
-            if let [verb, account, ..] = rest {
-                if matches!(verb.as_str(), "e" | "exec") && account.ends_with("@codex") {
-                    let after = i + 2;
-                    return Some(if rest.get(2).map(String::as_str) == Some("--") {
-                        after + 1
-                    } else {
-                        after
-                    });
-                }
-            }
-            return None;
+/// The same for a line known only as shell text: the overrides are spliced
+/// in right after the Codex program (or its `aas` account word), found
+/// among the line's leading plain words. Plain means no quote, escape,
+/// `$`, `#` or glob: none can hide a word boundary there. A line whose start
+/// is not plain, or that does not start Codex, comes back unchanged. The
+/// overrides come first, so a `-c` for the same key later on the line
+/// (even one quoted, which is not read here) still wins.
+#[must_use]
+pub fn with_startup_overrides_in_text(line: &str, render: impl Fn(&[String]) -> String) -> String {
+    let plain = |word: &str| {
+        !word.chars().any(|c| {
+            matches!(
+                c,
+                '\'' | '"' | '\\' | '`' | '$' | '#' | '*' | '?' | '[' | ';' | '&' | '|'
+            )
+        })
+    };
+    let words: Vec<&str> = line.split_whitespace().take_while(|w| plain(w)).collect();
+    let owned: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+    let Some(program) = codex_program_index(&owned) else {
+        return line.to_owned();
+    };
+    let mut after = program;
+    if owned.get(program + 1).map(String::as_str) == Some("--") {
+        after += 1;
+    }
+    let extra = startup_args(&owned[after + 1..]);
+    if extra.is_empty() {
+        return line.to_owned();
+    }
+    let anchor = words[after];
+    // `words` borrow from `line`: the anchor's end is its own offset.
+    let end = anchor.as_ptr() as usize - line.as_ptr() as usize + anchor.len();
+    format!("{} {}{}", &line[..end], render(&extra), &line[end..])
+}
+
+fn base(word: &str) -> String {
+    let name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".js"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            return stem.to_owned();
         }
     }
-    None
+    name
+}
+
+/// Where the word that starts Codex's own arguments sits: the Codex
+/// program, or the account (or frontend) word of an `aas` wrapper.
+fn codex_program_index(words: &[String]) -> Option<usize> {
+    let mut i = 0;
+    if words.first().is_some_and(|w| base(w) == "env") {
+        i = 1;
+        while let Some(word) = words.get(i) {
+            if word == "-u" || word == "--unset" {
+                i += 2;
+            } else if word.contains('=') && !word.starts_with('-') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let program = words.get(i)?;
+    match base(program).as_str() {
+        "codex" => Some(i),
+        "node" | "bun" | "deno" => words
+            .get(i + 1)
+            .is_some_and(|script| base(script) == "codex")
+            .then_some(i + 1),
+        "aas" => {
+            let verb = words.get(i + 1)?;
+            let account = words.get(i + 2)?;
+            if !matches!(verb.as_str(), "e" | "exec") {
+                return None;
+            }
+            if account.ends_with("@codex") {
+                Some(i + 2)
+            } else if words.get(i + 3).is_some_and(|front| front == "codex") {
+                Some(i + 3)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -145,22 +209,35 @@ mod tests {
     const UPDATE: &str = "check_for_update_on_startup=false";
     const CWD: &str = "tui.resume_cwd=\"session\"";
 
+    fn with(rest: &[&str]) -> Vec<String> {
+        let mut v = s(&["-c", UPDATE, "-c", CWD]);
+        v.extend(s(rest));
+        v
+    }
+
     #[test]
-    fn overrides_go_before_resume_or_a_prompt_and_only_once() {
+    fn overrides_lead_codexs_own_arguments_so_nothing_shifts() {
         assert_eq!(
-            with_startup_overrides(&s(&["--yolo", "resume", "id"]), None),
-            s(&["--yolo", "-c", UPDATE, "-c", CWD, "resume", "id"])
+            with_startup_overrides(&s(&["--yolo", "resume", "id"])),
+            with(&["--yolo", "resume", "id"])
         );
+        // An option's value that reads like a subcommand keeps its option.
         assert_eq!(
-            with_startup_overrides(&s(&["--yolo", "do it"]), Some(1)),
-            s(&["--yolo", "-c", UPDATE, "-c", CWD, "do it"])
+            with_startup_overrides(&s(&["--profile", "resume", "do it"])),
+            with(&["--profile", "resume", "do it"])
         );
+        // Never after `--`, where they would be prompt text.
         assert_eq!(
-            with_startup_overrides(&s(&["--yolo"]), None),
-            s(&["--yolo", "-c", UPDATE, "-c", CWD])
+            with_startup_overrides(&s(&["--yolo", "--", "do it"])),
+            with(&["--yolo", "--", "do it"])
         );
-        let once = with_startup_overrides(&s(&["resume", "id"]), None);
-        assert_eq!(with_startup_overrides(&once, None), once);
+        assert_eq!(with_startup_overrides(&s(&["--", "resume"])), {
+            let mut v = s(&["--"]);
+            v.extend(with(&["resume"]));
+            v
+        });
+        let once = with_startup_overrides(&s(&["resume", "id"]));
+        assert_eq!(with_startup_overrides(&once), once);
     }
 
     #[test]
@@ -173,22 +250,38 @@ mod tests {
         ] {
             let mut args = own.clone();
             args.extend(s(&["resume", "id"]));
-            let out = with_startup_overrides(&args, None);
-            let mut want = own;
-            want.extend(s(&["-c", CWD, "resume", "id"]));
-            assert_eq!(out, want);
+            let mut want = s(&["-c", CWD]);
+            want.extend(own);
+            want.extend(s(&["resume", "id"]));
+            assert_eq!(with_startup_overrides(&args), want);
         }
+        // A prompt that mentions a key sets nothing.
+        assert_eq!(
+            startup_args(&s(&["resume", "id", "explain check_for_update_on_startup"])).len(),
+            4
+        );
         // After `--` nothing is an option.
         assert_eq!(
-            startup_args(&s(&["--", "-c", "check_for_update_on_startup=true"])).len(),
+            startup_args(&s(&[
+                "--",
+                "-c",
+                "x",
+                "--",
+                "-c",
+                "check_for_update_on_startup=true"
+            ]))
+            .len(),
             4
         );
     }
 
     #[test]
-    fn a_rendered_line_gets_them_after_its_codex_program() {
+    fn a_line_gets_them_only_when_its_program_is_codex() {
+        let line = |w: &[&str]| with_startup_overrides_in_line(&s(w));
+        let mut want = s(&["aas", "e", "chatgpt@codex"]);
+        want.extend(with(&["--yolo", "--no-daemon", "resume", "id"]));
         assert_eq!(
-            with_startup_overrides_in_line(&s(&[
+            line(&[
                 "aas",
                 "e",
                 "chatgpt@codex",
@@ -196,52 +289,76 @@ mod tests {
                 "--no-daemon",
                 "resume",
                 "id"
-            ])),
-            s(&[
-                "aas",
-                "e",
-                "chatgpt@codex",
-                "--yolo",
-                "--no-daemon",
-                "-c",
-                UPDATE,
-                "-c",
-                CWD,
-                "resume",
-                "id"
-            ])
+            ]),
+            want
         );
+        let mut want = s(&["env", "CODEX_HOME=/h", "/opt/bin/codex"]);
+        want.extend(with(&["resume", "id"]));
         assert_eq!(
-            with_startup_overrides_in_line(&s(&[
-                "env",
-                "CODEX_HOME=/h",
-                "/opt/bin/codex",
-                "resume",
-                "id"
-            ])),
-            s(&[
-                "env",
-                "CODEX_HOME=/h",
-                "/opt/bin/codex",
-                "-c",
-                UPDATE,
-                "-c",
-                CWD,
-                "resume",
-                "id"
-            ])
+            line(&["env", "CODEX_HOME=/h", "/opt/bin/codex", "resume", "id"]),
+            want
         );
+        let mut want = s(&["aas", "exec", "b@codex", "--"]);
+        want.extend(with(&["resume", "id"]));
         assert_eq!(
-            with_startup_overrides_in_line(&s(&["aas", "exec", "b@codex", "--", "resume", "id"])),
-            s(&["aas", "exec", "b@codex", "--", "-c", UPDATE, "-c", CWD, "resume", "id"])
+            line(&["aas", "exec", "b@codex", "--", "resume", "id"]),
+            want
         );
-        // Not Codex: unchanged.
-        for line in [
+        let mut want = s(&["node", "/n/bin/codex"]);
+        want.extend(with(&["--yolo"]));
+        assert_eq!(line(&["node", "/n/bin/codex", "--yolo"]), want);
+        let mut want = s(&[r"C:\npm\codex.cmd"]);
+        want.extend(with(&["resume", "id"]));
+        assert_eq!(line(&[r"C:\npm\codex.cmd", "resume", "id"]), want);
+        // Not Codex, or `codex` only as an argument: byte for byte the same.
+        for words in [
             s(&["claude", "--resume", "id"]),
             s(&["aas", "e", "w@claude", "--resume", "id"]),
-            s(&["node", "server.js"]),
+            s(&["node", "server.js", "codex"]),
+            s(&["vim", "codex"]),
+            s(&["env", "A=1", "claude"]),
         ] {
-            assert_eq!(with_startup_overrides_in_line(&line), line);
+            assert_eq!(with_startup_overrides_in_line(&words), words);
+        }
+    }
+
+    #[test]
+    fn a_text_line_gets_them_after_its_program_and_never_inside_quotes() {
+        let render = |w: &[String]| w.join(" ");
+        let text = |line: &str| with_startup_overrides_in_text(line, render);
+        let o = format!("-c {UPDATE} -c {CWD}");
+        assert_eq!(text("codex resume id"), format!("codex {o} resume id"));
+        assert_eq!(
+            text("codex resume id 'explain check_for_update_on_startup'"),
+            format!("codex {o} resume id 'explain check_for_update_on_startup'")
+        );
+        assert_eq!(
+            text("codex -c 'developer_instructions=\"please resume the session\"' resume id"),
+            format!(
+                "codex {o} -c 'developer_instructions=\"please resume the session\"' resume id"
+            )
+        );
+        assert_eq!(
+            text("aas e x@codex --yolo resume id"),
+            format!("aas e x@codex {o} --yolo resume id")
+        );
+        assert_eq!(
+            text("aas exec x@codex -- resume id"),
+            format!("aas exec x@codex -- {o} resume id")
+        );
+        // A user's own plain -c for a key leaves that key alone.
+        assert_eq!(
+            text("codex -c check_for_update_on_startup=true resume id"),
+            format!("codex -c {CWD} -c check_for_update_on_startup=true resume id")
+        );
+        // Not plain where the program would be, or not Codex: unchanged.
+        for line in [
+            "'codex' resume id",
+            "FOO=$X codex",
+            "claude --resume id",
+            "node server.js codex",
+        ] {
+            assert_eq!(text(line), line);
         }
     }
 

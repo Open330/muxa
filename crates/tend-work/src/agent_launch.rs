@@ -85,7 +85,6 @@ impl AgentProgram {
             Vec::new()
         };
         args.extend(options.iter().cloned());
-        let prompt_at = prompt.map(|_| args.len());
         if let Some(prompt) = prompt {
             match self {
                 Self::Claude | Self::Codex => args.push(prompt.into()),
@@ -102,7 +101,7 @@ impl AgentProgram {
         if self == Self::Codex {
             // Never come up on Codex's update menu or directory question
             // (see `tend::codex_launch`).
-            args = tend::codex_launch::with_startup_overrides(&args, prompt_at);
+            args = tend::codex_launch::with_startup_overrides(&args);
         }
         NativeLaunch {
             command: self.label().into(),
@@ -2110,23 +2109,23 @@ os.execv({real:?}, [{real:?}] + args)
                 "/opt/aas",
                 "e",
                 "ok@codex",
-                "--yolo",
-                "--no-daemon",
                 "-c",
                 "check_for_update_on_startup=false",
                 "-c",
                 "tui.resume_cwd=\"session\"",
+                "--yolo",
+                "--no-daemon",
                 "it's\nfine"
             ]
         );
         let bare = [
             "codex",
-            "--yolo",
-            "--no-daemon",
             "-c",
             "check_for_update_on_startup=false",
             "-c",
             "tui.resume_cwd=\"session\"",
+            "--yolo",
+            "--no-daemon",
             "it's\nfine",
         ];
         assert_eq!(build().on_account(None).argv(), bare);
@@ -2140,7 +2139,7 @@ os.execv({real:?}, [{real:?}] + args)
     fn codex_profile_expands_cx_and_quotes_the_prompt() {
         assert_eq!(
             AgentProgram::Codex.launch_command(&[], Some("review June's changes; don't edit")),
-            "codex --yolo -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' 'review June'\\''s changes; don'\\''t edit'"
+            "codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo 'review June'\\''s changes; don'\\''t edit'"
         );
     }
 
@@ -2152,11 +2151,11 @@ os.execv({real:?}, [{real:?}] + args)
         assert_eq!(
             launch.args,
             [
-                "--yolo",
                 "-c",
                 "check_for_update_on_startup=false",
                 "-c",
                 "tui.resume_cwd=\"session\"",
+                "--yolo",
                 "review June's changes; don't edit"
             ]
         );
@@ -2222,7 +2221,7 @@ os.execv({real:?}, [{real:?}] + args)
         );
         assert_eq!(
             command,
-            "codex --yolo --model 'gpt 5; echo nope' -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' 'review $HOME'"
+            "codex -c check_for_update_on_startup=false -c 'tui.resume_cwd=\"session\"' --yolo --model 'gpt 5; echo nope' 'review $HOME'"
         );
 
         let native = AgentProgram::Antigravity.native_launch(

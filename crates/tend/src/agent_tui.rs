@@ -715,6 +715,10 @@ pub struct StartupBlocker {
     pub consent: Consent,
 }
 
+/// Startup dialogs any caller may answer: dismissing them installs,
+/// trusts and resumes nothing.
+pub const SAFE_DISMISSALS: &[&str] = &["skipped the Codex update prompt"];
+
 /// The startup dialog `screen` shows, if any, so a restore or launch never
 /// leaves a pane silently stuck on one. Built on [`STARTUP_DIALOGS`]; a
 /// dialog tend must not answer (folder-settings trust, Codex's "Hooks need
@@ -740,7 +744,11 @@ pub fn startup_blocker(screen: &str) -> Option<StartupBlocker> {
                 consent: Consent::None,
             });
     };
-    let keys = (dialog.consent == Consent::None)
+    // Only a dismissal that agrees to nothing and starts no work: the update
+    // menu's Esc ("skip"). Folder trust, a paused goal's "Resume goal" and
+    // the rest need evidence only a swap or a worker start has, so a
+    // generic caller reports them instead.
+    let keys = (dialog.consent == Consent::None && SAFE_DISMISSALS.contains(&dialog.label))
         .then(|| dialog.keys_on(screen))
         .flatten();
     Some(StartupBlocker {
@@ -1435,5 +1443,18 @@ mod tests {
         let found = startup_blocker(trust_0_154).expect("an open question");
         assert_eq!(found.label, "an unrecognised startup dialog");
         assert_eq!(found.keys, None);
+    }
+
+    #[test]
+    fn a_generic_caller_gets_keys_only_for_the_update_menu() {
+        let trust = "  Do you trust the contents of this directory?\n› 1. Trust and continue\n  2. Quit\n  \
+            Trust this folder · enter continue\n";
+        if let Some(found) = startup_blocker(trust) {
+            assert_eq!(found.keys, None, "{}", found.label);
+        }
+        let goal = "    Finish the docs.\n  › 1. Resume goal   Mark it active\n    2. Leave paused\n    enter select · esc back\n";
+        let found = startup_blocker(goal).expect("the goal menu");
+        assert_eq!(found.label, "resumed the paused goal");
+        assert_eq!(found.keys, None, "starting old work needs evidence");
     }
 }
