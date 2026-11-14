@@ -230,6 +230,29 @@ export function hostSections(data, now = Date.now()) {
   });
 }
 
+/// The history as sections per host, like the queue. An older response with
+/// a single `history` reads as one local section.
+export function historySections(data, now = Date.now()) {
+  const hosts = Array.isArray(data?.hosts)
+    ? data.hosts
+    : [{ alias: data?.covers || "this host", local: true, unavailable: data?.history?.unavailable || [], history: data?.history }];
+  return hosts.map((host) => {
+    const notes = [];
+    if (host.history?.truncated) notes.push("more than shown");
+    for (const source of host.unavailable || []) notes.push(`unavailable: ${source}`);
+    return {
+      alias: host.alias,
+      local: host.local === true,
+      covers: [],
+      notes,
+      cards: (host.history?.items || [])
+        .map((item) => decidedCard(item, now))
+        .filter(Boolean)
+        .map((card) => ({ ...card, host: host.alias, remote: host.local !== true, actionable: false })),
+    };
+  });
+}
+
 /// Request ids are per host (two hosts can hold the same one), so an unsent
 /// answer belongs to the host, the kind of item and its id together.
 export function draftKey(card) {

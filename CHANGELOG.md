@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Decided tab on the web "Needs you" page covers every connected Fleet
+  host, as the queue does. A new read-only Fleet operation
+  (`fleet_decision_history_v1`) brings a host's past decisions, read there
+  as its operator console. An older or offline host is listed with what kept
+  it out.
+
 - Results on other Fleet hosts can be accepted, sent back or withdrawn from
   the controller's "Needs you" page. The decision goes to the host that holds
   the item (a new Fleet operation, `fleet_review_dispose_v1`, control-mode

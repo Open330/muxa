@@ -503,6 +503,17 @@ async fn handle_request(
                 result: Box::new(FleetCommandResult::decision_queue(queue)),
             })
         }
+        RelayRequest::DecisionHistory { request_id, limit } => {
+            // As this host's operator console, like the queue.
+            let history = client
+                .decision_history(&tend::decision_queue::operator_origin(), limit)
+                .await
+                .context("reading the decision history")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: Box::new(FleetCommandResult::decision_history(history)),
+            })
+        }
         RelayRequest::ReviewDispose {
             request_id,
             dispose,
