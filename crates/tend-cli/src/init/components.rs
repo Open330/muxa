@@ -33,6 +33,8 @@ pub enum Component {
     AntigravityHooks,
     /// opencode plugin event bridge
     OpencodeHooks,
+    /// GitHub Copilot CLI user hooks
+    CopilotHooks,
     /// `tendd` user-level systemd service (Linux only)
     TenddSystemd,
     /// `tendd` `launchd` `LaunchAgent` (macOS only)
@@ -71,6 +73,7 @@ impl Component {
         Component::CodexHooks,
         Component::AntigravityHooks,
         Component::OpencodeHooks,
+        Component::CopilotHooks,
         Component::TenddSystemd,
         Component::TenddLaunchd,
         Component::TenddShellrc,
@@ -97,6 +100,7 @@ impl Component {
             Component::RetiredGeminiHooks => "gemini-hooks",
             Component::AntigravityHooks => "agy-hooks",
             Component::OpencodeHooks => "opencode-hooks",
+            Component::CopilotHooks => "copilot-hooks",
             Component::TenddSystemd => "tendd-systemd",
             Component::TenddLaunchd => "tendd-launchd",
             Component::TenddShellrc => "tendd-shellrc",
@@ -134,6 +138,7 @@ impl Component {
             Component::RetiredGeminiHooks => "Gemini CLI (retired): remove leftover tend hooks",
             Component::AntigravityHooks => "Antigravity CLI (agy): lifecycle hooks",
             Component::OpencodeHooks => "opencode: plugin event bridge",
+            Component::CopilotHooks => "GitHub Copilot CLI: user hooks",
             Component::TenddSystemd => "tendd: systemd user service (auto-start on login)",
             Component::TenddLaunchd => "tendd: launchd LaunchAgent (auto-start on login)",
             Component::TenddShellrc => "tendd: shellrc autostart hook (no service manager)",
@@ -167,6 +172,7 @@ impl Component {
             Component::OpencodeHooks => {
                 "installs ~/.config/opencode/plugins/tend.ts (1.x) and tend/tui.ts (2.x)"
             }
+            Component::CopilotHooks => "writes ~/.copilot/hooks/tend.json ($COPILOT_HOME)",
             Component::TenddSystemd => "Linux only; skipped on macOS / launchd hosts",
             Component::TenddLaunchd => "macOS only; skipped on Linux / systemd hosts",
             Component::TenddShellrc => {
@@ -240,6 +246,7 @@ impl Component {
                 Component::CodexHooks,
                 Component::AntigravityHooks,
                 Component::OpencodeHooks,
+                Component::CopilotHooks,
                 Component::Collaboration,
                 Component::AgentInstructions,
                 Component::AgentSkills,

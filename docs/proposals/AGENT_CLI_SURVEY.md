@@ -1,6 +1,7 @@
 # Agent CLI candidates (survey, 2026-11-12)
 
-Status: proposal. Nothing here is implemented. It records which agent CLIs
+Status: proposal. Copilot CLI has since been implemented (see
+[COPILOT.md](../COPILOT.md)); the rest is not. It records which agent CLIs
 tend should integrate next after the Gemini CLI removal and the opencode
 rewrite, judged by the [Direction](../DIRECTION.md) rule: support is claimed
 only at the depth where the provider gives deterministic signals (hook or

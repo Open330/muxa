@@ -89,8 +89,8 @@ Tend has two layers. **Attention** works on agents you already run; **Runtime**
 organizes the agents Tend launches into Work. Attention never requires Runtime.
 See [Direction](docs/DIRECTION.md).
 
-- **Keeps your setup.** Reads agent state from Claude Code, Codex, and
-  Antigravity CLI (`agy`) hooks and opencode plugin events, with screen detection
+- **Keeps your setup.** Reads agent state from Claude Code, Codex,
+  Antigravity CLI (`agy`) and Copilot CLI hooks and opencode plugin events, with screen detection
   for hook-less agents, and maps it onto the tmux panes you already have.
   You can keep launching agents yourself, or use tend's optional agent and
   pipeline launchers. tmux, [rmux](https://rmux.io),
@@ -459,6 +459,7 @@ systems, so tend gets exact state transitions:
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
 | Google Antigravity CLI (`agy`) | Supported | `~/.gemini/config/hooks.json` — [details](docs/ANTIGRAVITY.md) |
 | opencode | Supported (plugin events) | `~/.config/opencode/plugins/tend.ts` (1.x), `plugins/tend/tui.ts` (2.x) — [details](docs/OPENCODE.md) |
+| GitHub Copilot CLI | Supported (watched, not launched) | `~/.copilot/hooks/tend.json` — [details](docs/COPILOT.md) |
 
 The Google Gemini CLI is no longer supported; use its successor, the
 Antigravity CLI. `tend init` removes the hooks an older tend wrote into

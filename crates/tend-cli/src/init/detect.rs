@@ -27,6 +27,9 @@ pub struct Detection {
     /// installed.
     pub antigravity_home: Option<PathBuf>,
     pub opencode_config: Option<PathBuf>,
+    /// `$COPILOT_HOME` (or `~/.copilot`) when it exists, or `copilot` on
+    /// PATH.
+    pub copilot_home: Option<PathBuf>,
     pub tendd_running: bool,
     pub systemd_user_available: bool,
     pub launchctl_available: bool,
@@ -56,6 +59,7 @@ impl Detection {
             codex_config: agent_config(super::files::codex::default_path(), "codex"),
             antigravity_home: detect_antigravity(),
             opencode_config: detect_opencode(),
+            copilot_home: detect_copilot(),
             tendd_running: tendd_is_running(),
             systemd_user_available: super::files::systemd::systemd_available(),
             launchctl_available: super::files::launchd::launchctl_available(),
@@ -110,6 +114,9 @@ impl Detection {
         if self.antigravity_home.is_some() {
             out.push(Component::AntigravityHooks);
         }
+        if self.copilot_home.is_some() {
+            out.push(Component::CopilotHooks);
+        }
         // Pre-check the daemon-manager that fits this host so the
         // wizard's default produces a working install. The picker
         // hides the others (filtered via `Component::applicable_here`).
@@ -121,7 +128,7 @@ impl Detection {
     /// Whether an agent-hook component's config is present on disk.
     ///
     /// Returns `Some(true)`/`Some(false)` for the four agent hooks
-    /// (Claude/Codex/agy/opencode) and `None` for every other
+    /// (Claude/Codex/agy/opencode/Copilot) and `None` for every other
     /// component — the caller reads `None` as "not an agent hook, always
     /// keep". This is what lets the non-interactive/preset path skip
     /// wiring up an agent the user doesn't actually have installed,
@@ -132,6 +139,7 @@ impl Detection {
             Component::CodexHooks => Some(self.codex_config.is_some()),
             Component::AntigravityHooks => Some(self.antigravity_home.is_some()),
             Component::OpencodeHooks => Some(self.opencode_config.is_some()),
+            Component::CopilotHooks => Some(self.copilot_home.is_some()),
             _ => None,
         }
     }
@@ -229,6 +237,18 @@ pub fn antigravity_installed() -> bool {
 fn detect_opencode() -> Option<PathBuf> {
     let dir = super::files::opencode::config_dir();
     existing_dir(dir.clone()).or_else(|| which::which("opencode").ok().and(dir))
+}
+
+/// Presence-only form of [`detect_copilot`], for `doctor`.
+pub fn copilot_installed() -> bool {
+    detect_copilot().is_some()
+}
+
+/// Copilot CLI creates `$COPILOT_HOME` (default `~/.copilot`) on first run;
+/// `copilot` on PATH covers an install that has never run.
+fn detect_copilot() -> Option<PathBuf> {
+    let dir = super::files::copilot::home_dir();
+    existing_dir(dir.clone()).or_else(|| which::which("copilot").ok().and(dir))
 }
 
 fn home_join(rel: &str) -> PathBuf {

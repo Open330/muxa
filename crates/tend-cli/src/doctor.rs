@@ -24,7 +24,9 @@ use tokio::time::timeout;
 
 use crate::doctor_report::{tilde, Level, Report};
 
-use crate::init::files::{antigravity, claude, codex, gemini, launchd, systemd as systemd_files};
+use crate::init::files::{
+    antigravity, claude, codex, copilot, gemini, launchd, systemd as systemd_files,
+};
 
 /// Marker block ids the `tend init` tmux installer writes — must match
 /// the constants in `init::components::Component::id`. Duplicated as
@@ -1167,7 +1169,30 @@ fn check_agent_hooks() -> Vec<(String, CheckResult)> {
             ),
         ));
     }
+    // Copilot likewise: only when it is installed.
+    if crate::init::detect::copilot_installed() {
+        checks.push((
+            "Hooks · Copilot CLI".to_string(),
+            check_one_agent_hook("copilot", copilot::default_path(), copilot_hook_configured),
+        ));
+    }
     checks
+}
+
+/// Does `$COPILOT_HOME/hooks/tend.json` wire every event tend reads? A
+/// file from an older tend that misses one reports as broken.
+pub fn copilot_hook_configured(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    tend::adapters::copilot::EVENTS.iter().all(|(name, flag)| {
+        let want = format!("tend hook copilot --event {flag}");
+        value["hooks"][*name].as_array().is_some_and(|handlers| {
+            handlers
+                .iter()
+                .any(|handler| handler["bash"].as_str() == Some(want.as_str()))
+        })
+    })
 }
 
 fn check_one_agent_hook(
@@ -2473,6 +2498,16 @@ esac
             antigravity_hook_configured(split),
             "coverage is what matters, not which key holds it",
         );
+    }
+
+    #[test]
+    fn copilot_hook_configured_needs_every_event() {
+        let written = crate::init::files::copilot::upsert("").0;
+        assert!(copilot_hook_configured(&written));
+        let mut v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        v["hooks"].as_object_mut().unwrap().remove("agentStop");
+        assert!(!copilot_hook_configured(&v.to_string()));
+        assert!(!copilot_hook_configured("{ not json"));
     }
 
     /// A block left over from an older tend covers only some events. Calling

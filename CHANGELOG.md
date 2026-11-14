@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Copilot CLI agent, and the dashboard, `tend watch`, `tend timeline
   --agent copilot`, automation rules, the herdr bridge and Tend for Mac name
   it. tend watches Copilot; it does not launch it.
+- Copilot CLI hooks. `tend init --component copilot-hooks` writes
+  `~/.copilot/hooks/tend.json` (`$COPILOT_HOME`), and `tend hook copilot`
+  turns Copilot's hooks into the row: the prompt, each tool and its
+  command, a permission prompt as waiting, the turn's answer (read from
+  Copilot's session log) and the session's end. The hook prints nothing and
+  always exits 0, so it can never deny a tool. `tend doctor` checks the file
+  when Copilot is installed. Checked against Copilot CLI 1.0.110; see
+  `docs/COPILOT.md`.
 
 ### Changed
 

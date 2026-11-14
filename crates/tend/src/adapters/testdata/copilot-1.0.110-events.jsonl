@@ -1,0 +1,45 @@
+{"type": "session.start", "timestamp": "2026-11-14T14:51:04.980Z", "data": {"sessionId": "cef1d85d-3316-4419-a5a2-91599b597658", "version": 1, "producer": "copilot-agent", "copilotVersion": "1.0.110", "startTime": "2026-11-14T14:51:04.964Z"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:53:28.463Z", "data": {"hookInvocationId": "3a6553b7-8e8b-43ae-be6c-c50905f0f6d4", "hookType": "sessionStart"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:53:29.409Z", "data": {"hookInvocationId": "28f43bdb-4515-4a0a-a3fc-6b28552559b1", "hookType": "userPromptSubmitted"}}
+{"type": "user.message", "timestamp": "2026-11-14T14:53:29.449Z", "data": {"content": "", "source": "memory", "interactionId": "86ca483f-2f86-4c81-8b0e-5f83a671ecbe"}}
+{"type": "user.message", "timestamp": "2026-11-14T14:53:29.450Z", "data": {"content": "Run the shell command 'cat a.txt' and reply with only its content.", "interactionId": "86ca483f-2f86-4c81-8b0e-5f83a671ecbe"}}
+{"type": "assistant.turn_start", "timestamp": "2026-11-14T14:53:29.456Z", "data": {"turnId": "0", "interactionId": "86ca483f-2f86-4c81-8b0e-5f83a671ecbe"}}
+{"type": "assistant.message", "timestamp": "2026-11-14T14:53:35.881Z", "data": {"messageId": "bdeb89d2-1487-4209-82e0-8d6944bda8de", "model": "gpt-5.6-luna", "content": "", "interactionId": "86ca483f-2f86-4c81-8b0e-5f83a671ecbe"}}
+{"type": "tool.execution_start", "timestamp": "2026-11-14T14:53:35.882Z", "data": {"toolCallId": "call_9xbOBfUvV1HtObUWQhORzVF0", "toolName": "bash", "arguments": {"command": "cat a.txt", "description": "Read a.txt"}, "turnId": "0"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:53:35.883Z", "data": {"hookInvocationId": "cb0b26e8-8e5a-4522-b6dd-73b7cbe7031b", "hookType": "preToolUse"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:53:35.960Z", "data": {"hookInvocationId": "562a7fe2-ef54-44ec-87c6-ec96a71972cc", "hookType": "postToolUse"}}
+{"type": "tool.execution_complete", "timestamp": "2026-11-14T14:53:35.997Z", "data": {"toolCallId": "call_9xbOBfUvV1HtObUWQhORzVF0", "turnId": "0", "success": true}}
+{"type": "assistant.turn_end", "timestamp": "2026-11-14T14:53:36.000Z", "data": {"turnId": "0"}}
+{"type": "assistant.turn_start", "timestamp": "2026-11-14T14:53:36.000Z", "data": {"turnId": "1", "interactionId": "86ca483f-2f86-4c81-8b0e-5f83a671ecbe"}}
+{"type": "assistant.message", "timestamp": "2026-11-14T14:53:43.505Z", "data": {"messageId": "e795991b-fd85-4338-a94d-0949fe00c70f", "model": "gpt-5.6-luna", "content": "hello", "interactionId": "86ca483f-2f86-4c81-8b0e-5f83a671ecbe"}}
+{"type": "assistant.turn_end", "timestamp": "2026-11-14T14:53:43.505Z", "data": {"turnId": "1"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:53:43.506Z", "data": {"hookInvocationId": "a392acd5-a1ec-4005-a377-7f5d74b7639f", "hookType": "agentStop"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:54:09.080Z", "data": {"hookInvocationId": "0f43c403-3a4a-4306-89ce-e71c31e8108e", "hookType": "userPromptSubmitted"}}
+{"type": "user.message", "timestamp": "2026-11-14T14:54:09.140Z", "data": {"content": "Run the shell command 'touch b.txt'.", "interactionId": "132d77a8-ec05-4167-8fa7-74489092f35e"}}
+{"type": "assistant.turn_start", "timestamp": "2026-11-14T14:54:09.141Z", "data": {"turnId": "0", "interactionId": "132d77a8-ec05-4167-8fa7-74489092f35e"}}
+{"type": "assistant.message", "timestamp": "2026-11-14T14:54:16.729Z", "data": {"messageId": "738a403a-b7b6-4228-8adf-32c96f42640e", "model": "gpt-5.6-luna", "content": "", "interactionId": "132d77a8-ec05-4167-8fa7-74489092f35e"}}
+{"type": "tool.execution_start", "timestamp": "2026-11-14T14:54:16.730Z", "data": {"toolCallId": "call_9LHoHODf7gU9jU7g90QmumBY", "toolName": "bash", "arguments": {"command": "touch b.txt", "description": "Create b.txt"}, "turnId": "0"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:54:16.730Z", "data": {"hookInvocationId": "7e4678ef-1c5f-4c1d-bd12-f4b50bb35dab", "hookType": "preToolUse"}}
+{"type": "permission.requested", "timestamp": "2026-11-14T14:54:16.768Z", "data": {"requestId": "2ff31325-9c5d-434d-bf9b-73732e3cbbdb"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:54:16.768Z", "data": {"hookInvocationId": "f0a2ed18-f2b6-4ce4-ae1f-10ebced861b5", "hookType": "notification"}}
+{"type": "permission.completed", "timestamp": "2026-11-14T14:54:30.049Z", "data": {"requestId": "2ff31325-9c5d-434d-bf9b-73732e3cbbdb", "result": {"kind": "cancelled", "reason": "Session aborted"}, "toolCallId": "call_9LHoHODf7gU9jU7g90QmumBY"}}
+{"type": "assistant.turn_end", "timestamp": "2026-11-14T14:54:30.050Z", "data": {"turnId": "0"}}
+{"type": "abort", "timestamp": "2026-11-14T14:54:30.051Z", "data": {"reason": "user_initiated"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:56:39.423Z", "data": {"hookInvocationId": "690d0e6c-3a5e-4e6f-959f-61a04d8b82ac", "hookType": "userPromptSubmitted"}}
+{"type": "user.message", "timestamp": "2026-11-14T14:56:39.487Z", "data": {"content": "Run the shell command 'touch b.txt'.", "interactionId": "5280cdd8-a7e7-4e20-8c48-6fbba405c9c1"}}
+{"type": "assistant.turn_start", "timestamp": "2026-11-14T14:56:39.490Z", "data": {"turnId": "0", "interactionId": "5280cdd8-a7e7-4e20-8c48-6fbba405c9c1"}}
+{"type": "assistant.message", "timestamp": "2026-11-14T14:56:46.833Z", "data": {"messageId": "10d67a57-54e5-41e7-99cb-b378e6bbd8d3", "model": "gpt-5.6-luna", "content": "", "interactionId": "5280cdd8-a7e7-4e20-8c48-6fbba405c9c1"}}
+{"type": "tool.execution_start", "timestamp": "2026-11-14T14:56:46.834Z", "data": {"toolCallId": "call_KgLV45hQoyzfSryimrEPFKCL", "toolName": "bash", "arguments": {"command": "touch b.txt", "description": "Create b.txt"}, "turnId": "0"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:56:46.834Z", "data": {"hookInvocationId": "df935a90-64ff-4110-8c81-8c88597c6625", "hookType": "preToolUse"}}
+{"type": "permission.requested", "timestamp": "2026-11-14T14:56:46.869Z", "data": {"requestId": "2059da75-2c9b-40e8-9bb1-303c4a930c95"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:56:46.869Z", "data": {"hookInvocationId": "fb4ba6a8-f76f-48ac-853a-a13ccca551bb", "hookType": "notification"}}
+{"type": "permission.completed", "timestamp": "2026-11-14T14:56:54.442Z", "data": {"requestId": "2059da75-2c9b-40e8-9bb1-303c4a930c95", "result": {"kind": "approved"}, "toolCallId": "call_KgLV45hQoyzfSryimrEPFKCL"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:56:54.466Z", "data": {"hookInvocationId": "f51e2f31-570a-4dbd-baca-5eae44b5d77c", "hookType": "postToolUse"}}
+{"type": "tool.execution_complete", "timestamp": "2026-11-14T14:56:54.504Z", "data": {"toolCallId": "call_KgLV45hQoyzfSryimrEPFKCL", "turnId": "0", "success": true}}
+{"type": "assistant.turn_end", "timestamp": "2026-11-14T14:56:54.506Z", "data": {"turnId": "0"}}
+{"type": "assistant.turn_start", "timestamp": "2026-11-14T14:56:54.506Z", "data": {"turnId": "1", "interactionId": "5280cdd8-a7e7-4e20-8c48-6fbba405c9c1"}}
+{"type": "assistant.message", "timestamp": "2026-11-14T14:57:02.510Z", "data": {"messageId": "05b1ea1f-1b49-454a-8935-f38b392439c6", "model": "gpt-5.6-luna", "content": "", "interactionId": "5280cdd8-a7e7-4e20-8c48-6fbba405c9c1"}}
+{"type": "assistant.turn_end", "timestamp": "2026-11-14T14:57:02.511Z", "data": {"turnId": "1"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:57:02.515Z", "data": {"hookInvocationId": "5dd2c10f-5313-457a-bfec-1a5dcd23a14b", "hookType": "agentStop"}}
+{"type": "hook.start", "timestamp": "2026-11-14T14:57:54.823Z", "data": {"hookInvocationId": "fabe47ba-509b-44fe-bba9-963704717b01", "hookType": "sessionEnd"}}
+{"type": "session.shutdown", "timestamp": "2026-11-14T14:57:54.865Z", "data": {"shutdownType": "routine"}}

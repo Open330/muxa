@@ -219,6 +219,7 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 Err(e) => tracing::debug!(error = %e, event, "agy hook payload ignored"),
             }
         }
+        HookCmd::Copilot { event } => copilot_hook(client, &event).await,
         HookCmd::Opencode { event } => {
             // Fail-open like agy: the plugin awaits this process from inside
             // opencode, so a payload tend cannot use is logged and dropped
@@ -255,6 +256,26 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `tend hook copilot`. Fail-open like agy: a payload tend cannot use is
+/// logged and dropped, never surfaced as output or a failing exit, since
+/// Copilot reads a tool hook's stdout and status as its verdict.
+async fn copilot_hook(client: &Client, event: &str) {
+    let mut text = String::new();
+    if std::io::stdin().read_to_string(&mut text).is_err() {
+        return;
+    }
+    let place = tend::adapters::hook::HookPlace::resolve(AgentKind::Copilot);
+    match tend::adapters::copilot::parse(event, &text, place.pane.clone()) {
+        Ok(Some(ev)) => {
+            let ev = place.bind(ev);
+            best_effort_ingest(client, &ev).await;
+            best_effort_default_alias(client, &ev).await;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!(error = %e, event, "copilot hook payload ignored"),
+    }
 }
 
 /// Record the hook event and ask for turn-boundary offers. At `stop` the
