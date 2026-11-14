@@ -23,7 +23,11 @@ private func reply(_ name: String) throws -> TendIPCResponse {
 /// Every fixture the Rust side records, with what the app needs from it.
 private let checks: [String: @Sendable (TendIPCResponse) -> Bool] = [
     "hello": { $0.minProtocol != nil && $0.maxProtocol != nil && $0.capabilities?.isEmpty == false && $0.bootID != nil },
-    "snapshot": { $0.agents?.count == 1 },
+    // A Claude Code row and a watched-only Copilot CLI row.
+    "snapshot": { response in
+        guard let agents = response.agents, agents.count == 2 else { return false }
+        return Set(agents.map(\.kind)) == ["claude_code", "copilot"]
+    },
     "list_sessions": { $0.sessions != nil },
     "pipeline_runs": { $0.pipelineRuns != nil },
     "ask_status": { $0.askEnabled != nil },
