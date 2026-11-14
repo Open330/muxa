@@ -113,7 +113,7 @@ fn pin_tend_socket_live(socket: &std::path::Path) {
     if !overrides.is_empty() {
         tracing::info!(
             ?overrides,
-            "XDG directories overridden: leaving the tmux server's TEND_SOCKET alone"
+            "HOME or XDG directories are not the account's own: leaving the tmux server's TEND_SOCKET alone"
         );
     }
     if server_up {

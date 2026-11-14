@@ -214,6 +214,13 @@ fn backend_of(kind: HostKind) -> SharedBackend {
 /// governs rows in its own pane-id namespace (see
 /// [`pane_id_host_kind`] and the cross-host reaping guard).
 pub fn active_backends() -> Vec<SharedBackend> {
+    // A daemon that is not the user's (`tmux::scanner::restrict_to_own_tmux_dir`)
+    // observes only tmux, and that only in its own `TMUX_TMPDIR`: rmux's
+    // default server, a herdr or cmux GUI and zellij sessions found through
+    // the environment or an installed CLI are the user's.
+    if crate::tmux::scanner::own_tmux_dir_only() {
+        return restricted_backends();
+    }
     active_backends_from(
         |name| std::env::var(name).ok(),
         |kind| match kind {
@@ -228,6 +235,11 @@ pub fn active_backends() -> Vec<SharedBackend> {
             HostKind::Cmux | HostKind::Tmux | HostKind::Zellij => false,
         },
     )
+}
+
+/// What a daemon that is not the user's observes: tmux only.
+fn restricted_backends() -> Vec<SharedBackend> {
+    vec![Arc::new(tmux::TmuxBackend::new())]
 }
 
 /// Decoupled-from-process-env variant of [`active_backends`] for tests.
@@ -1445,5 +1457,14 @@ mod tests {
             ),
             vec![HostKind::Rmux, HostKind::Tmux, HostKind::Cmux],
         );
+    }
+
+    #[test]
+    fn a_restricted_daemon_observes_only_tmux() {
+        let kinds: Vec<HostKind> = restricted_backends()
+            .iter()
+            .map(|backend| PaneBackend::kind(backend.as_ref()))
+            .collect();
+        assert_eq!(kinds, [HostKind::Tmux]);
     }
 }

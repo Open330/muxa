@@ -221,10 +221,20 @@ pub fn data_dir() -> Option<PathBuf> {
 /// another spelling of the same directory (a symlink) is not an override.
 #[must_use]
 pub fn default_dirs_overridden() -> Vec<&'static str> {
-    let home = account_home();
+    dirs_overridden(account_home().as_deref(), |key| std::env::var_os(key))
+}
+
+/// [`default_dirs_overridden`] with the account's home and the environment
+/// given. An account home that cannot be established (no user-database
+/// entry, a lookup error) fails closed: a set `HOME` then counts as an
+/// override, since nothing shows it is the account's.
+fn dirs_overridden(
+    home: Option<&Path>,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<&'static str> {
     let mut overridden = Vec::new();
-    if let (Some(env_home), Some(home)) = (std::env::var_os("HOME"), home.as_deref()) {
-        if !env_home.is_empty() && !same_dir(Path::new(&env_home), home) {
+    if let Some(env_home) = var("HOME").filter(|value| !value.is_empty()) {
+        if home.is_none_or(|home| !same_dir(Path::new(&env_home), home)) {
             overridden.push("HOME");
         }
     }
@@ -232,8 +242,8 @@ pub fn default_dirs_overridden() -> Vec<&'static str> {
         XDG_DIRS
             .iter()
             .filter(|(key, _)| {
-                std::env::var_os(key).is_some_and(|value| {
-                    !value.is_empty() && !is_conventional(key, Path::new(&value), home.as_deref())
+                var(key).is_some_and(|value| {
+                    !value.is_empty() && !is_conventional(key, Path::new(&value), home)
                 })
             })
             .map(|(key, _)| *key),
@@ -353,11 +363,37 @@ mod tests {
     }
 
     #[test]
-    fn the_account_home_comes_from_the_user_database() {
-        // Whatever `$HOME` says in this test process, the reference is the
-        // account's own home, which exists.
-        #[cfg(unix)]
-        assert!(account_home().is_some_and(|home| home.is_absolute()));
+    fn home_and_xdg_are_judged_against_the_accounts_own_home() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| std::ffi::OsString::from(*v))
+            }
+        };
+        let account = Path::new("/nonexistent/home/u");
+        // The user's own setup.
+        assert!(dirs_overridden(Some(account), env(&[("HOME", "/nonexistent/home/u")])).is_empty());
+        assert!(dirs_overridden(
+            Some(account),
+            env(&[
+                ("HOME", "/nonexistent/home/u"),
+                ("XDG_CONFIG_HOME", "/nonexistent/home/u/.config")
+            ])
+        )
+        .is_empty());
+        // A scratch HOME with "conventional" XDG dirs under it.
+        assert_eq!(
+            dirs_overridden(
+                Some(account),
+                env(&[("HOME", "/tmp/s"), ("XDG_CONFIG_HOME", "/tmp/s/.config")])
+            ),
+            ["HOME", "XDG_CONFIG_HOME"]
+        );
+        // No account entry to compare with: a set HOME fails closed.
+        assert_eq!(dirs_overridden(None, env(&[("HOME", "/tmp/s")])), ["HOME"]);
+        assert!(dirs_overridden(None, env(&[])).is_empty());
     }
 
     #[test]

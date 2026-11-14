@@ -287,7 +287,7 @@ async fn run() -> Result<()> {
         if owns_data_dir {
             tracing::info!(
                 overrides = ?xdg_overrides,
-                "XDG directories overridden: not the user's daemon, so the tmux server environment is left alone"
+                "HOME or XDG directories are not the account's own: not the user's daemon, so the tmux server environment is left alone"
             );
         }
         // Nor does it watch the user's own tmux servers when it was given
