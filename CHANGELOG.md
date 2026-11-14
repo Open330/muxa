@@ -23,9 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - tendd starts agents itself for the Mac app's New Agent and the
   `agent_start` IPC request, instead of running `tend agent start` as a
   child. It reads the same config, pins the target's tmux server the way
-  the child's `TEND_TMUX_SOCKET` did, gives a native session the same
-  environment, and bounds every tmux command it runs by the child's 30 s.
-  A request for an rmux server still runs the child.
+  the child's `TEND_TMUX_SOCKET` did, bounds every tmux command it runs by
+  the child's 30 s, and stops when the request is dropped. A request for
+  an rmux server, or a native one whose `env` changes the daemon's own
+  values (the Mac app's `PATH`), still runs the child.
   `TEND_AGENT_START_CHILD=1` brings the child back for every request.
 
 ### Removed

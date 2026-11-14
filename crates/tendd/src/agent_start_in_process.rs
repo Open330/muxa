@@ -12,10 +12,13 @@
 //!   here as the selected mux endpoint (`mux_control::with_endpoint`), so
 //!   every tmux command and pane lookup goes to that one server;
 //! - for a native session, the environment the child's `caller_env` read:
-//!   the daemon's, `TEND_SOCKET` pinned, and the request's allowlisted keys;
+//!   the daemon's with `TEND_SOCKET` pinned (a request whose allowlisted
+//!   keys would change the daemon's own values declines, below);
 //! - an IPC client on the socket the child had pinned as `TEND_SOCKET`;
 //! - for every tmux process it starts, a closed stdin, `TEND_SOCKET` and the
-//!   child's 30 s deadline (`tend_work::subprocess`);
+//!   child's 30 s deadline (`tend_work::subprocess`), and, when the call is
+//!   dropped, nothing further started (no tmux command, no native spawn), as
+//!   the child was killed on drop;
 //! - the agent-directory invalidation the CLI sent after every
 //!   `agent start`.
 //!
@@ -23,11 +26,16 @@
 //! `work up` does. A request for an rmux server declines: the child got that
 //! server as `$RMUX` with the pane variables cleared, which code outside the
 //! mux endpoint reads too (backend detection, the caller's own pane). So
-//! does an unparseable argv or unreadable config. A declined request runs
+//! does a native request whose `env` changes a daemon variable: the child
+//! had it in its own environment before the session existed (`PATH` to find
+//! `aas` and the provider, `TERM` for the terminal size), which only an
+//! explicit environment through those lookups can reproduce. So does an
+//! unparseable argv or unreadable config. A declined request runs
 //! the child. `TEND_AGENT_START_CHILD=1` forces the child.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tend::agent_control::{
     AgentStartError, AgentStartRequest, AgentStartResult, InProcessAgentStart,
@@ -47,6 +55,9 @@ async fn run(
     socket: PathBuf,
 ) -> Option<Result<AgentStartResult, AgentStartError>> {
     if tend::agent_control::targets_rmux(&request) {
+        return None;
+    }
+    if changes_own_env(&request.env, |key| std::env::var(key).ok()) {
         return None;
     }
     let args = match tend_work::agent_launch::parse_start_argv(&request.arguments()) {
@@ -81,16 +92,15 @@ async fn run(
         &socket,
         &request.env,
     );
+    // Dropping this call (the client hung up, tendd stopping) stops the
+    // launch: no further tmux command or native spawn starts, as the child
+    // was killed on drop.
+    let (scope, _cancel_on_drop) = launch_scope(&socket);
     let work = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| AgentStartError::Failed(format!("agent start runtime: {error}")))?;
-        let scope = tend_work::subprocess::Scope {
-            socket: socket.clone(),
-            deadline: std::time::Instant::now() + tend::work_control::WORK_COMMAND_TIMEOUT,
-            cancel: None,
-        };
         tend_work::subprocess::with_scope(scope, || {
             tend_work::mux_control::with_endpoint(endpoint, || {
                 runtime.block_on(async move {
@@ -117,6 +127,44 @@ async fn run(
             "agent start task: {error}"
         ))),
     })
+}
+
+/// Sets the scope's cancel flag when the call is dropped.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The child's limits for one launch: closed stdin, `TEND_SOCKET`, its 30 s
+/// deadline, and a cancel flag the returned guard sets on drop.
+fn launch_scope(socket: &Path) -> (tend_work::subprocess::Scope, CancelOnDrop) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    (
+        tend_work::subprocess::Scope {
+            socket: socket.to_path_buf(),
+            deadline: std::time::Instant::now() + tend::work_control::WORK_COMMAND_TIMEOUT,
+            cancel: Some(cancel.clone()),
+        },
+        CancelOnDrop(cancel),
+    )
+}
+
+/// Whether the request's environment (native placement) would change a
+/// variable of the daemon's own. The child ran with those values in its
+/// process environment, where the launch reads them before the session
+/// exists: `PATH` to find `aas` and the provider, `TERM` for the terminal
+/// size. The in-process launch only hands them to the session, so such a
+/// request runs the child.
+fn changes_own_env(
+    overrides: &BTreeMap<String, String>,
+    own: impl Fn(&str) -> Option<String>,
+) -> bool {
+    overrides
+        .iter()
+        .any(|(key, value)| own(key).as_deref() != Some(value.as_str()))
 }
 
 /// The environment the child's `caller_env` handed a native session: its
@@ -163,6 +211,33 @@ mod tests {
                 ("TEND_SOCKET", "/run/tendd.sock"),
             ]
             .map(|(key, value)| (key.to_string(), value.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_native_env_that_changes_the_daemons_runs_the_child() {
+        let own = |key: &str| (key == "PATH").then(|| "/usr/bin".to_string());
+        assert!(!changes_own_env(&BTreeMap::new(), own));
+        let same = BTreeMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        assert!(!changes_own_env(&same, own));
+        let wider = BTreeMap::from([("PATH".to_string(), "/opt/bin:/usr/bin".to_string())]);
+        assert!(changes_own_env(&wider, own));
+        let unset_here = BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]);
+        assert!(changes_own_env(&unset_here, own));
+    }
+
+    #[test]
+    fn dropping_the_launch_stops_what_it_would_start_next() {
+        let (scope, guard) = launch_scope(Path::new("/run/tendd.sock"));
+        let still = scope.clone();
+        assert!(
+            tend_work::subprocess::with_scope(scope, tend_work::subprocess::ensure_time_left)
+                .is_ok()
+        );
+        drop(guard);
+        assert!(
+            tend_work::subprocess::with_scope(still, tend_work::subprocess::ensure_time_left)
+                .is_err()
         );
     }
 

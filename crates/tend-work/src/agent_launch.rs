@@ -661,6 +661,8 @@ async fn launch_native(
         .native_launch(&options, prompt)
         .on_account(routed.as_ref());
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    // The one thing a native launch creates; not after an abandoned call.
+    crate::subprocess::ensure_time_left()?;
     let session = client
         .spawn_session(tend::SpawnSession {
             command: launch.command,
@@ -2207,6 +2209,54 @@ os.execv({real:?}, [{real:?}] + args)
                 "-i",
                 "review it"
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_abandoned_native_launch_never_asks_the_daemon_for_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("tendd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let words: Vec<String> = [
+            "agent",
+            "start",
+            "--json",
+            "--agent=codex",
+            "--host=native",
+            "--direction=auto",
+        ]
+        .iter()
+        .map(|word| (*word).to_string())
+        .chain([format!("--cwd={}", dir.path().display())])
+        .collect();
+        let args = super::parse_start_argv(&words).unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scope = crate::subprocess::Scope {
+            socket: socket.clone(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            cancel: Some(cancel),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = tend::ipc::Client::new(socket.clone());
+        let result = crate::subprocess::with_scope(scope, || {
+            runtime.block_on(super::launch_json(
+                args,
+                &client,
+                &socket,
+                &tend::config::Config::default(),
+                Vec::new(),
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the daemon was asked to spawn a session"
         );
     }
 
