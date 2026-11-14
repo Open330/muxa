@@ -204,7 +204,7 @@ impl OrchestrationConfig {
                     paths,
                     reason: String::new(),
                 }
-                .resolve_paths(Path::new(PLACEHOLDER_HOME))?;
+                .check_paths()?;
             }
         }
         Ok(())
@@ -274,13 +274,42 @@ impl OrchestrationConfig {
         }
         let plan = DispatchPlan { request, node_id, host: host.alias.clone(), repo: policy.repo.clone(), url: policy.url.clone(), pipeline: policy.pipeline.clone(), paths, reason: "online, control-authorized, workspace and request selectors matched; fewest active agents, then stable NodeId".into() };
         // Validate templates without expanding the controller's home on a remote node.
-        plan.resolve_paths(Path::new(PLACEHOLDER_HOME))?;
+        plan.check_paths()?;
         Ok(plan)
     }
 }
 
 impl DispatchPlan {
+    /// The paths this plan works in on the host that runs it, under `home`.
+    /// Every one must be absolute by this platform's rule: the caller
+    /// creates directories, clones and adds worktrees there.
     pub fn resolve_paths(&self, home: &Path) -> Result<ResolvedPaths, String> {
+        let paths = self.paths_under(home, Path::is_absolute)?;
+        for path in [&paths.repo, &paths.run, &paths.artifacts] {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "execution path {} is not absolute on this host",
+                    path.display()
+                ));
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Check the templates where the plan is made, which may not be the
+    /// host that runs it: a root only needs a root there (`/srv/runs` for a
+    /// Unix node is no less absolute for lacking a Windows drive), and that
+    /// host applies its own rule in [`Self::resolve_paths`].
+    fn check_paths(&self) -> Result<(), String> {
+        self.paths_under(Path::new(PLACEHOLDER_HOME), Path::has_root)
+            .map(|_| ())
+    }
+
+    fn paths_under(
+        &self,
+        home: &Path,
+        absolute: fn(&Path) -> bool,
+    ) -> Result<ResolvedPaths, String> {
         self.request.validate()?;
         component(&self.repo)?;
         let expand = |template: &str| -> Result<PathBuf, String> {
@@ -310,15 +339,12 @@ impl DispatchPlan {
             Ok(path)
         };
         let root = expand(&self.paths.root)?;
-        // Rooted, not `is_absolute`: these paths are often a remote node's,
-        // and on a Windows controller `/srv/runs` (a Unix node's root) has
-        // no drive yet is no less absolute there. On Unix the two agree.
-        if !root.has_root() {
+        if !absolute(&root) {
             return Err("execution root must be absolute or start with ~/".into());
         }
         let resolve = |s: &str| -> Result<PathBuf, String> {
             let p = expand(s)?;
-            Ok(if p.has_root() { p } else { root.join(p) })
+            Ok(if absolute(&p) { p } else { root.join(p) })
         };
         // Runs/artifacts must be attempt-specific so retries cannot overwrite another attempt.
         for template in [&self.paths.run, &self.paths.artifacts] {
@@ -473,11 +499,29 @@ mod tests {
             },
         );
         let plan = cfg.plan(request(), &snapshot(vec![h])).unwrap();
-        let p = plan.resolve_paths(Path::new("/Users/june")).unwrap();
-        assert_eq!(p.repo, Path::new("/Users/june/device/repos/open330-tend"));
-        assert!(p.run.starts_with("/Users/june/device/runs/tend/fleet"));
+        let home = crate::test_paths::abs_path("/Users/june");
+        let p = plan.resolve_paths(&home).unwrap();
+        assert_eq!(p.repo, home.join("device/repos/open330-tend"));
+        assert!(p.run.starts_with(home.join("device/runs/tend/fleet")));
         assert!(p.run.ends_with(&plan.request.dispatch_id));
     }
+    #[test]
+    fn a_plan_checks_a_rooted_root_and_the_running_host_its_own_rule() {
+        let h = host("mac", &[("organization", "personal")]);
+        let mut cfg = policy();
+        // A Unix node's root, planned on any controller.
+        cfg.paths.root = "/srv/runs".into();
+        let plan = cfg.plan(request(), &snapshot(vec![h])).unwrap();
+        let home = crate::test_paths::abs_path("/home/w");
+        let resolved = plan.resolve_paths(&home);
+        if cfg!(windows) {
+            // Rooted but drive-relative here: refused before anything runs.
+            assert!(resolved.is_err());
+        } else {
+            assert!(resolved.unwrap().repo.starts_with("/srv/runs"));
+        }
+    }
+
     #[test]
     fn reject_mutable_revision_path_escape_overlap_and_unknown_templates() {
         let h = host("local", &[("organization", "personal")]);
