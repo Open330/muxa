@@ -76,6 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process works inside, and deletes only the moved tree. Worktree receipts
   save on Windows at all now (they failed to sync their folder there).
 
+- Windows: the tmux sidebar hooks keep their inner quoting under
+  PowerShell, so new and selected windows get a sidebar again on rmux.
+  `~` in account paths expands against `USERPROFILE` when `HOME` is unset,
+  and Claude's folder-trust prompt is read for drive and UNC paths.
+
 - An agent launched on a named tmux server (MCP `tend_start_agent`, and
   now tendd) looks up its new pane on that server only. A pane with the
   same `%N` on another server could be registered in its place.
