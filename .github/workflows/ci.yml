@@ -36,6 +36,12 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Saved from main only: every PR push saving its own ~300 MB copy
+          # per job filled the 10 GB repository cache and evicted the
+          # libghostty and macOS caches the release depends on. PRs restore
+          # main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The workspace run unifies features, so tend is always built with
       # `dashboard` there. This builds the CLI side the way `cargo install
@@ -92,6 +98,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Saved from main only: every PR push saving its own ~300 MB copy
+          # per job filled the 10 GB repository cache and evicted the
+          # libghostty and macOS caches the release depends on. PRs restore
+          # main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo build --workspace --bins
       - run: shellcheck scripts/tend-sandbox.sh scripts/sandbox-smoke.sh
@@ -112,6 +124,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Saved from main only: every PR push saving its own ~300 MB copy
+          # per job filled the 10 GB repository cache and evicted the
+          # libghostty and macOS caches the release depends on. PRs restore
+          # main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo build --workspace --bins
       # The tour claims it never intercepts a keystroke, so every step has to be
@@ -134,6 +152,12 @@ jobs:
         with:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Saved from main only: every PR push saving its own ~300 MB copy
+          # per job filled the 10 GB repository cache and evicted the
+          # libghostty and macOS caches the release depends on. PRs restore
+          # main's.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace
 
   deny:
