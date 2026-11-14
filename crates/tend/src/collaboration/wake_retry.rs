@@ -26,6 +26,7 @@ use super::RequestStatus;
 use super::{recovery::exact_agent, CollaborationError, CollaborationRequest, CollaborationStore};
 use crate::{Agent, AgentState};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 /// How long a delivered wake may leave its recipient untouched before it is
@@ -123,6 +124,44 @@ pub(super) fn wake_undelivered(
             .is_some_and(|offer| offer.offered_recently(now))
         && agent.state == AgentState::Idle
         && now - request.created_at.max(agent.state_entered_at) >= WAKE_UNDELIVERED_AFTER
+}
+
+/// A ready recipient's registry row key: pane, socket and session id.
+pub type ReadyRecipient = (String, Option<String>, String);
+
+impl CollaborationStore {
+    /// Replace the ready recipients of pending-pane requests the waker
+    /// resolved on this pass (see [`ready_pending_agent`]).
+    pub fn set_ready_pending_recipients(&self, ready: HashMap<String, ReadyRecipient>) {
+        *self
+            .ready_pending_recipients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ready;
+    }
+
+    /// The registry row the waker last found ready for a request still
+    /// addressed to a launching pane. Reconciliation has no pane list, so it
+    /// cannot repeat delivery's endpoint, room and launch-mark checks; it
+    /// takes the waker's verdict instead of matching any row at the pane.
+    pub(super) fn ready_pending_agent<'a>(
+        &self,
+        request: &CollaborationRequest,
+        agents: &'a [Agent],
+    ) -> Option<&'a Agent> {
+        if !super::is_pending_session(&request.to.agent_session_id) {
+            return None;
+        }
+        let ready = self
+            .ready_pending_recipients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pane, socket, session) = ready.get(&request.id)?;
+        agents.iter().find(|agent| {
+            agent.pane.as_deref() == Some(pane.as_str())
+                && agent.tmux_socket == *socket
+                && agent.session_id == *session
+        })
+    }
 }
 
 /// The final attempt was typed and also left the recipient untouched.
@@ -748,5 +787,63 @@ mod tests {
         assert_eq!(offers[0]["request_id"], id.as_str());
         store.reconcile_peer_interruptions(&agents).await.unwrap();
         assert_eq!(reason_of(&store, &id).await, None, "a recent hook offer");
+    }
+    /// A task to a launching worker (`pending-pane:` address) whose pane is
+    /// ready and Idle, but every write to it is refused, is bounded too. Only
+    /// the recipient the waker resolved by delivery's own checks counts: a
+    /// row merely sitting at the pane id does not.
+    #[tokio::test]
+    async fn a_pending_worker_ready_but_refusing_writes_is_reported_undelivered() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (mut launching, peer) = actor("%2", "peer").await;
+        launching.agent_session_id = "pending-pane:default:%2".into();
+        let id = store
+            .create(
+                sender,
+                launching,
+                NewRequest {
+                    body: "implement".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        store
+            .requests
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .created_at -= WAKE_UNDELIVERED_AFTER + time::Duration::minutes(1);
+        let agents = [coordinator, peer];
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert_eq!(
+            reason_of(&store, &id).await,
+            None,
+            "without the waker's verdict a row at the pane id is not the recipient"
+        );
+        store.set_ready_pending_recipients(HashMap::from([(
+            id.clone(),
+            (
+                "%2".to_owned(),
+                Some("default".to_owned()),
+                "peer".to_owned(),
+            ),
+        )]));
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert_eq!(
+            reason_of(&store, &id).await.as_deref(),
+            Some("wake_undelivered")
+        );
+        assert!(row(&store, &id).await.peer_interrupted());
+        // Delivered at last: the item clears.
+        store
+            .mark_wake_notified(&id, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(!row(&store, &id).await.peer_interrupted());
     }
 }

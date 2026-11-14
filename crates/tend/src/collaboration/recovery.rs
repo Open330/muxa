@@ -311,7 +311,8 @@ impl CollaborationStore {
                         .then_some("wake_unsubmitted")
                 })
                 .or_else(|| {
-                    (typed_wakes && super::wake_retry::wake_undelivered(original, agent, now))
+                    let recipient = agent.or_else(|| self.ready_pending_agent(original, agents));
+                    (typed_wakes && super::wake_retry::wake_undelivered(original, recipient, now))
                         .then_some("wake_undelivered")
                 });
             let mut parent = original.clone();
@@ -364,6 +365,12 @@ impl CollaborationStore {
                 }
             } else if parent.status.is_terminal()
                 || agent.is_some_and(|a| matches!(a.state, AgentState::Working | AgentState::Idle))
+                // Delivered at last, even to a still-pending address.
+                || (parent
+                    .interruption
+                    .as_ref()
+                    .is_some_and(|i| i.reason == "wake_undelivered")
+                    && (parent.notified_at.is_some() || parent.claimed_at.is_some()))
                 || (agent.is_some()
                     && parent
                         .interruption

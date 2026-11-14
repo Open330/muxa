@@ -2717,6 +2717,10 @@ pub struct CollaborationStore {
     turn_continuation: std::sync::atomic::AtomicBool,
     /// `collaboration.hook_transport = "primary"` (see `turn_offer.rs`).
     hook_transport: std::sync::atomic::AtomicBool,
+    /// Pending-pane requests whose recipient the waker found ready on its
+    /// last pass, by delivery's own predicate: request id to the ready row's
+    /// (pane, socket, session). Only the undelivered-wake bound reads it.
+    ready_pending_recipients: std::sync::Mutex<HashMap<String, wake_retry::ReadyRecipient>>,
 }
 
 impl CollaborationStore {
@@ -2751,6 +2755,7 @@ impl CollaborationStore {
             read_validators: Mutex::new(read_validator::ReadValidators::default()),
             turn_continuation: std::sync::atomic::AtomicBool::new(true),
             hook_transport: std::sync::atomic::AtomicBool::new(false),
+            ready_pending_recipients: std::sync::Mutex::new(HashMap::new()),
             changes,
         })
     }
@@ -2851,6 +2856,7 @@ impl CollaborationStore {
             read_validators: Mutex::new(read_validator::ReadValidators::default()),
             turn_continuation: std::sync::atomic::AtomicBool::new(true),
             hook_transport: std::sync::atomic::AtomicBool::new(false),
+            ready_pending_recipients: std::sync::Mutex::new(HashMap::new()),
             changes,
         });
         store.apply_retention().await?;
