@@ -43,7 +43,6 @@ pub fn tendd_responsive(socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
 
     #[test]
@@ -68,11 +67,11 @@ mod tests {
         assert!(!tendd_responsive(&path));
     }
 
-    #[test]
-    fn responsive_true_when_listener_bound() {
+    #[tokio::test]
+    async fn responsive_true_when_listener_bound() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sock");
-        let _listener = UnixListener::bind(&path).unwrap();
+        let _listener = tend::transport::Listener::bind(&path).unwrap();
         assert!(tendd_responsive(&path));
     }
 }

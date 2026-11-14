@@ -46,9 +46,9 @@ async fn ask_progress_notifies_watch_without_an_agent_transition() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("ask-subscribe.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let listener = tend::transport::Listener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         for kind in ["hello", "ask_subscribe"] {
@@ -126,9 +126,9 @@ async fn streaming_activity_refresh_is_event_driven() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("subscribe.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let listener = tend::transport::Listener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         for expected in ["hello", "subscribe_agent_changes"] {
@@ -1220,14 +1220,14 @@ async fn first_history_snapshot_waits_for_subscription_and_keeps_racing_updates(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("first-history.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let listener = tend::transport::Listener::bind(&socket).unwrap();
     let (race, race_rx) = tokio::sync::oneshot::channel();
     let (finish, finish_rx) = tokio::sync::oneshot::channel();
     let row = collab_request("%2");
     let server = tokio::spawn(async move {
         let mut race_rx = Some(race_rx);
         // The subscription must be acknowledged before the first list.
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let (read, mut subscription) = stream.into_split();
         let mut reader = BufReader::new(read);
         for kind in ["hello", "collaboration_subscribe"] {
@@ -1247,7 +1247,7 @@ async fn first_history_snapshot_waits_for_subscription_and_keeps_racing_updates(
                 race_rx.take().unwrap().await.unwrap();
                 subscription.write_all(b"{\"revision\":1}\n").await.unwrap();
             }
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
             let mut reader = BufReader::new(read);
             for kind in ["hello", "collaboration_list"] {
@@ -1272,7 +1272,7 @@ async fn first_history_snapshot_waits_for_subscription_and_keeps_racing_updates(
                 .unwrap();
         }
         tokio::select! {
-            extra = listener.accept() => panic!("unchanged history opened another connection: {extra:?}"),
+            extra = listener.accept() => panic!("unchanged history opened another connection (accepted: {})", extra.is_ok()),
             _ = finish_rx => (),
         }
     });
@@ -1315,9 +1315,9 @@ async fn mailbox_subscription_ack_establishes_idle_baseline_without_a_revision_e
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("idle-subscription.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let listener = tend::transport::Listener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
         let mut line = String::new();

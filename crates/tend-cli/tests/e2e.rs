@@ -60,6 +60,8 @@ struct Daemon {
     /// persistence read this directly; tests that don't care about
     /// history simply ignore it.
     history: PathBuf,
+    // Read by a Unix-only test.
+    #[cfg_attr(not(unix), allow(dead_code))]
     activity: PathBuf,
 }
 

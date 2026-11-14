@@ -926,6 +926,7 @@ mod tests {
         finished.state = "launched".into();
         save(&path, &finished).unwrap();
         assert_eq!(load(&path).unwrap().unwrap().state, "launched");
+        #[cfg(unix)] // Unix file modes
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600

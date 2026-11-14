@@ -328,15 +328,19 @@ use topology::{distribution_rank, group_attached_clients};
 use rows::WORK_STATE_GUTTER_WIDTH;
 
 #[cfg(test)]
-use runtime::{
-    apply_single_agent, initialize_watch_collaboration, merge_agent_for_ui, FullRefresh,
-};
+use runtime::{apply_single_agent, merge_agent_for_ui, FullRefresh};
+// Used only by the IPC-backed watch tests, which run on Unix.
+#[cfg(all(test, unix))]
+use runtime::initialize_watch_collaboration;
 
 #[cfg(test)]
 use collaboration::{
     empty_room_hint, mailbox_history_scope, open_prompt_only_composer, peer_choice_hint,
-    read_human_requests, read_watch_history, reconcile_search_history, resolved_marks,
-    stale_mark_count, watch_collaboration_origin_from, watch_history,
+    resolved_marks, stale_mark_count, watch_collaboration_origin_from,
+};
+#[cfg(all(test, unix))]
+use collaboration::{
+    read_human_requests, read_watch_history, reconcile_search_history, watch_history,
 };
 
 #[cfg(test)]

@@ -109,6 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows: tendd notices an upgraded binary there even when the new one has
+  the old size and modification time (the creation time now counts; Windows
+  has no inode).
+
 - A `tend` command pointed at a daemon that is not the user's (`--socket
   <scratch>`, or run with its own HOME/XDG setup) no longer reads the user's
   tmux or rmux server through its own `$TMUX`/`$RMUX`. Inside a real pane,

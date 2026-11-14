@@ -452,7 +452,7 @@ impl CheckResult {
 /// IPC ping with a 1.5 s budget — same window `init::verify` uses.
 /// Cold-started tendd answers a snapshot in <50 ms; anything past 1.5 s
 /// is a real problem worth surfacing.
-#[cfg(test)]
+#[cfg(all(test, unix))] // its one test runs on Unix
 async fn check_tendd(socket: &Path) -> CheckResult {
     probe_tendd(socket).await.0
 }
@@ -2425,13 +2425,12 @@ esac
         assert_eq!(parse_tend_socket_env(""), None);
     }
 
-    #[test]
-    fn socket_is_reachable_true_when_listener_bound() {
-        use std::os::unix::net::UnixListener;
+    #[tokio::test]
+    async fn socket_is_reachable_true_when_listener_bound() {
         let path =
             std::env::temp_dir().join(format!("tend-doctor-probe-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind probe socket");
+        let listener = tend::transport::Listener::bind(&path).expect("bind probe socket");
         assert!(socket_is_reachable(&path));
         drop(listener);
         let _ = std::fs::remove_file(&path);

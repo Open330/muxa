@@ -28,6 +28,10 @@ pub(crate) struct BinaryIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    /// Without an inode (Windows), a binary installed by rename or copy
+    /// still shows a new creation time, even with the old size and mtime.
+    #[cfg(not(unix))]
+    created_nanos: u128,
     size: u64,
     modified_nanos: u128,
 }
@@ -50,23 +54,22 @@ impl BinaryIdentity {
             // to re-exec onto.
             return None;
         }
-        // Windows has no stable inode through std; size plus mtime is what
-        // an install there changes.
+        let nanos = |time: std::io::Result<std::time::SystemTime>| {
+            time.ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos())
+        };
+        // Windows has no stable inode through std; the creation time, size
+        // and mtime are what an install there changes.
         Some(Self {
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(not(unix))]
+            created_nanos: nanos(metadata.created()),
             size: metadata.len(),
-            modified_nanos: metadata
-                .modified()
-                .ok()
-                .and_then(|time| {
-                    time.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|since| since.as_nanos())
-                })
-                .unwrap_or(0),
+            modified_nanos: nanos(metadata.modified()),
         })
     }
 }
@@ -154,10 +157,16 @@ impl BinaryWatch {
 mod tests {
     use super::*;
 
+    /// `inode` names the file: a different one is another file, which on
+    /// Windows shows as another creation time.
     fn identity(inode: u64, size: u64) -> BinaryIdentity {
         BinaryIdentity {
+            #[cfg(unix)]
             device: 1,
+            #[cfg(unix)]
             inode,
+            #[cfg(not(unix))]
+            created_nanos: u128::from(inode),
             size,
             modified_nanos: 0,
         }

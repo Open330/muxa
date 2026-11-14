@@ -200,9 +200,9 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("legacy.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tend::transport::Listener::bind(&socket).unwrap();
         let daemon = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
