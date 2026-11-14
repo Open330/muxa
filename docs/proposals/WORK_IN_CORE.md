@@ -173,6 +173,7 @@ pub struct WorkContext {
     native one with a changed `TERM`, before that case declined); an
     unknown server refused before anything ran; `health` answering in under
     10 ms during a launch; the forced child failing without a CLI and
+    succeeding with one.
 - Snapshots (`mux_snapshot_control`: list, save, the automatic snapshot,
   plan, delete, restore) run `tend_work::reload` in tendd
   (`crates/tendd/src/snapshot_in_process.rs`, hook
