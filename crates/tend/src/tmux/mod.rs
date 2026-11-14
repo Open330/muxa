@@ -81,6 +81,15 @@ pub fn tmux_command() -> Command {
         // server, which every bare tmux call would otherwise reach.
         cmd.env_remove("TMUX").env_remove("TMUX_PANE");
     }
+    if let Some(dir) = unreachable_tmpdir(
+        scanner::own_tmux_dir_only(),
+        std::env::var_os("TMUX_TMPDIR").is_some_and(|dir| !dir.is_empty()),
+    ) {
+        // Without a directory of its own, a bare call (no `-S`) would
+        // resolve the user's default server: point it nowhere instead.
+        // An explicit `-S` still reaches the socket it names.
+        cmd.env("TMUX_TMPDIR", dir);
+    }
     cmd
 }
 
@@ -90,6 +99,12 @@ fn inherited_tmux_is_foreign(own_dir_only: bool, _has_tmux_tmpdir: bool) -> bool
     // Its own directory or none, the server an inherited `$TMUX` names is
     // the user's.
     own_dir_only
+}
+
+/// The `TMUX_TMPDIR` a restricted daemon's tmux calls get when it has none
+/// of its own: a directory that does not exist, so no default server.
+fn unreachable_tmpdir(own_dir_only: bool, has_tmux_tmpdir: bool) -> Option<&'static str> {
+    (own_dir_only && !has_tmux_tmpdir).then_some("/nonexistent/tend-not-the-users-daemon")
 }
 
 pub fn tmux_binary() -> &'static Path {
@@ -900,7 +915,7 @@ fn scan_panes() -> PaneScan {
     // enumerable socket exists (e.g. CI sandboxes).
     let sockets = scanner::enumerate_sockets();
     if sockets.is_empty() {
-        return scan_panes_bare();
+        return bare_fallback(scanner::own_tmux_dir_only(), scan_panes_bare);
     }
     let mut scan = PaneScan::empty();
     for sock in &sockets {
@@ -966,6 +981,18 @@ pub fn list_panes() -> Result<Vec<PaneInfo>, TmuxError> {
         }
     }
     Ok(observation.panes)
+}
+
+/// With no enumerable socket: the bare `tmux list-panes -a` for the user's
+/// daemon (CI sandboxes), and nothing at all for one that is not the
+/// user's. With neither its own `TMUX_TMPDIR` nor an explicit socket, a
+/// bare call would reach the user's default server.
+fn bare_fallback(restricted: bool, bare: impl FnOnce() -> PaneScan) -> PaneScan {
+    if restricted {
+        PaneScan::empty()
+    } else {
+        bare()
+    }
 }
 
 fn scan_panes_bare() -> PaneScan {
@@ -1946,6 +1973,31 @@ mod tests {
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].session, "main");
         assert_eq!(clients[0].last_activity, 1_700_000_100);
+    }
+
+    #[test]
+    fn a_restricted_daemon_never_falls_back_to_the_default_server() {
+        let mut called = false;
+        let scan = bare_fallback(true, || {
+            called = true;
+            PaneScan::empty()
+        });
+        assert!(
+            !called,
+            "no bare list-panes for a daemon that is not the user's"
+        );
+        assert!(scan.observation.panes.is_empty());
+        let mut called = false;
+        bare_fallback(false, || {
+            called = true;
+            PaneScan::empty()
+        });
+        assert!(called, "the user's daemon keeps its CI-sandbox fallback");
+        assert!(
+            unreachable_tmpdir(true, false).is_some_and(|dir| !std::path::Path::new(dir).exists())
+        );
+        assert_eq!(unreachable_tmpdir(true, true), None);
+        assert_eq!(unreachable_tmpdir(false, false), None);
     }
 
     #[test]
