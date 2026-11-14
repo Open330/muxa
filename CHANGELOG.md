@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The swap's answer to Codex's "Working directory · resume" menu. A swap
+  relaunch has set `tui.resume_cwd="session"` since v0.10.17 and never
+  meets it, and a worker launch never answered it. If it does appear, the
+  swap stops at it and types nothing, as for any other unknown question.
+
 ## [0.10.17] - 2026-11-13
 
 ### Added

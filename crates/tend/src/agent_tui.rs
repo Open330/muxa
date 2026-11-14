@@ -671,20 +671,10 @@ pub const STARTUP_DIALOGS: &[Dialog] = &[
         pause: Duration::from_millis(500),
         consent: Consent::None,
     },
-    // Codex: the conversation's own last directory is the default row. A
-    // swap relaunch sets `tui.resume_cwd="session"` and never meets it; a
-    // worker launch still can.
-    Dialog {
-        needles: &["Working directory · resume", "Use session directory"],
-        keys: &[ENTER],
-        pick: Some("Use session directory"),
-        row: None,
-        footer: None,
-        label: "kept the session directory",
-        max: 1,
-        pause: Duration::from_millis(500),
-        consent: Consent::None,
-    },
+    // Codex's "Working directory · resume" menu is not here: a swap
+    // relaunch sets `tui.resume_cwd="session"` and never meets it, and a
+    // worker launch does not answer it. Met anyway, it is an open question
+    // and the swap stops there without typing.
     Dialog {
         needles: &["1. Resume goal", "enter select"],
         keys: &[ENTER],
@@ -1317,14 +1307,16 @@ mod tests {
     }
 
     #[test]
-    fn codex_resume_menus_keep_the_session_directory_and_the_goal() {
+    fn codex_resume_menus_resume_the_goal_and_leave_the_directory_menu_alone() {
+        // A swap relaunch never shows this menu (`tui.resume_cwd`); shown
+        // anyway, nothing is typed and the swap says what is waiting.
         let directory = "  Working directory · resume\n  Session = latest cwd recorded in the resumed session\n\
             › 1. Use session directory (/Users/jiun/personal/steam)\n  2. Use current directory (/Users/jiun)\n\
               enter continue · esc use session · ⌃c quit\n";
         let (resume, answered, keys) = answering(directory, RESUMED, 1, true);
-        assert_eq!(resume, Resume::Ready);
-        assert_eq!(answered, vec!["kept the session directory"]);
-        assert_eq!(keys, vec!["\r".to_owned()]);
+        assert!(matches!(resume, Resume::Blocked(_)), "{resume:?}");
+        assert!(answered.is_empty());
+        assert!(keys.is_empty());
         let goal = "    필요한 구현·테스트·문서 개선을 완료한다.\n  › 1. Resume goal   Mark it active\n    2. Leave paused\n    enter select · esc back\n";
         let (resume, answered, _) = answering(goal, RESUMED, 1, true);
         assert_eq!(resume, Resume::Ready);
