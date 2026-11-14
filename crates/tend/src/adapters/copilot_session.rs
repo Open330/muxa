@@ -145,33 +145,58 @@ pub fn default_home() -> Option<PathBuf> {
         .filter(|path| path.is_dir())
 }
 
-/// When the log's current turn was cancelled: the `abort` record's time,
-/// when it is the latest of the turn's start (`user.message`,
-/// `assistant.turn_start`) and its cancel. Esc on a permission prompt
-/// fires no hook, and this record is the only trace of it.
+/// How the log's current turn ended without a hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnEnd {
+    /// `abort`: Esc on a permission prompt (or mid-turn).
+    Cancelled { at: OffsetDateTime },
+    /// `session.error` with `errorType: "query"`: Copilot gave up on the
+    /// turn, e.g. after its model-call retries ran out (1.0.110 fires a
+    /// recoverable `errorOccurred` per retry and nothing at the end).
+    Failed { at: OffsetDateTime, message: String },
+}
+
+/// A `session.error` that ends the turn. Only `errorType: "query"` (what a
+/// failed turn logged on 1.0.110) counts: an SDK extension's
+/// `session.log(…, {level: "error"})` writes `session.error` with
+/// `errorType: "notification"` in the middle of a working turn.
+fn is_turn_failure(record: &Value) -> bool {
+    record["type"] == "session.error" && record["data"]["errorType"] == "query"
+}
+
+/// The current turn's hookless ending: the latest of the turn's start
+/// (`user.message`, `assistant.turn_start`) and its end (`abort`,
+/// `session.error`), when it is an end.
 ///
 /// `assistant.turn_end` alone settles nothing: Copilot writes one after
 /// every model call, mid-turn too.
-fn cancelled_at(records: &[Value]) -> Option<OffsetDateTime> {
+fn turn_end(records: &[Value]) -> Option<TurnEnd> {
     let record = records.iter().rev().find(|record| {
         is_user_prompt(record)
             || record["type"] == "assistant.turn_start"
             || record["type"] == "abort"
+            || is_turn_failure(record)
     })?;
-    if record["type"] != "abort" {
-        return None;
+    let at = || {
+        OffsetDateTime::parse(
+            record["timestamp"].as_str()?,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()
+    };
+    match record["type"].as_str()? {
+        "abort" => Some(TurnEnd::Cancelled { at: at()? }),
+        "session.error" if is_turn_failure(record) => Some(TurnEnd::Failed {
+            at: at()?,
+            message: record["data"]["message"]
+                .as_str()
+                .unwrap_or("session error")
+                .to_string(),
+        }),
+        _ => None,
     }
-    OffsetDateTime::parse(
-        record["timestamp"].as_str()?,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()
 }
 
-/// Settle Copilot rows a missing hook left working or waiting: for each,
-/// read its session log and, when the turn there was cancelled, record the
-/// stop at the cancel's own time. The Store's precedence drops it when a
-/// newer hook (the next prompt) has already moved the row.
 /// The states a missing hook can leave a Copilot row in, and so the only
 /// ones [`poll`] reads and settles.
 const SETTLED_STATES: &[crate::event::AgentState] = &[
@@ -180,6 +205,10 @@ const SETTLED_STATES: &[crate::event::AgentState] = &[
     crate::event::AgentState::WaitingChoice,
 ];
 
+/// Settle Copilot rows a missing hook left working or waiting: for each,
+/// read its session log and, when the turn there was cancelled or failed,
+/// record that at the log's own time. The Store's precedence drops it when
+/// a newer hook (the next prompt) has already moved the row.
 pub async fn poll(store: &crate::state::SharedStore, home: &Path) {
     use crate::event::{AgentEvent, AgentId, AgentKind};
     let targets: Vec<AgentId> = store
@@ -213,30 +242,39 @@ pub async fn poll(store: &crate::state::SharedStore, home: &Path) {
             .into_iter()
             .filter_map(|id| {
                 let log = root.join(&id.session_id).join("events.jsonl");
-                let at = cancelled_at(&tail_bytes(&log, SETTLE_TAIL_BYTES)?)?;
-                Some((id, at))
+                let end = turn_end(&tail_bytes(&log, SETTLE_TAIL_BYTES)?)?;
+                Some((id, end))
             })
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
     let now = OffsetDateTime::now_utc();
-    for (id, at) in settled {
-        if at > now {
+    for (id, end) in settled {
+        let event = match end {
+            TurnEnd::Cancelled { at } => AgentEvent::TurnStopped {
+                id,
+                response: None,
+                recap: None,
+                ai_title: None,
+                // Positive evidence the wait is over: Copilot recorded the
+                // permission prompt cancelled (`permission.completed`,
+                // `abort`). Without it the Store keeps a response-less stop
+                // on a waiting row waiting, as it must for Codex's early
+                // `Stop`.
+                idle_confirmed: true,
+                at,
+            },
+            TurnEnd::Failed { at, message } => AgentEvent::NotificationFired {
+                id,
+                level: crate::event::NotificationLevel::Error,
+                message: super::hook::truncate(format!("copilot: {message}"), 1_000),
+                at,
+            },
+        };
+        if event.at() > now {
             continue;
         }
-        let event = AgentEvent::TurnStopped {
-            id,
-            response: None,
-            recap: None,
-            ai_title: None,
-            // Positive evidence the wait is over: Copilot recorded the
-            // permission prompt cancelled (`permission.completed`,
-            // `abort`). Without it the Store keeps a response-less stop on
-            // a waiting row waiting, as it must for Codex's early `Stop`.
-            idle_confirmed: true,
-            at,
-        };
         // Only a row that still exists and still needs settling: the user
         // may have forgotten it while the log was read.
         store
@@ -390,16 +428,56 @@ mod tests {
     #[test]
     fn only_an_abort_after_the_turn_started_is_a_cancel() {
         // Turn 2 of the real session, cut at Esc's `abort`.
-        let at = cancelled_at(&real_until("\"abort\"")).unwrap();
+        let Some(TurnEnd::Cancelled { at }) = turn_end(&real_until("\"abort\"")) else {
+            panic!("no cancel");
+        };
         assert_eq!(at.to_string(), "2026-11-14 14:54:30.051 +00:00:00");
         // The whole log: turn 3 started after the abort and finished.
         let all: Vec<Value> = REAL
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(cancelled_at(&all), None);
+        assert_eq!(turn_end(&all), None);
         // Turn 1 ends with `assistant.turn_end`, which is no cancel.
-        assert_eq!(cancelled_at(&real_until("agentStop")), None);
+        assert_eq!(turn_end(&real_until("agentStop")), None);
+    }
+
+    #[test]
+    fn a_turn_whose_model_call_retries_ran_out_failed() {
+        // Recorded on 1.0.110 with the model connection cut mid-answer.
+        let records: Vec<Value> = include_str!("testdata/copilot-1.0.110-model-error-events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let Some(TurnEnd::Failed { at, message }) = turn_end(&records) else {
+            panic!("no failure");
+        };
+        assert_eq!(at.to_string(), "2026-11-14 16:55:26.487 +00:00:00");
+        assert!(
+            message.starts_with("Execution failed: Failed to get response"),
+            "{message}"
+        );
+        // A diagnostic an extension logs is not a failure, during a turn or
+        // after a real end.
+        let diagnostic = serde_json::json!({"type": "session.error", "timestamp": "2026-11-14T16:55:30Z",
+            "data": {"errorType": "notification", "message": "extension diagnostic"}});
+        let mut after = records.clone();
+        after.push(diagnostic.clone());
+        assert!(matches!(turn_end(&after), Some(TurnEnd::Failed { .. })));
+        let mut working = records[..3].to_vec();
+        working.push(diagnostic.clone());
+        working.push(serde_json::json!({"type": "tool.execution_start", "timestamp": "2026-11-14T16:55:31Z", "data": {}}));
+        assert_eq!(turn_end(&working), None);
+        let mut cancelled = real_until("\"abort\"");
+        cancelled.push(diagnostic);
+        assert!(matches!(
+            turn_end(&cancelled),
+            Some(TurnEnd::Cancelled { .. })
+        ));
+        // A later prompt starts a new turn: the old failure settles nothing.
+        let mut later = records.clone();
+        later.push(serde_json::json!({"type": "user.message", "timestamp": "2026-11-14T16:56:00Z", "data": {"content": "again"}}));
+        assert_eq!(turn_end(&later), None);
     }
 
     mod poll {
@@ -510,6 +588,48 @@ mod tests {
             assert_eq!(
                 store.by_session("s1").await.unwrap().state,
                 AgentState::Idle
+            );
+        }
+
+        #[tokio::test]
+        async fn a_turn_copilot_gave_up_on_fails_the_row() {
+            let home = tempfile::tempdir().unwrap();
+            let store = Store::shared();
+            let id = id("f1", "%1");
+            hook(
+                &store,
+                vec![
+                    AgentEvent::Started {
+                        id: id.clone(),
+                        at: at(-3),
+                    },
+                    AgentEvent::PromptSubmitted {
+                        id,
+                        prompt: "count".into(),
+                        at: at(-2),
+                    },
+                ],
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let failed = OffsetDateTime::now_utc();
+            write_log(
+                home.path(),
+                "f1",
+                &[
+                    prompt_line(at(-2)),
+                    format!(
+                        r#"{{"type":"session.error","timestamp":"{}","data":{{"errorType":"query","message":"Execution failed: retried 5 times"}}}}"#,
+                        rfc3339(failed)
+                    ),
+                ],
+            );
+            poll(&store, home.path()).await;
+            let row = store.by_session("f1").await.unwrap();
+            assert_eq!(row.state, AgentState::Error);
+            assert_eq!(
+                row.last_notification.as_deref(),
+                Some("copilot: Execution failed: retried 5 times")
             );
         }
 
