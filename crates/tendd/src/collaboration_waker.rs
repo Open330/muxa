@@ -166,6 +166,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
     wake_payload: CollaborationWakePayload,
     wake_inflight: &mut HashSet<(String, Option<String>, String)>,
 ) {
+    resolve_exited_stops(collaboration).await;
     let requests = collaboration.pending_unnotified().await;
     let replies = collaboration.pending_reply_unnotified().await;
     let agents = store.snapshot().await;
@@ -200,12 +201,14 @@ async fn wake_idle_collaboration_peers_with_inflight(
     let senders = follow_vanished_senders(collaboration, &replies, &participants, &agents, &panes);
     Box::pin(senders).await;
 
+    let mut ready_pending = std::collections::HashMap::new();
     for request in requests {
         let Some(recipient) =
             ready_collaboration_recipient(&participants, &agents, &panes, &request)
         else {
             continue;
         };
+        note_ready_pending(&mut ready_pending, &request, &recipient, &agents);
         let recipient = &recipient;
         if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
             continue;
@@ -260,6 +263,8 @@ async fn wake_idle_collaboration_peers_with_inflight(
         }
     }
 
+    collaboration.note_ready_pending_recipients(ready_pending);
+
     wake_senders_of_ready_replies(
         collaboration,
         &participants,
@@ -269,6 +274,31 @@ async fn wake_idle_collaboration_peers_with_inflight(
         store,
     )
     .await;
+}
+
+/// An unresolved stop pauses Tend input to its pane id; release the ones
+/// whose process is gone before that id refuses the next agent's wake.
+async fn resolve_exited_stops(collaboration: &CollaborationStore) {
+    match collaboration.resolve_exited_drains().await {
+        Ok(0) => {}
+        Ok(closed) => tracing::info!(closed, "resolved worker stops whose process exited"),
+        Err(error) => tracing::warn!(%error, "failed to resolve exited worker stops"),
+    }
+}
+
+/// Reconciliation bounds undelivered wakes but has no pane list; hand it
+/// delivery's own verdict for a launching pane's recipient.
+fn note_ready_pending(
+    ready: &mut std::collections::HashMap<String, tend::collaboration::wake_retry::ReadyRecipient>,
+    request: &CollaborationRequest,
+    recipient: &tend::collaboration::Participant,
+    agents: &[tend::state::Agent],
+) {
+    if tend::collaboration::is_pending_session(&request.to.agent_session_id) {
+        if let Some(key) = tend::collaboration::ready_row_key(recipient, agents) {
+            ready.insert(request.id.clone(), key);
+        }
+    }
 }
 
 /// Undelivered requests (quiet ones included) whose pinned session is no

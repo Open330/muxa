@@ -140,6 +140,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting. Older Codex releases' `Press enter to continue` menus are
   recognised as open questions.
 
+- A task to an idle worker could stay queued with no wake and no trace. A
+  worker stop left `uncertain` (its `/exit` outcome unverified) paused all
+  Tend input to its pane id indefinitely, so after a tmux restore reused that
+  id, every typed wake to the new agent there was refused silently. The waker
+  now closes an uncertain stop as exited once its fenced process has
+  definitely exited. Separately, a request its idle worker has not received in
+  any way after five minutes is marked `peer_interrupted` with the new reason
+  `wake_undelivered`, so the sender learns of it instead of waiting.
+
 - Claude's folder-trust prompt is no longer answered when its path wraps
   across rows, on any platform: a space dropped at the break could make
   another folder read as a trusted one. Such a prompt is left for a person.

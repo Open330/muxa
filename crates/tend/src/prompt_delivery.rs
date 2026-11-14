@@ -749,4 +749,57 @@ mod tests {
             Some(PromptOrigin::Unknown)
         );
     }
+
+    /// The 2026-11-14 stall: a stop left uncertain on 11-09 still paused
+    /// input to pane %19 after a tmux restore gave that id to another agent,
+    /// so every typed wake to it was refused without a trace. Once its fenced
+    /// process is gone, the stop resolves and the pane takes input again.
+    #[tokio::test]
+    async fn a_stop_whose_process_exited_no_longer_refuses_the_pane() {
+        let store = Store::shared();
+        start(&store).await;
+        let collaboration =
+            CollaborationStore::in_memory(crate::collaboration::CollaborationOptions::default());
+        // This pid with another birth: the fenced process has exited.
+        let gone = crate::collaboration::ProcessFence {
+            pid: std::process::id(),
+            birth: "a process that has exited".into(),
+        };
+        collaboration
+            .plant_uncertain_stop_for_test("rmux:%7", Some("/test.sock"), gone)
+            .await;
+        let pane = slow_pane();
+        let refused = deliver_prompt(&collaboration, &store, pane.clone(), delivery("go")).await;
+        assert!(matches!(refused, Err(DeliveryRefused::WorkerDraining)));
+
+        assert_eq!(collaboration.resolve_exited_drains().await.unwrap(), 1);
+        let views = collaboration.worker_drains().await;
+        assert_eq!(
+            views[0].phase,
+            crate::collaboration::WorkerDrainPhase::Exited
+        );
+        let delivered = deliver_prompt(&collaboration, &store, pane.clone(), delivery("go")).await;
+        assert_eq!(delivered.map(|d| d.submitted), Ok(true));
+        assert_eq!(*pane.keys.lock().unwrap(), ["go", "\r"]);
+        // Resolved once; nothing left to resolve.
+        assert_eq!(collaboration.resolve_exited_drains().await.unwrap(), 0);
+    }
+
+    /// A stop whose process is still alive stays unresolved and keeps the
+    /// pane's input paused: only exit evidence releases it.
+    #[tokio::test]
+    async fn a_stop_whose_process_lives_keeps_refusing_the_pane() {
+        let store = Store::shared();
+        start(&store).await;
+        let collaboration =
+            CollaborationStore::in_memory(crate::collaboration::CollaborationOptions::default());
+        collaboration
+            .block_worker_input_for_test("rmux:%7", Some("/test.sock"))
+            .await;
+        assert_eq!(collaboration.resolve_exited_drains().await.unwrap(), 0);
+        let pane = slow_pane();
+        let refused = deliver_prompt(&collaboration, &store, pane.clone(), delivery("go")).await;
+        assert!(matches!(refused, Err(DeliveryRefused::WorkerDraining)));
+        assert!(pane.keys.lock().unwrap().is_empty());
+    }
 }

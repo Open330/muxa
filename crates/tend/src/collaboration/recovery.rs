@@ -210,6 +210,11 @@ fn recovery_body(
             "Tend woke recipient {session} for request {request_id} twice, but no prompt was submitted and the request was never claimed.\nThe recipient is idle; its input line may hold an unsent draft, or the terminal may have dropped Enter. Open this exact recipient's pane and look before pressing anything: submit or clear the draft, then the agent can claim {request_id}. Tend will not type the wake again. Choose: fix the pane and wait, hand the work off, or stop this attempt."
         );
     }
+    if current_reason == "wake_undelivered" {
+        return format!(
+            "Tend could not deliver request {request_id} to recipient {session}: the recipient is idle, but no wake reached it and it never claimed the request.\nThe request has not started. Tend refused to type into that pane (for example, an unresolved stop recorded for the pane) or the terminal write failed. Open this exact recipient's pane, or have it claim {request_id} with tend_inbox; Tend clears this item once the request is delivered or claimed. Choose: fix the pane and wait, hand the work off, or stop this attempt. Do not resend the request."
+        );
+    }
     let observation = if current_reason == "binding_unavailable" {
         "cannot verify the recipient binding; delivery and execution are uncertain, and process exit is not established"
     } else {
@@ -274,7 +279,12 @@ impl CollaborationStore {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
         let now = OffsetDateTime::now_utc();
+        // With `wake = "never"` nothing is ever typed, so waiting is expected.
+        let typed_wakes = self
+            .turn_continuation
+            .load(std::sync::atomic::Ordering::SeqCst);
         let snapshot = self.requests.read().await;
+        self.prune_ready_pending(&snapshot);
         let mut missing = self.missing_recipients.lock().await;
         missing.retain(|id, _| snapshot.get(id).is_some_and(|r| !r.status.is_terminal()));
         let mut changed = Vec::new();
@@ -300,6 +310,11 @@ impl CollaborationStore {
                 .or_else(|| {
                     super::wake_retry::wake_exhausted_unsubmitted(original, agent, now)
                         .then_some("wake_unsubmitted")
+                })
+                .or_else(|| {
+                    let recipient = agent.or_else(|| self.ready_pending_agent(original, agents));
+                    (typed_wakes && super::wake_retry::wake_undelivered(original, recipient, now))
+                        .then_some("wake_undelivered")
                 });
             let mut parent = original.clone();
             close_stale_stop(&mut parent, agent);
@@ -351,6 +366,16 @@ impl CollaborationStore {
                 }
             } else if parent.status.is_terminal()
                 || agent.is_some_and(|a| matches!(a.state, AgentState::Working | AgentState::Idle))
+                // The validated recipient of a still-pending address moved on.
+                || self
+                    .ready_pending_agent(&parent, agents)
+                    .is_some_and(|a| matches!(a.state, AgentState::Working | AgentState::Idle))
+                // Delivered at last, even to a still-pending address.
+                || (parent
+                    .interruption
+                    .as_ref()
+                    .is_some_and(|i| i.reason == "wake_undelivered")
+                    && (parent.notified_at.is_some() || parent.claimed_at.is_some()))
                 || (agent.is_some()
                     && parent
                         .interruption
