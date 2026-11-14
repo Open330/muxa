@@ -138,6 +138,80 @@ pub fn run(endpoint: &BackendEndpoint, args: &[&str]) -> Result<(), String> {
     capture(endpoint, args).map(|_| ())
 }
 
+/// Each command's output, in order, from as few round trips as the server
+/// allows. tmux runs them in one client, `;`-separated, with a marker line
+/// printed between them; any other host, a command with an argument tmux
+/// would read as a separator (a trailing `;`), or a batch that fails runs
+/// them one by one instead, so every command still gets its own answer.
+///
+/// For commands that are safe to run twice (reads, `set-option`): after a
+/// failed batch some of them may already have run.
+pub fn capture_each(
+    endpoint: &BackendEndpoint,
+    commands: &[Vec<String>],
+) -> Vec<Result<String, String>> {
+    if let Some(outputs) = capture_batch(endpoint, commands) {
+        return outputs.into_iter().map(Ok).collect();
+    }
+    commands
+        .iter()
+        .map(|command| {
+            let words: Vec<&str> = command.iter().map(String::as_str).collect();
+            capture(endpoint, &words)
+        })
+        .collect()
+}
+
+fn capture_batch(endpoint: &BackendEndpoint, commands: &[Vec<String>]) -> Option<Vec<String>> {
+    if endpoint.host != HostKind::Tmux
+        || commands.len() < 2
+        || commands.iter().flatten().any(|word| word.ends_with(';'))
+    {
+        return None;
+    }
+    let marker = batch_marker();
+    let mut words: Vec<&str> = Vec::new();
+    for command in commands {
+        words.extend(command.iter().map(String::as_str));
+        words.extend([";", "display-message", "-p", marker.as_str(), ";"]);
+    }
+    words.pop();
+    let out = capture(endpoint, &words).ok()?;
+    split_batch(&out, &marker, commands.len())
+}
+
+/// A line no command's output carries by accident.
+fn batch_marker() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    format!(
+        "__tend_batch_{}_{nanos}_{}__",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// `count` outputs, each followed by `marker` on a line of its own; `None`
+/// when the reply does not have exactly that shape.
+fn split_batch(out: &str, marker: &str, count: usize) -> Option<Vec<String>> {
+    let separator = format!("{marker}\n");
+    let mut pieces: Vec<String> = Vec::with_capacity(count);
+    let mut rest = out;
+    for _ in 0..count {
+        let at = if rest.starts_with(&separator) {
+            0
+        } else {
+            rest.find(&format!("\n{separator}"))? + 1
+        };
+        pieces.push(rest[..at].to_owned());
+        rest = &rest[at + separator.len()..];
+    }
+    rest.is_empty().then_some(pieces)
+}
+
 pub fn peek_popup(client: Option<&str>) -> anyhow::Result<()> {
     let mut words = vec![std::env::current_exe()?.into_os_string()];
     words.extend(std::env::args_os().skip(1).filter(|arg| arg != "--popup"));
@@ -267,6 +341,47 @@ mod tests {
     use super::*;
 
     #[cfg(unix)] // drives a `#!/bin/sh` stand-in for rmux
+    #[test]
+    fn a_batch_reply_splits_into_one_output_per_command() {
+        let reply = "claude\nM\nM\ntwo\nlines\nM\n";
+        assert_eq!(
+            split_batch(reply, "M", 3),
+            Some(vec![
+                "claude\n".to_owned(),
+                String::new(),
+                "two\nlines\n".to_owned()
+            ])
+        );
+        // A marker missing, or output after the last one, is not the batch.
+        assert_eq!(split_batch("claude\nM\n", "M", 2), None);
+        assert_eq!(split_batch("a\nM\nstray\n", "M", 1), None);
+        // The marker only counts on a line of its own.
+        assert_eq!(
+            split_batch("xM\nM\n", "M", 1),
+            Some(vec!["xM\n".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_batch_is_only_tried_where_tmux_reads_it_as_meant() {
+        let tmux = BackendEndpoint {
+            host: HostKind::Tmux,
+            socket: "/nonexistent/tend-batch-test".into(),
+        };
+        let rmux = BackendEndpoint {
+            host: HostKind::Rmux,
+            socket: "/nonexistent/tend-batch-test".into(),
+        };
+        let two = vec![vec!["a".to_owned()], vec!["b".to_owned()]];
+        assert!(capture_batch(&rmux, &two).is_none());
+        assert!(capture_batch(&tmux, &two[..1]).is_none());
+        let trailing = vec![
+            vec!["set".to_owned(), "x;".to_owned()],
+            vec!["b".to_owned()],
+        ];
+        assert!(capture_batch(&tmux, &trailing).is_none());
+    }
+
     #[test]
     fn lifecycle_commands_use_one_rmux_server_and_keep_termination_guards() {
         use std::os::unix::fs::PermissionsExt;

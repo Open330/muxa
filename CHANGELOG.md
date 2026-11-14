@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server. Checked against Copilot CLI 1.0.110: a request offered this way
   was claimed and answered.
 
+- `tend restore` reports every pane as it lands (restored, waiting on a
+  startup dialog, or failed, with how long it took), and its `--json`
+  document gives each pane an `outcome` and `seconds`, `totals.waiting_dialog`
+  and per-phase `timings`. A restore run by tendd reports its progress while
+  it runs (`progress` on `mux_snapshot_restore_status`, and the operation's
+  message), and Tend.app shows it. `tend restore --jobs N` and
+  `[snapshot] restore_jobs` set how many panes are launched at once.
+
 - The Decided tab on the web "Needs you" page covers every connected Fleet
   host, as the queue does. A new read-only Fleet operation
   (`fleet_decision_history_v1`) brings a host's past decisions, read there
@@ -69,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before. The record is `<data dir>/tend/account-usage.json`. Replaces #367.
 
 ### Changed
+
+- `tend restore` is about three times faster: a 49-pane, 13-session
+  snapshot came back in 8.7s instead of 30.2s. Panes are brought back side
+  by side (at most one launch per CPU core at a time, 8 at most) instead of
+  one after another, each agent is watched until it is up on its own, a slow
+  or stuck pane no longer holds up the rest, and tend's marks are read and
+  written in a few batched tmux calls per window instead of one per option
+  (12.3s down to 0.6s on that snapshot). An agent stopped on a startup
+  dialog is reported as waiting on it instead of passing for restored;
+  Codex's update menu, which `agent_tui::startup_blocker` dismisses safely,
+  gets one Esc (skip, nothing installed) and the restore carries on.
 
 - `tend work done --summary` files its result record and completes the
   alias as one tendd operation (`work_done_record_v1`), and runs the Work's
@@ -160,6 +179,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   definitely exited. Separately, a request its idle worker has not received in
   any way after five minutes is marked `peer_interrupted` with the new reason
   `wake_undelivered`, so the sender learns of it instead of waiting.
+
+- A restore starts each window at the size it was recorded with also when
+  tmux recorded its layout in the newer JSON form; such windows used to
+  start at 80x24.
 
 - Claude's folder-trust prompt is no longer answered when its path wraps
   across rows, on any platform: a space dropped at the break could make

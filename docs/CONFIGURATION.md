@@ -87,6 +87,7 @@ onboarding sandbox, skips them and logs that it did, because without an
 [snapshot]
 auto_interval_minutes = 15   # 0 turns automatic snapshots off
 keep_auto = 10               # newest automatic snapshots kept
+# restore_jobs = 8           # panes a restore launches at once
 ```
 
 tendd takes an automatic workspace snapshot (`tend snapshot --auto`) every
@@ -98,6 +99,13 @@ window has focus. Only the newest `keep_auto` automatic snapshots are kept;
 snapshots taken with `tend snapshot`, Save Snapshot in Tend.app, or `tend
 reload` are never pruned. When tend's agents span several multiplexer servers
 the automatic snapshot is skipped with a warning in tendd's log.
+
+A restore (`tend restore --run`, Restore in Tend.app) brings panes back side
+by side: up to `restore_jobs` panes are launched at a time (default: one per
+CPU core, at most 8; `tend restore --jobs N` overrides it for one run), and
+each launched agent is watched on its own until it is up. It reports each
+pane as it lands — restored, waiting on a startup dialog, or failed — and
+Tend.app shows the count while it runs.
 
 Snapshots live in `$XDG_DATA_HOME/tend/snapshots/<id>/snapshot.json`
 (`~/Library/Application Support/tend/snapshots` on macOS). `tend snapshot

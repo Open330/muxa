@@ -645,6 +645,7 @@ async fn run() -> Result<()> {
         .unwrap_or_else(|| primary.clone());
     // WS-F: snapshot
     let mux_snapshots = tend::mux_snapshot_control::MuxSnapshotControl::new(socket.clone());
+    mux_snapshots.set_restore_jobs(cfg.snapshot.restore_jobs);
     let mux_snapshot_handle =
         spawn_mux_snapshot_task(&cfg.snapshot, Arc::clone(&mux_snapshots), &shutdown_tx);
     let server = Server::new(socket.clone(), store)

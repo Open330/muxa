@@ -222,6 +222,8 @@ final class SessionSnapshotViewModel: ObservableObject {
             while operation.state == .running {
                 try await Task.sleep(for: pollInterval)
                 operation = try await client.status(operationID: operation.operationID)
+                // tendd says how far it has got ("12/49 panes: …").
+                if operation.state == .running { statusMessage = operation.message }
             }
             apply(operation)
             phase = .finished

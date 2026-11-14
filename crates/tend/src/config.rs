@@ -1584,6 +1584,10 @@ pub struct SnapshotConfig {
     pub auto_interval_minutes: u64,
     /// How many automatic snapshots to keep.
     pub keep_auto: usize,
+    /// How many panes a restore brings back at once (`tend restore --jobs`).
+    /// Unset: one per CPU core, at most 8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_jobs: Option<u16>,
 }
 
 impl Default for SnapshotConfig {
@@ -1591,6 +1595,7 @@ impl Default for SnapshotConfig {
         Self {
             auto_interval_minutes: 15,
             keep_auto: 10,
+            restore_jobs: None,
         }
     }
 }
