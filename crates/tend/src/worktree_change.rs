@@ -1054,9 +1054,11 @@ mod tests {
             Outcome::Done
         );
         let dest = f.current().set_aside.unwrap().dest;
-        let mut holder = std::process::Command::new("cmd")
-            .args(["/C", "ping -n 60 127.0.0.1 >NUL"])
+        // Spawned directly, so killing it leaves no child behind in there.
+        let mut holder = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
             .current_dir(&dest)
+            .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
