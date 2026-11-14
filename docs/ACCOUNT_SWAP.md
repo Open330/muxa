@@ -331,7 +331,9 @@ the panes with no shell are handed back to `tend swap` and respawned.
 `type` stays the default. On a scratch daemon (2026-11-14, real Claude and
 Codex agents through `aas`, v0.10.17), both ways swapped every target:
 21 of 21 typed relaunches and 26 of 26 respawns, each with the resume
-verified, a launch id and the follow-up's hook receipt. Respawning also
+verified and a launch id. Every one that sent a follow-up got the
+follow-up's hook receipt: all 21 typed, and 20 respawns (the other 6 had no
+follow-up to send). Respawning also
 dropped a variable exported in the pane's shell, which typing keeps, so it
 is not the safer default.
 
