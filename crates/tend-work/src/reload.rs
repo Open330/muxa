@@ -1603,36 +1603,6 @@ fn reserve_alias(
         .collect()
 }
 
-/// Wait for a resumed agent's screen to hold still, so the follow-up lands in
-/// its input box rather than in its startup.
-///
-/// A screen that might be a startup trust dialog never counts as settled:
-/// the follow-up ends in Enter, which would answer it. A Claude pane must
-/// also show its own screen (banner or composer footer) first.
-fn screen_settled(endpoint: &BackendEndpoint, target: &str, claude: bool) -> bool {
-    let started = Instant::now();
-    let mut last = String::new();
-    let mut quiet_since = Instant::now();
-    while started.elapsed() < CONTINUE_READY_TIMEOUT && !crate::subprocess::abandoned() {
-        let screen = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
-            .unwrap_or_default();
-        if launch::may_be_trust_prompt(&screen) {
-            return false;
-        }
-        if screen != last {
-            last = screen;
-            quiet_since = Instant::now();
-        } else if !last.trim().is_empty()
-            && quiet_since.elapsed() >= CONTINUE_READY_QUIET
-            && (!claude || launch::claude_started(&last))
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    false
-}
-
 /// What one restore built itself, as opposed to found already there.
 #[derive(Debug, Default)]
 struct Fresh {
@@ -2707,14 +2677,16 @@ mod tests {
     fn an_abandoned_restore_stops_waiting_on_panes_at_once() {
         let endpoint = endpoint_for("tmux", "/nonexistent/tend-test/default".into()).unwrap();
         let started = Instant::now();
+        let pane = pane("work", "0", "0", Some("codex"));
+        let report = std::sync::Mutex::new(RestoreReport::new(false));
         let (settled, shell) = crate::subprocess::with_scope(cancelled_scope(), || {
             (
-                screen_settled(&endpoint, "work:0.0", false),
+                panes::continue_pane(&endpoint, &pane, "work:0.0", "go on", &report),
                 wait_for_shell(&endpoint, "work:0.0"),
             )
         });
         assert!(
-            !settled && !shell,
+            settled == Err(panes::Ending::Abandoned) && !shell,
             "nothing may be typed into an abandoned restore"
         );
         assert!(
@@ -3171,13 +3143,10 @@ mod tests {
         )
         .unwrap();
         let report = std::sync::Mutex::new(RestoreReport::new(false));
-        assert!(panes::continue_pane(
-            &endpoint,
-            &snapshot.panes[0],
-            &target,
-            "carry on",
-            &report
-        ));
+        assert_eq!(
+            panes::continue_pane(&endpoint, &snapshot.panes[0], &target, "carry on", &report),
+            Ok(true)
+        );
         std::thread::sleep(Duration::from_millis(300));
         let screen = mux_control::capture(&endpoint, &["capture-pane", "-p", "-t", &target]);
         let _ = mux_control::run(&endpoint, &["kill-server"]);

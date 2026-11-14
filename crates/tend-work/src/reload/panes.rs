@@ -28,8 +28,8 @@ use tend::BackendEndpoint;
 
 use super::{
     agent, foreground, launch, mux_control, plan, relaunch_command, resume_hint, runs_claude,
-    saved_dirs, screen_settled, wait_for_shell, Apply, PaneShape, RestoreReport, Snapshot,
-    CONTINUE_SUBMIT_GRACE,
+    saved_dirs, wait_for_shell, Apply, PaneShape, RestoreReport, Snapshot, CONTINUE_READY_QUIET,
+    CONTINUE_READY_TIMEOUT, CONTINUE_SUBMIT_GRACE,
 };
 
 /// How many panes a restore launches at once unless told otherwise: one per
@@ -129,22 +129,7 @@ impl AgentWatch {
         if let Some(reason) = agent_tui::blocked_screen(screen) {
             return Some(AgentScreen::Blocked(reason));
         }
-        let dialog = agent_tui::pending_dialog(screen, agent_tui::STARTUP_DIALOGS, &[])
-            // Named by what it shows (its label says how a swap answers it).
-            .map(|dialog| {
-                dialog
-                    .needles
-                    .first()
-                    .copied()
-                    .unwrap_or(dialog.label)
-                    .to_owned()
-            })
-            .or_else(|| {
-                agent_tui::dialog_is_active(screen)
-                    .then(|| agent_tui::open_question(screen))
-                    .flatten()
-            });
-        if let Some(question) = dialog {
+        if let Some(question) = startup_dialog(screen) {
             let (since, _) = self
                 .dialog_since
                 .get_or_insert_with(|| (elapsed, question.clone()));
@@ -155,6 +140,90 @@ impl AgentWatch {
         }
         self.dialog_since = None;
         agent_tui::agent_prompt_visible(screen).then_some(AgentScreen::Ready)
+    }
+}
+
+/// The dialog `screen` ends in, named by what it shows, if any.
+pub(super) fn startup_dialog(screen: &str) -> Option<String> {
+    agent_tui::pending_dialog(screen, agent_tui::STARTUP_DIALOGS, &[])
+        // Named by what it shows (its label says how a swap answers it).
+        .map(|dialog| {
+            dialog
+                .needles
+                .first()
+                .copied()
+                .unwrap_or(dialog.label)
+                .to_owned()
+        })
+        .or_else(|| {
+            agent_tui::dialog_is_active(screen)
+                .then(|| agent_tui::open_question(screen))
+                .flatten()
+        })
+}
+
+/// A startup dialog, or anything that might be a trust prompt.
+fn held_screen(screen: &str) -> Option<String> {
+    startup_dialog(screen)
+        .or_else(|| launch::may_be_trust_prompt(screen).then(|| "a trust prompt".to_owned()))
+}
+
+/// Waiting for a resumed agent's screen to hold still before the follow-up,
+/// fed one capture at a time. A dialog can appear after the agent's prompt
+/// first showed (a late update menu, a trust prompt), so every capture is
+/// checked again: a dialog never counts as settled, and one that holds for
+/// [`DIALOG_HOLD`] ends the pane as waiting on it. A Claude pane must also
+/// show its own screen (banner or composer footer) first.
+#[derive(Debug)]
+pub(super) struct SettleWatch {
+    claude: bool,
+    last: String,
+    quiet_since: Duration,
+    dialog_since: Option<Duration>,
+}
+
+/// What [`SettleWatch`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Settle {
+    /// Still and showing the agent: the follow-up can go in.
+    Settled,
+    /// Nothing may be typed: the pane ends this way.
+    Stop(Ending),
+}
+
+impl SettleWatch {
+    pub fn new(claude: bool) -> Self {
+        Self {
+            claude,
+            last: String::new(),
+            quiet_since: Duration::ZERO,
+            dialog_since: None,
+        }
+    }
+
+    pub fn observe(&mut self, elapsed: Duration, screen: &str) -> Option<Settle> {
+        if let Some(reason) = agent_tui::blocked_screen(screen) {
+            return Some(Settle::Stop(Ending::Failed(reason.to_owned())));
+        }
+        if let Some(question) = held_screen(screen) {
+            let since = *self.dialog_since.get_or_insert(elapsed);
+            self.last.clear();
+            if elapsed.saturating_sub(since) >= DIALOG_HOLD {
+                return Some(Settle::Stop(Ending::Waiting(waiting_note(&question))));
+            }
+            return None;
+        }
+        self.dialog_since = None;
+        if screen != self.last {
+            screen.clone_into(&mut self.last);
+            self.quiet_since = elapsed;
+            return None;
+        }
+        let quiet = elapsed.saturating_sub(self.quiet_since) >= CONTINUE_READY_QUIET;
+        (!self.last.trim().is_empty()
+            && quiet
+            && (!self.claude || launch::claude_started(&self.last)))
+        .then_some(Settle::Settled)
     }
 }
 
@@ -382,7 +451,12 @@ fn watch_pane(
         return Ending::Abandoned;
     }
     let continued = match how.follow_up {
-        Some(text) if interrupted(pane) => continue_pane(endpoint, pane, &target, text, report),
+        Some(text) if interrupted(pane) => {
+            match continue_pane(endpoint, pane, &target, text, report) {
+                Ok(continued) => continued,
+                Err(ending) => return ending,
+            }
+        }
         _ => false,
     };
     Ending::Relaunched { continued }
@@ -489,19 +563,38 @@ fn wait_for_agent(endpoint: &BackendEndpoint, target: &str) -> AgentScreen {
 }
 
 /// Tell an agent the snapshot caught mid-turn to carry on, once its resumed
-/// screen has stopped redrawing. Whether the text went out.
+/// screen has stopped redrawing. `Ok` with whether the text went out; `Err`
+/// with the pane's ending when a dialog or a startup error took the screen,
+/// in which case nothing, or no Enter, was typed.
 pub(super) fn continue_pane(
     endpoint: &BackendEndpoint,
     pane: &PaneShape,
     target: &str,
     text: &str,
     report: &Mutex<RestoreReport>,
-) -> bool {
+) -> Result<bool, Ending> {
     let claude = pane
         .agent
         .as_ref()
         .is_some_and(|agent| agent.kind == "claude_code");
-    if !screen_settled(endpoint, target, claude) {
+    let capture = || mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target]);
+    let started = Instant::now();
+    let mut watch = SettleWatch::new(claude);
+    let mut settled = false;
+    while started.elapsed() < CONTINUE_READY_TIMEOUT && !crate::subprocess::abandoned() {
+        match watch.observe(started.elapsed(), &capture().unwrap_or_default()) {
+            Some(Settle::Settled) => {
+                settled = true;
+                break;
+            }
+            Some(Settle::Stop(ending)) => return Err(ending),
+            None => std::thread::sleep(POLL),
+        }
+    }
+    if crate::subprocess::abandoned() {
+        return Err(Ending::Abandoned);
+    }
+    if !settled {
         say(
             report,
             &plan::manual_line(
@@ -509,25 +602,29 @@ pub(super) fn continue_pane(
                 "was mid-turn; resumed screen never settled, so nothing was sent",
             ),
         );
-        return false;
+        return Ok(false);
     }
-    let sent =
-        mux_control::run(endpoint, &["send-keys", "-t", target, "-l", "--", text]).and_then(|()| {
-            std::thread::sleep(CONTINUE_SUBMIT_GRACE);
-            mux_control::run(endpoint, &["send-keys", "-t", target, "Enter"])
-        });
-    match sent {
-        Ok(()) => true,
-        Err(error) => {
-            say(
-                report,
-                &plan::manual_line(
-                    target,
-                    &format!("was mid-turn; could not send {text:?}: {error}"),
-                ),
-            );
-            false
-        }
+    let failed = |error: String| {
+        say(
+            report,
+            &plan::manual_line(
+                target,
+                &format!("was mid-turn; could not send {text:?}: {error}"),
+            ),
+        );
+        Ok(false)
+    };
+    if let Err(error) = mux_control::run(endpoint, &["send-keys", "-t", target, "-l", "--", text]) {
+        return failed(error);
+    }
+    std::thread::sleep(CONTINUE_SUBMIT_GRACE);
+    // Enter answers a dialog: one drawn in the meantime gets none.
+    if let Some(question) = held_screen(&capture().unwrap_or_default()) {
+        return Err(Ending::Waiting(waiting_note(&question)));
+    }
+    match mux_control::run(endpoint, &["send-keys", "-t", target, "Enter"]) {
+        Ok(()) => Ok(true),
+        Err(error) => failed(error),
     }
 }
 
@@ -618,6 +715,48 @@ mod tests {
             watch.observe(ms(2000), "› \n  ? for shortcuts"),
             Some(AgentScreen::Ready)
         );
+    }
+
+    const CODEX_UPDATE: &str =
+        "  Update available · 0.164.0 → 0.166.0\n› 1. Update now (runs `npm i`)\n  \
+        2. Skip\n  3. Skip until next version\n  enter continue · esc skip\n";
+
+    #[test]
+    fn a_dialog_drawn_after_the_prompt_stops_the_follow_up() {
+        let prompt = "› Ask Codex to do anything\n  ? for shortcuts";
+        // The agent watch lets the pane go at its first prompt…
+        assert_eq!(
+            AgentWatch::default().observe(ms(0), prompt),
+            Some(AgentScreen::Ready)
+        );
+        // …and the follow-up's own watch then sees the update menu replace
+        // it: never settled, and once it holds, the pane waits on it.
+        let mut settle = SettleWatch::new(false);
+        assert_eq!(settle.observe(ms(0), prompt), None);
+        assert_eq!(settle.observe(ms(250), CODEX_UPDATE), None);
+        assert_eq!(settle.observe(ms(1000), CODEX_UPDATE), None);
+        assert_eq!(settle.observe(ms(1600), CODEX_UPDATE), None);
+        assert_eq!(
+            settle.observe(ms(1800), CODEX_UPDATE),
+            Some(Settle::Stop(Ending::Waiting(waiting_note(
+                "Update available"
+            ))))
+        );
+        // A quiet prompt settles; a Claude pane also needs Claude's screen.
+        let mut settle = SettleWatch::new(false);
+        assert_eq!(settle.observe(ms(0), prompt), None);
+        assert_eq!(settle.observe(ms(1600), prompt), Some(Settle::Settled));
+        let mut claude = SettleWatch::new(true);
+        assert_eq!(claude.observe(ms(0), "> \n"), None);
+        assert_eq!(claude.observe(ms(2000), "> \n"), None);
+        // A trust prompt is never a settled screen.
+        let trust = "Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit\nEnter to confirm";
+        let mut settle = SettleWatch::new(true);
+        assert_eq!(settle.observe(ms(0), trust), None);
+        assert!(matches!(
+            settle.observe(ms(2000), trust),
+            Some(Settle::Stop(Ending::Waiting(_)))
+        ));
     }
 
     #[test]
